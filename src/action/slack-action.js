@@ -4,10 +4,6 @@
  * @returns {Promise}
  */
 function main(params) {
-    global.window = {}; // fixes form-data
-    global.location = global.location || {};
-    global.location.protocol = global.location.protocol || "http"; // fixes stream-http
-
     return new Promise(
         (resolve, reject) => {
             //send message to slack channel
