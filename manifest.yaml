@@ -10,4 +10,4 @@ package:
       inputs:
         slack_webhook_url:
           type: String
-          description: Incoming Webhook URL. See: https://api.slack.com/incoming-webhooks for more info
+          description: Incoming Webhook URL. See https://api.slack.com/incoming-webhooks for more info
