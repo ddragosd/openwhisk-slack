@@ -23,7 +23,7 @@ function main(params) {
 
             var webhook = new IncomingWebhook(url);
 
-            webhook.send('Hello there from Austin',
+            webhook.send('Hody y all from Austin! This ain t my first rodeo',
                 function (err, res) {
                     if (err) {
                         console.log('Error:', err);

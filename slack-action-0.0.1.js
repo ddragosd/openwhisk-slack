@@ -76439,7 +76439,7 @@ function extend() {
  * @param params Input object
  * @returns {Promise}
  */function main(a){return new Promise(function(b,c){//send message to slack channel
-try{var d=require("@slack/client").IncomingWebhook}catch(g){console.log(g),c({message:"Could not load @slack/client",error:g.toString()})}var e=a.slack_webhook_url,f=new d(e);f.send("Hello there from Austin",function(g,h){g?(console.log("Error:",g),c(a)):(console.log("Message sent: ",h),b(a))})})}exports.default=main;
+try{var d=require("@slack/client").IncomingWebhook}catch(g){console.log(g),c({message:"Could not load @slack/client",error:g.toString()})}var e=a.slack_webhook_url,f=new d(e);f.send("Hody y all from Austin! This ain t my first rodeo",function(g,h){g?(console.log("Error:",g),c(a)):(console.log("Message sent: ",h),b(a))})})}exports.default=main;
 
 },{"@slack/client":1}]},{},[]);
 var main = require('main-action').default;
