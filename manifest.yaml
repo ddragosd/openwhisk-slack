@@ -1,0 +1,13 @@
+package:
+  name: serverlessconf-austin
+  version: 1.0
+  license: Apache-2.0
+  actions:
+    demo-slack-action:
+      version: 1.0
+      location: slack-action-0.0.1.js
+      runtime: nodejs@6
+      inputs:
+        slack_webhook_url:
+          type: String
+          description: Incoming Webhook URL. See: https://api.slack.com/incoming-webhooks
