@@ -11,7 +11,7 @@
     "fix_pkginfo": "replace 'var pkginfo.*' 'module.exports.name=\"@slack/client\";module.exports.version=\"3.8.1\";' -r ./node_modules/@slack/client",
     "fix_agent_base": "replace 'require.*patch-core' '//removed patch-core ...' -r ./node_modules/agent-base",
     "prepublish": "npm run fix_pkginfo && npm run fix_agent_base && browserify --node -r ./src/action/slack-action.js:main-action > ${npm_package_name}-${npm_package_version}.js && npm run whisk_wrapper",
-    "whisk_wrapper": "echo \"var main = require('main-action').default;\" >> ${npm_package_name}-${npm_package_version}.js"
+    "whisk_wrapper": "echo \"var main = require('main-action').default; exports.main=main;\" >> ${npm_package_name}-${npm_package_version}.js"
   },
   "repository": {
     "type": "git",

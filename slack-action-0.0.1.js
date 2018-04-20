@@ -1,21 +1,24 @@
-require=(function e(t,n,r){function s(o,u){if(!n[o]){if(!t[o]){var a=typeof require=="function"&&require;if(!u&&a)return a(o,!0);if(i)return i(o,!0);var f=new Error("Cannot find module '"+o+"'");throw f.code="MODULE_NOT_FOUND",f}var l=n[o]={exports:{}};t[o][0].call(l.exports,function(e){var n=t[o][1][e];return s(n?n:e)},l,l.exports,e,t,n,r)}return n[o].exports}var i=typeof require=="function"&&require;for(var o=0;o<r.length;o++)s(r[o]);return s})({1:[function(require,module,exports){
+require=(function(){function r(e,n,t){function o(i,f){if(!n[i]){if(!e[i]){var c="function"==typeof require&&require;if(!f&&c)return c(i,!0);if(u)return u(i,!0);var a=new Error("Cannot find module '"+i+"'");throw a.code="MODULE_NOT_FOUND",a}var p=n[i]={exports:{}};e[i][0].call(p.exports,function(r){var n=e[i][1][r];return o(n||r)},p,p.exports,r,e,n,t)}return n[i].exports}for(var u="function"==typeof require&&require,i=0;i<t.length;i++)o(t[i]);return o}return r})()({1:[function(require,module,exports){
 var events = require('./lib/clients/events');
+var retryPolicies = require('./lib/clients/retry-policies');
 
 module.exports = {
   WebClient: require('./lib/clients/web/client'),
   RtmClient: require('./lib/clients/rtm/client'),
   IncomingWebhook: require('./lib/clients/incoming-webhook/client'),
   LegacyRtmClient: require('./lib/clients/default/legacy-rtm'),
+  MemoryDataStore: require('./lib/data-store/memory-data-store'),
+  requestOptionsTransport: require('./lib/clients/transports/request').requestOptionsTransport,
   CLIENT_EVENTS: {
     WEB: events.CLIENT_EVENTS.WEB,
     RTM: events.CLIENT_EVENTS.RTM
   },
   RTM_EVENTS: events.RTM_EVENTS,
   RTM_MESSAGE_SUBTYPES: events.RTM_MESSAGE_SUBTYPES,
-  MemoryDataStore: require('./lib/data-store/memory-data-store')
+  RETRY_POLICIES: retryPolicies
 };
 
-},{"./lib/clients/default/legacy-rtm":3,"./lib/clients/events":6,"./lib/clients/incoming-webhook/client":10,"./lib/clients/rtm/client":12,"./lib/clients/web/client":16,"./lib/data-store/memory-data-store":44}],2:[function(require,module,exports){
+},{"./lib/clients/default/legacy-rtm":3,"./lib/clients/events":6,"./lib/clients/incoming-webhook/client":10,"./lib/clients/retry-policies":11,"./lib/clients/rtm/client":12,"./lib/clients/transports/request":14,"./lib/clients/web/client":16,"./lib/data-store/memory-data-store":46}],2:[function(require,module,exports){
 /**
  *
  */
@@ -26,13 +29,13 @@ var async = require('async');
 var bind = require('lodash').bind;
 var inherits = require('inherits');
 var partial = require('lodash').partial;
+var pick = require('lodash').pick;
 var retry = require('retry');
 
 var SlackAPIError = require('./errors').SlackAPIError;
 var callTransport = require('./transports/call-transport');
-var getLogger = require('../helpers').getLogger;
-var helpers = require('./helpers');
 var globalHelpers = require('../helpers');
+var clientHelpers = require('./helpers');
 var requestsTransport = require('./transports/request').requestTransport;
 var retryPolicies = require('./retry-policies');
 
@@ -40,15 +43,16 @@ var retryPolicies = require('./retry-policies');
 /**
  * Base client for both the RTM and web APIs.
  * @param {string} token The Slack API token to use with this client.
- * @param {Object} opts
- * @param {String} opts.slackAPIUrl The Slack API URL.
- * @param {Function} opts.transport Function to call to make an HTTP call to the Slack API.
- * @param {string=} opts.logLevel The log level for the logger.
- * @param {Function=} opts.logger Function to use for log calls, takes (logLevel, logString) params.
- * @param {Number} opts.maxRequestConcurrency The max # of concurrent requests to make to Slack's
- *     API's, defaults to 3.
- * @param {Object} opts.retryConfig The configuration to use for the retry operation,
- *     {@see https://github.com/SEAPUNK/node-retry}
+ * @param {Object} [opts]
+ * @param {string} [opts.slackAPIUrl=https://slack.com/api/] - The Slack API URL.
+ * @param {BaseAPIClient~transportFn} [opts.transport] - Function to call to make an HTTP call to
+ * the Slack API.
+ * @param {string} [opts.logLevel=info] The log level for the logger.
+ * @param {BaseAPIClient~logFn} [opts.logger] Function to use for log calls, takes (logLevel, logString) params.
+ * @param {number} [opts.maxRequestConcurrency=3] The max # of concurrent requests to make to Slack's
+ * API
+ * @param {Object} [opts.retryConfig] The configuration to use for the retry operation,
+ * see {@link https://github.com/tim-kos/node-retry|node-retry} for more details.
  * @constructor
  */
 function BaseAPIClient(token, opts) {
@@ -64,55 +68,61 @@ function BaseAPIClient(token, opts) {
   /** @type {string} */
   this.slackAPIUrl = clientOpts.slackAPIUrl || 'https://slack.com/api/';
 
-  /** @type {Function} */
+  /**
+   * The logger function attached to this client.
+   * @type {BaseAPIClient~logFn}
+   */
+  this.logger = clientOpts.logger || globalHelpers.getLogger(clientOpts.logLevel);
+
+  /** @type {BaseAPIClient~transportFn} */
   this.transport = clientOpts.transport || requestsTransport;
 
   /**
-   * Default to attempting 5 retries within 5 minutes, with exponential backoff.
+   * Default to retrying forever with an exponential backoff, capped at thirty
+   * minutes but with some randomization.
+   * @type {Object}
    */
-  this.retryConfig = clientOpts.retryConfig || retryPolicies.FIVE_RETRIES_IN_FIVE_MINUTES;
+  this.retryConfig = clientOpts.retryConfig ||
+    retryPolicies.RETRY_FOREVER_EXPONENTIAL_CAPPED_RANDOM;
 
   /**
    *
-   * @type {Object}
+   * @type {AsyncQueue}
    * @private
    */
-  this.requestQueue = async.priorityQueue(
+  this.requestQueue = async.queue(
     bind(this._callTransport, this),
     clientOpts.maxRequestConcurrency || 3
   );
 
-  /**
-   * The logger function attached to this client.
-   * @type {Function}
-   */
-  this.logger = clientOpts.logger || getLogger(clientOpts.logLevel);
-
   this._createFacets();
+
+  this.logger('debug', 'BaseAPIClient initialized');
 }
 
 inherits(BaseAPIClient, EventEmitter);
-
-BaseAPIClient.prototype.emit = function emit() {
-  BaseAPIClient.super_.prototype.emit.apply(this, arguments);
-  this.logger('debug', arguments);
-};
-
 
 /**
  * Initializes each of the API facets.
  * @protected
  */
 BaseAPIClient.prototype._createFacets = function _createFacets() {
+  this.logger('debug', 'BaseAPIClient _createFacets end');
 };
-
 
 /**
  * Attaches a data-store to the client instance.
+ *
+ * @deprecated SlackDataStore interface will be removed in v4.0.0. See
+ * {@link https://github.com/slackapi/node-slack-sdk/wiki/DataStore-v3.x-Migration-Guide|the migration guide}
+ * for details.
  * @param {SlackDataStore} dataStore
  */
 BaseAPIClient.prototype.registerDataStore = function registerDataStore(dataStore) {
+  this.logger('warn', 'SlackDataStore is deprecated and will be removed in the next major ' +
+    'version. See project documentation for a migration guide.');
   this.dataStore = dataStore;
+  this.logger('debug', 'BaseAPIClient registerDataStore end');
 };
 
 
@@ -121,40 +131,43 @@ BaseAPIClient.prototype.registerDataStore = function registerDataStore(dataStore
  *
  * This will also manage 429 responses and retry failed operations.
  *
- * @param {object} task The arguments to pass to the transport.
+ * @param {Object} task The arguments to pass to the transport.
  * @param {function} queueCb Callback to signal to the request queue that the request has completed.
  * @protected
  */
 BaseAPIClient.prototype._callTransport = function _callTransport(task, queueCb) {
-  var _this = this;
-  var retryOp = retry.operation(_this.retryConfig);
+  var self = this;
+  var retryOp = retry.operation(self.retryConfig);
   var retryArgs = {
-    client: _this,
+    client: self,
     task: task,
     queueCb: queueCb,
     retryOp: retryOp
   };
 
   retryOp.attempt(function attemptTransportCall() {
-    _this.transport(task.args, partial(callTransport.handleTransportResponse, retryArgs));
+    self.logger('verbose', 'BaseAPIClient _callTransport - Retrying ' + pick(task.args, 'url'));
+    self.transport(task.args, partial(callTransport.handleTransportResponse, retryArgs));
   });
+  this.logger('debug', 'BaseAPIClient _callTransport end');
 };
 
 
 /**
  * Makes a call to the Slack API.
  *
- * @param {String} endpoint The API endpoint to send to.
- * @param {Object=} apiArgs
- * @param {Object=} apiOptArgs
- * @param {function=} optCb The callback to run on completion.
+ * @param {string} endpoint The API endpoint to send to.
+ * @param {Object} apiArgs
+ * @param {Object} apiOptArgs
+ * @param {function} optCb The callback to run on completion.
  * @private
  */
 BaseAPIClient.prototype._makeAPICall = function _makeAPICall(endpoint, apiArgs, apiOptArgs, optCb) {
-  var apiCallArgs = helpers.getAPICallArgs(
-    this._token,
+  var self = this;
+  var apiCallArgs = clientHelpers.getAPICallArgs(
+    self._token,
     globalHelpers.getVersionString(),
-    this.slackAPIUrl,
+    self.slackAPIUrl,
     endpoint,
     apiArgs,
     apiOptArgs,
@@ -163,16 +176,18 @@ BaseAPIClient.prototype._makeAPICall = function _makeAPICall(endpoint, apiArgs, 
   var cb = apiCallArgs.cb;
   var args = apiCallArgs.args;
   var promise;
-  var _this = this;
 
   if (!cb) {
     promise = new Promise(function makeAPICallPromiseResolver(resolve, reject) {
-      _this.requestQueue.push({
+      self.requestQueue.push({
         args: args,
         cb: function makeAPICallPromiseResolverInner(err, res) {
           if (err) {
             reject(err);
           } else {
+            // NOTE: inspecting the contents of the response and semantically mapping that to an
+            // error should probably be some in one place for both callback based invokations, and
+            // promise based invokations.
             if (!res.ok) {
               reject(new SlackAPIError(res.error));
             } else {
@@ -183,19 +198,20 @@ BaseAPIClient.prototype._makeAPICall = function _makeAPICall(endpoint, apiArgs, 
       });
     });
   } else {
-    this.requestQueue.push({
+    self.requestQueue.push({
       args: args,
       cb: cb
     });
   }
 
+  this.logger('debug', 'BaseAPIClient _makeAPICall end');
   return promise;
 };
 
 
 module.exports = BaseAPIClient;
 
-},{"../helpers":58,"./errors":4,"./helpers":9,"./retry-policies":11,"./transports/call-transport":13,"./transports/request":14,"async":80,"bluebird":99,"eventemitter3":157,"inherits":198,"lodash":216,"retry":242}],3:[function(require,module,exports){
+},{"../helpers":60,"./errors":4,"./helpers":9,"./retry-policies":11,"./transports/call-transport":13,"./transports/request":14,"async":82,"bluebird":101,"eventemitter3":161,"inherits":202,"lodash":216,"retry":243}],3:[function(require,module,exports){
 /**
  * Legacy client implementation mirroring the 1.x.x Slack client implementations.
  */
@@ -220,7 +236,7 @@ inherits(LegacyRTMClient, RtmClient);
 
 module.exports = LegacyRTMClient;
 
-},{"../../data-store/memory-data-store":44,"../rtm/client":12,"inherits":198}],4:[function(require,module,exports){
+},{"../../data-store/memory-data-store":46,"../rtm/client":12,"inherits":202}],4:[function(require,module,exports){
 /* eslint vars-on-top: 0 */
 
 var inherits = require('inherits');
@@ -245,7 +261,7 @@ inherits(SlackRTMSendError, SlackAPIError);
 module.exports.SlackAPIError = SlackAPIError;
 module.exports.SlackRTMSendError = SlackRTMSendError;
 
-},{"inherits":198}],5:[function(require,module,exports){
+},{"inherits":202}],5:[function(require,module,exports){
 /**
  * API client events.
  */
@@ -460,6 +476,22 @@ var assignApiArgs = function assignApiArgs(target, source) {
         } else {
           target[key] = JSON.stringify(val);
         }
+      // For the web API, this should always be a JSON-encoded object, see:
+      //   https://api.slack.com/methods/chat.unfurl
+      } else if (key === 'unfurls') {
+        if (isString(val)) {
+          target[key] = val;
+        } else {
+          target[key] = JSON.stringify(val);
+        }
+      // For the web API, this should always be a JSON-encoded object, see:
+      //   https://api.slack.com/methods/users.profile.set or https://api.slack.com/methods/users.profile.get
+      } else if (key === 'profile') {
+        if (isString(val)) {
+          target[key] = val;
+        } else {
+          target[key] = JSON.stringify(val);
+        }
       } else if (key !== 'opts') {
         target[key] = val;
       }
@@ -499,10 +531,8 @@ var getAPICallArgs = function getAPICallArgs(
   // respectively
   if (isPlainObject(apiOptArgs) || isNull(apiOptArgs)) {
     optArgs = apiOptArgs;
-  } else {
-    if (isFunction(apiOptArgs)) {
-      cb = apiOptArgs;
-    }
+  } else if (isFunction(apiOptArgs)) {
+    cb = apiOptArgs;
   }
 
   return {
@@ -521,7 +551,7 @@ var getAPICallArgs = function getAPICallArgs(
 module.exports.getAPICallData = getAPICallData;
 module.exports.getAPICallArgs = getAPICallArgs;
 
-},{"lodash":216,"url-join":283}],10:[function(require,module,exports){
+},{"lodash":216,"url-join":285}],10:[function(require,module,exports){
 var requestsTransport = require('../transports/request').requestTransport;
 var isString = require('lodash').isString;
 var isObject = require('lodash').isObject;
@@ -538,6 +568,8 @@ var noop = require('lodash').noop;
  * @param {string} defaults.channel The default channel to use when sending a webhook.
  *      If no channel is specified, the one chosen when creating the webhook will be used.
  * @param {string} defaults.text The default text to use when sending a webhook.
+ * @param {string} defaults.linkNames The default setting for the link_names format option to use when sending a webhook.
+ *      If no value is specified, the one chosen when creating the webhook will be used.
  * @constructor
  */
 function IncomingWebhook(slackUrl, defaults) {
@@ -553,6 +585,7 @@ function IncomingWebhook(slackUrl, defaults) {
     iconEmoji: _defaults.iconEmoji,
     iconUrl: _defaults.iconUrl,
     channel: _defaults.channel,
+    linkNames: _defaults.linkNames,
     text: _defaults.text
   };
 
@@ -587,6 +620,7 @@ IncomingWebhook.prototype._formatData = function _formatData(message) {
     icon_emoji: this.defaults.iconEmoji,
     icon_url: this.defaults.iconUrl,
     channel: this.defaults.channel,
+    link_names: this.defaults.linkNames,
     text: this.defaults.text
   };
 
@@ -598,7 +632,10 @@ IncomingWebhook.prototype._formatData = function _formatData(message) {
     if (message.iconEmoji) data.icon_emoji = message.iconEmoji;
     if (message.iconUrl) data.icon_url = message.iconUrl;
     if (message.channel) data.channel = message.channel;
+    if (message.linkNames) data.link_names = message.linkNames;
     if (message.attachments) data.attachments = message.attachments;
+    if (message.unfurl_links) data.unfurl_links = message.unfurl_links;
+    if (message.unfurl_media) data.unfurl_media = message.unfurl_media;
   }
 
   return data;
@@ -614,24 +651,74 @@ module.exports = IncomingWebhook;
  */
 
 
+/**
+ * Keep retrying forever, with an exponential backoff.
+ */
+var RETRY_FOREVER_EXPONENTIAL = {
+  forever: true
+};
+
+
+/**
+ * Same as {@link RETRY_FOREVER_EXPONENTIAL}, but capped at 30 minutes.
+ */
+var RETRY_FOREVER_EXPONENTIAL_CAPPED = {
+  forever: true,
+  maxTimeout: 30 * 60 * 1000
+};
+
+
+/**
+ * Same as {@link RETRY_FOREVER_EXPONENTIAL_CAPPED}, but with randomization to
+ * prevent stampeding herds.
+ */
+var RETRY_FOREVER_EXPONENTIAL_CAPPED_RANDOM = {
+  forever: true,
+  maxTimeout: 30 * 60 * 1000,
+  randomize: true
+};
+
+
+/**
+ * Short & sweet, five retries in five minutes and then bail.
+ */
 var FIVE_RETRIES_IN_FIVE_MINUTES = {
   retries: 5,
   factor: 3.86
 };
 
 
+/**
+ * This policy is just to keep the tests running fast.
+ */
 var TEST_RETRY_POLICY = {
   minTimeout: 0,
   maxTimeout: 1
 };
 
 
+module.exports.RETRY_FOREVER_EXPONENTIAL = RETRY_FOREVER_EXPONENTIAL;
+module.exports.RETRY_FOREVER_EXPONENTIAL_CAPPED = RETRY_FOREVER_EXPONENTIAL_CAPPED;
+module.exports.RETRY_FOREVER_EXPONENTIAL_CAPPED_RANDOM = RETRY_FOREVER_EXPONENTIAL_CAPPED_RANDOM;
 module.exports.FIVE_RETRIES_IN_FIVE_MINUTES = FIVE_RETRIES_IN_FIVE_MINUTES;
 module.exports.TEST_RETRY_POLICY = TEST_RETRY_POLICY;
 
+/**
+ * Uses legacy RTM client options to make a retry policy.
+ * @param {Object} opts
+ * @param {Number} opts.maxReconnectionAttempts Maximum number of attempts before emitting error
+ * @param {Number} opts.reconnectionBackoff     Time to wait between attempts
+ */
+module.exports.retryPolicyFromOptions = function retryPolicyFromOptions(opts) {
+  return opts.maxReconnectionAttempts || opts.reconnectionBackoff ? {
+    retries: opts.maxReconnectionAttempts || 10,
+    minTimeout: opts.reconnectionBackoff || 3000,
+    maxTimeout: opts.reconnectionBackoff || 3000
+  } : null;
+};
+
 },{}],12:[function(require,module,exports){
 /**
- *
  * See [the RTM client events](../events/client) for details of the client event lifecycle.
  */
 
@@ -656,7 +743,9 @@ var RTM_CLIENT_INTERNAL_EVENT_TYPES = [
 var UNRECOVERABLE_RTM_START_ERRS = [
   'not_authed',
   'invalid_auth',
-  'account_inactive'
+  'account_inactive',
+  'user_removed_from_team',
+  'team_disabled'
 ];
 var CLIENT_EVENTS = require('../events/client').RTM;
 var BaseAPIClient = require('../client');
@@ -667,24 +756,31 @@ var ChatFacet = require('../web/facets').ChatFacet;
 var SlackRTMSendError = require('../errors').SlackRTMSendError;
 var makeMessageEventWithSubtype = require('../events/utils').makeMessageEventWithSubtype;
 var wsSocketFn = require('../transports/ws');
+var retryPolicyFromOptions = require('../retry-policies').retryPolicyFromOptions;
 
 /**
- *
- * @param {String} token
- * @param {object?} opts
- * @param {Function} opts.socketFn A function to call, passing in a websocket URL, that should
- *     return a websocket instance connected to that URL.
- * @param {object} opts.dataStore A store to cache Slack info, e.g. channels, users etc. in.
- *     If you don't want a store, pass false or null as the value for this.
- * @param {boolean} opts.autoReconnect Whether or not to automatically reconnect when the connection
- *     closes.
- * @param {number} opts.maxReconnectionAttempts
- * @param {number} opts.reconnectionBackoff
- * @param {number} opts.wsPingInterval
- * @param {number} opts.maxPongInterval
- * @param {string} opts.logLevel The log level for the logger.
- * @param {Function} opts.logger Function to use for log calls, takes (logLevel, logString)
- *     parameters.
+ * Creates a new instance of RTM client.
+ * @param {string} token - The token to use for connecting
+ * @param {Object} [opts]
+ * @param {RTMClient~socketFn} [opts.socketFn] - A function to call, passing in a websocket URL,
+ * that should return a websocket instance connected to that URL
+ * @param {SlackDataStore|null|false} [opts.dataStore] - A store to cache Slack info. Recommended
+ * value is `false`. Default value is an instance of {@link SlackMemoryDataStore}.
+ * @param {boolean} [opts.autoReconnect=true] - Whether or not to automatically reconnect when the
+ * connection closes
+ * @param {boolean} [opts.useRtmConnect=false] - Whether to use rtm.connect rather than rtm.start.
+ * Recommended value is `true`.
+ * @param {Object} [opts.retryConfig] - The retry policy to use, defaults to forever with
+ * exponential backoff, see {@link https://github.com/SEAPUNK/node-retry|node-retry} for more details.
+ * @param {number} [opts.maxReconnectionAttempts] - DEPRECATED: Use retryConfig instead
+ * @param {number} [opts.reconnectionBackoff] - DEPRECATED: Use retryConfig instead
+ * @param {number} [opts.wsPingInterval=5000] - The time (in ms) to wait between pings with the
+ * server
+ * @param {number} [opts.maxPongInterval] - The max time (in ms) to wait for a pong before
+ * reconnecting
+ * @param {string} [opts.logLevel=info] - The log level for the logger
+ * @param {RTMClient~logFn} [opts.logger] - Function to use for log calls, takes
+ * (logLevel, logString) parameters
  * @constructor
  */
 function RTMClient(token, opts) {
@@ -694,12 +790,17 @@ function RTMClient(token, opts) {
   // trying to rtm.start in parallel.
   clientOpts.maxRequestConcurrency = 1;
 
+  // Migrate deprecated parameters to a retry policy.
+  if (!clientOpts.retryConfig) {
+    clientOpts.retryConfig = retryPolicyFromOptions(clientOpts);
+  }
+
   BaseAPIClient.call(this, token, clientOpts);
 
   /**
    * @type {Function}
    */
-  this._socketFn = clientOpts.socketFn || wsSocketFn;
+  this._socketFn = clientOpts.socketFn || wsSocketFn.factory(this.logger);
 
   /**
    * The active websocket.
@@ -734,6 +835,13 @@ function RTMClient(token, opts) {
    */
   this._msgChannelLookup = {};
 
+  /**
+   * If true, we'll use rtm.connect everywhere in place of rtm.start
+   * @type {boolean}
+   * @private
+   */
+  this._useRtmConnect = clientOpts.useRtmConnect;
+
   if (clientOpts.dataStore instanceof DataStore) {
     this.registerDataStore(clientOpts.dataStore);
   } else {
@@ -743,15 +851,15 @@ function RTMClient(token, opts) {
     }
   }
 
-  this.MAX_RECONNECTION_ATTEMPTS = clientOpts.maxReconnectionAttempts || 10;
-  this.RECONNECTION_BACKOFF = clientOpts.reconnectionBackoff || 3000;
-
-  // NOTE: see the "Ping and Pong" section of https://api.slack.com/rtm
-  //       these are to do with the RTM API level connection and not the underlying ws connection.
-  this.MAX_PONG_INTERVAL = clientOpts.maxPongInterval || 10000;
+  // See the "Ping and Pong" section of https://api.slack.com/rtm
+  // These are to do with the RTM API level connection and not the underlying
+  // socket connection.
+  this.MAX_PONG_INTERVAL = clientOpts.maxPongInterval || 20000;
   this.WS_PING_INTERVAL = clientOpts.wsPingInterval || 5000;
 
   this.autoReconnect = clientOpts.autoReconnect !== false;
+
+  this.logger('debug', 'RTMClient initialized');
 }
 
 inherits(RTMClient, BaseAPIClient);
@@ -784,6 +892,12 @@ RTMClient.prototype.activeTeamId = undefined;
 
 
 /**
+ * @type {?SlackDataStore}
+ */
+RTMClient.prototype.dataStore = undefined;
+
+
+/**
  * The timer repeatedly pinging the server to let it know the client is still alive.
  * @type {?}
  */
@@ -799,7 +913,7 @@ RTMClient.prototype._lastPong = 0;
 
 
 /**
- *
+ * A running count of socket connection attempts.
  * @type {number}
  * @private
  */
@@ -815,17 +929,19 @@ RTMClient.prototype._connecting = false;
 
 
 /**
- * Whether the server is currently re-connecting.
+ * Options passed to `start`, for use when reconnecting.
+ * @type {object}
+ * @private
+ */
+RTMClient.prototype._startOpts = null;
+
+
+/**
+ * Whether the server is currently reconnecting.
  * @type {boolean}
  * @private
  */
 RTMClient.prototype._reconnecting = false;
-
-
-/**
- * @type {SlackDataStore}
- */
-RTMClient.prototype.dataStore = undefined;
 
 
 /** @inheritDoc */
@@ -849,17 +965,26 @@ RTMClient.prototype._createFacets = function _createFacets() {
 
 
 /**
- *
- * @param {object} opts
+ * Begin an RTM session.
+ * @param {object} [opts]
+ * @param {boolean} [opts.batch_presence_aware=false] - Opt into receiving fewer `presence_change`
+ * events that can contain many users. Instead of the event containing one `user` property {string},
+ * it would contain a `users` property {string[]}. This option is not compatible with using the
+ * `dataStore`, you must initialize the RTM client object with the `dataStore: false` option.
  */
 RTMClient.prototype.start = function start(opts) {
   // Check whether the client is currently attempting to connect to the RTM API.
   if (!this._connecting) {
-    this.logger('verbose', 'attempting to connect via the RTM API');
+    this.logger('verbose', 'Attempting to connect via the RTM API');
     this.emit(CLIENT_EVENTS.CONNECTING);
     this._connecting = true;
+    this._startOpts = opts;
 
-    this._rtm.start(opts, bind(this._onStart, this));
+    if (this._useRtmConnect) {
+      this._rtm.connect(opts, bind(this._onStart, this));
+    } else {
+      this._rtm.start(opts, bind(this._onStart, this));
+    }
   }
 };
 
@@ -883,33 +1008,45 @@ RTMClient.prototype.nextMessageId = function nextMessageId() {
 
 
 /**
- *
- * @param err
- * @param data
+ * Occurs when we've received a response to the API call made in start.
+ * Connect to the socket using the URL from the response, or if it went wrong,
+ * check the error and potentially retry or permanently disconnect.
+ * @param requestError - An error that occurred during the request
+ * @param data - The response data
  * @private
  */
-RTMClient.prototype._onStart = function _onStart(err, data) {
-  var errMsg;
+RTMClient.prototype._onStart = function _onStart(requestError, data) {
+  // There may have been an HTTP error or an error returned from the Slack API
+  var error = requestError || data.error;
+  var startMethod = this._useRtmConnect ? 'rtm.connect' : 'rtm.start';
+
+  var disconnectWithReason = bind(function disconnectWithReason(reason) {
+    this.logger('error', 'Disconnecting because ' + reason);
+    this.logger('error', error);
+    this.disconnect(reason, error);
+  }, this);
+
   this._connecting = false;
   this._reconnecting = false;
 
-  if (err || !data.url) {
-    this.emit(CLIENT_EVENTS.UNABLE_TO_RTM_START, err || data.error);
+  if (error || (!data || !data.url)) {
+    this.emit(CLIENT_EVENTS.UNABLE_TO_RTM_START, error);
 
     // Any of these mean this client is unusable, so don't attempt to auto-reconnect
     if (data && includes(UNRECOVERABLE_RTM_START_ERRS, data.error)) {
-      errMsg = 'unrecoverable failure connecting to the RTM API';
-      this.logger('error', errMsg + ': ' + data.error);
-      this.disconnect(errMsg, data.error);
+      disconnectWithReason(data.error + ' is not recoverable');
     } else {
-      this.logger('info', 'unable to RTM start, attempting reconnect: ' + err || data.error);
       this.authenticated = false;
       if (this.autoReconnect) {
+        this.logger('info', 'Unable to ' + startMethod + ', attempting reconnect');
         this.reconnect();
+      } else {
+        disconnectWithReason('auto-reconnect is disabled');
       }
     }
   } else {
-    this.logger('verbose', 'rtm.start successful, attempting to open websocket URL');
+    this.logger('verbose', startMethod + ' successful, attempting to open websocket URL');
+
     this.authenticated = true;
     this.activeUserId = data.self.id;
     this.activeTeamId = data.team.id;
@@ -934,7 +1071,6 @@ RTMClient.prototype._safeDisconnect = function _safeDisconnect() {
   }
   if (this.ws) {
     // Stop listening to the websocket's close event, so that the auto-reconnect logic doesn't fire
-    // twice.
     this.ws.removeAllListeners('close');
     this.ws.close();
   }
@@ -945,7 +1081,7 @@ RTMClient.prototype._safeDisconnect = function _safeDisconnect() {
 
 /**
  * Connects to the RTM API.
- * @param {string} socketUrl The URL of the websocket to connect to.
+ * @param {String} socketUrl The URL of the websocket to connect to.
  */
 RTMClient.prototype.connect = function connect(socketUrl) {
   this.emit(CLIENT_EVENTS.WS_OPENING);
@@ -960,8 +1096,8 @@ RTMClient.prototype.connect = function connect(socketUrl) {
 
 /**
  * Disconnects from the RTM API.
- * @param optReason
- * @param optCode
+ * @param {Error} optReason
+ * @param {Number} optCode
  */
 RTMClient.prototype.disconnect = function disconnect(optErr, optCode) {
   this.emit(CLIENT_EVENTS.DISCONNECT, optErr, optCode);
@@ -971,7 +1107,7 @@ RTMClient.prototype.disconnect = function disconnect(optErr, optCode) {
 
 
 /**
- *
+ * Attempts to reconnect to the websocket by retrying the start method.
  */
 RTMClient.prototype.reconnect = function reconnect() {
   if (!this._reconnecting) {
@@ -979,35 +1115,11 @@ RTMClient.prototype.reconnect = function reconnect() {
     this._reconnecting = true;
     this._safeDisconnect();
 
-    // TODO(leah): Update this to remove the reconn logic in the RTM client as it should be covered
-    //             by the web client policy
     this._connAttempts++;
-    if (this._connAttempts > this.MAX_RECONNECTION_ATTEMPTS) {
-      this.emit(
-        CLIENT_EVENTS.UNABLE_TO_RTM_START,
-        'unable to connect to Slack RTM API, failed after max reconnection attempts'
-      );
-    }
-    setTimeout(bind(this.start, this), this._connAttempts * this.RECONNECTION_BACKOFF);
-  }
-};
+    this.logger('warn', 'Reconnecting, on attempt', this._connAttempts);
 
-
-/**
- * Pings the remote server to let it know the client is still alive.
- * @private
- */
-RTMClient.prototype._pingServer = function _pingServer() {
-  var pongInterval;
-
-  if (this.connected) {
-    // If the last pong was more than MAX_PONG_INTERVAL, force a reconnect
-    pongInterval = Date.now() - this._lastPong;
-    if (pongInterval > this.MAX_PONG_INTERVAL) {
-      this.reconnect();
-    } else {
-      this.send({ type: 'ping' }, noop);
-    }
+    // Ensure we use the same arguments to `start` when reconnecting
+    this.start(this._startOpts);
   }
 };
 
@@ -1018,13 +1130,6 @@ RTMClient.prototype._pingServer = function _pingServer() {
  */
 RTMClient.prototype.handleWsOpen = function handleWsOpen() {
   this.emit(CLIENT_EVENTS.WS_OPENED);
-  this._lastPong = Date.now();
-  this._connAttempts = 0;
-  if (this._pingTimer) {
-    clearInterval(this._pingTimer);
-  } else {
-    this._pingTimer = setInterval(bind(this._pingServer, this), this.WS_PING_INTERVAL);
-  }
 };
 
 
@@ -1040,21 +1145,21 @@ RTMClient.prototype.handleWsMessage = function handleWsMessage(wsMsg) {
   try {
     message = JSON.parse(wsMsg);
   } catch (err) {
-    // TODO(leah): Emit an event here?
-    this.logger('debug', 'unable to parse message: ' + err);
+    this.logger('error', 'Unable to parse message: ' + err);
     return;
   }
 
   if (includes(RTM_CLIENT_INTERNAL_EVENT_TYPES, message.type)) {
     this._handleWsMessageInternal(message.type, message);
   } else {
+    this._maybeKeepAlive(message);
     this._handleWsMessageViaEventHandler(message.type, message);
   }
 };
 
 
 /**
- *
+ * Handler for messages we need to deal with internally.
  * @param {String} messageType
  * @param {Object} message
  * @private
@@ -1220,7 +1325,9 @@ RTMClient.prototype.handleWsError = function handleWsError(err) {
 
 
 /**
- *
+ * Occurs when the websocket closes.
+ * @param {String} code The error code
+ * @param {String} reason The reason for closing
  */
 RTMClient.prototype.handleWsClose = function handleWsClose(code, reason) {
   this.connected = false;
@@ -1247,10 +1354,58 @@ RTMClient.prototype._handlePong = function _handlePong(message) {
 };
 
 
-/** {@link https://api.slack.com/events/hello|hello} */
+/**
+ * Pings the remote server to let it know the client is still alive.
+ * @private
+ */
+RTMClient.prototype._pingServer = function _pingServer() {
+  var pongInterval;
+
+  if (this.connected) {
+    // Get the delta between ping sent & pong received, remember this timer
+    // fires sometime later so deduct that to get the real latency
+    pongInterval = Math.abs(Date.now() - this._lastPong - this.WS_PING_INTERVAL);
+    this.logger('debug', 'waited ' + pongInterval + ' ms for a pong');
+
+    // If we didn't receive a response to the last pong in some duration,
+    // force a reconnect
+    if (pongInterval > this.MAX_PONG_INTERVAL) {
+      this.reconnect();
+    } else {
+      this.send({ type: 'ping' }, noop);
+    }
+  }
+};
+
+
+/**
+ * If we haven't received a pong in too long, treat any incoming message as a pong
+ * to prevent unnecessary disconnects.
+ * @param {Object} message
+ */
+RTMClient.prototype._maybeKeepAlive = function _maybeKeepAlive(message) {
+  var pongInterval = Date.now() - this._lastPong;
+  if (pongInterval > this.MAX_PONG_INTERVAL) {
+    this.logger('warn', 'No pong in ' + pongInterval +
+      'ms, treating ' + message.type + ' as keep-alive');
+    this._lastPong = Date.now();
+  }
+};
+
+
+/**
+ * Occurs when the socket connection is opened.
+ * Begin ping-pong with the server.
+ * {@link https://api.slack.com/events/hello|hello}
+ */
 RTMClient.prototype._handleHello = function _handleHello() {
   this.connected = true;
   this.emit(CLIENT_EVENTS.RTM_CONNECTION_OPENED);
+
+  this._lastPong = Date.now();
+  this._connAttempts = 0;
+  if (this._pingTimer) clearInterval(this._pingTimer);
+  this._pingTimer = setInterval(bind(this._pingServer, this), this.WS_PING_INTERVAL);
 };
 
 
@@ -1268,6 +1423,7 @@ RTMClient.prototype.sendMessage = function sendMessage(text, channelId, optCb) {
   }, optCb);
 };
 
+
 /**
  * Helper for updating a sent message via the 'chat.update' API call
  * @param message {object} message The message object to be updated,
@@ -1278,6 +1434,7 @@ RTMClient.prototype.updateMessage = function updateMessage(message, optCb) {
   return this._chat.update(message.ts, message.channel, message.text, message.opts, optCb);
 };
 
+
 /**
  * Sends a typing indicator to indicate that the user with `activeUserId` is typing.
  * @param {string} channelId The id of the channel|group|DM to send this message to.
@@ -1286,6 +1443,19 @@ RTMClient.prototype.sendTyping = function sendTyping(channelId) {
   this.send({
     type: 'typing',
     channel: channelId
+  }, noop);
+};
+
+
+/**
+ * Subscribes this socket to presence changes for only the given `userIds`.
+ * This requires `presence_sub` to have been passed as an argument to `start`.
+ * @param {Array} userIds The user IDs to subscribe to
+ */
+RTMClient.prototype.subscribePresence = function subscribePresence(userIds) {
+  this.send({
+    type: 'presence_sub',
+    ids: userIds
   }, noop);
 };
 
@@ -1440,7 +1610,7 @@ RTMClient.prototype._clearMessageState = function _clearMessageState(msgId) {
 
 module.exports = RTMClient;
 
-},{"../../data-store/data-store":43,"../../data-store/memory-data-store":44,"../client":2,"../errors":4,"../events/client":5,"../events/rtm":7,"../events/utils":8,"../transports/ws":15,"../web/facets":28,"bluebird":99,"inherits":198,"lodash":216}],13:[function(require,module,exports){
+},{"../../data-store/data-store":45,"../../data-store/memory-data-store":46,"../client":2,"../errors":4,"../events/client":5,"../events/rtm":7,"../events/utils":8,"../retry-policies":11,"../transports/ws":15,"../web/facets":30,"bluebird":101,"inherits":202,"lodash":216}],13:[function(require,module,exports){
 // For some reason, I can't turn this off only for functions, so suppress all cases
 /* eslint no-use-before-define: 0 */
 
@@ -1498,8 +1668,6 @@ var handleRateLimitResponse = function handleRateLimitResponse(retryArgs, header
 
 
 /**
- *
- *
  * If this is reached, it means an error outside the normal error logic was received. These
  * should be very unusual as standard errors come back with a 200 code and an "error"
  * property.
@@ -1511,7 +1679,7 @@ var handleRateLimitResponse = function handleRateLimitResponse(retryArgs, header
  * @param statusCode
  */
 var handleHttpErr = function handleHttpErr(retryOp, apiCb, statusCode) {
-  var httpErr = new Error('Unable to process request, received bad ' + statusCode + ' error');
+  var httpErr = new Error('Unable to process request, received status ' + statusCode);
   if (!retryOp.retry(httpErr)) {
     apiCb(httpErr, null);
     return true;
@@ -1546,7 +1714,7 @@ var handleHttpResponse = function handleHttpResponse(body, headers, client, apiC
 
   if (!jsonResponse.ok) {
     jsonError = new Error(jsonResponse.error);
-    client.logger('error', jsonResponse.error);
+    client.logger('error', 'Response not OK: ', jsonResponse.error);
   }
 
   jsonResponse.scopes = (headers['x-oauth-scopes'] === undefined) ?
@@ -1620,8 +1788,9 @@ module.exports.handleHttpResponse = handleHttpResponse;
 var HttpsProxyAgent = require('https-proxy-agent');
 var has = require('lodash').has;
 var partial = require('lodash').partial;
+var defaults = require('lodash').defaults;
+var cloneDeep = require('lodash').cloneDeep;
 var request = require('request');
-
 
 var handleRequestTranportRes = function handleRequestTranportRes(cb, err, response, body) {
   var headers;
@@ -1645,6 +1814,18 @@ var getRequestTransportArgs = function getReqestTransportArgs(args) {
 
   if (has(args.data, 'file')) {
     transportArgs.formData = args.data;
+
+    // Buffers are sometimes not handled well by the underlying form-data package. Adding extra
+    // metadata can resolve this.
+    // see: https://github.com/slackapi/node-slack-sdk/issues/307#issuecomment-289231737
+    if (Buffer.isBuffer(transportArgs.formData.file) && has(args.data, 'filename')) {
+      transportArgs.formData.file = {
+        value: transportArgs.formData.file,
+        options: {
+          filename: args.data.filename
+        }
+      };
+    }
   } else {
     transportArgs.form = args.data;
   }
@@ -1665,17 +1846,24 @@ var proxiedRequestTransport = function proxiedRequestTransport(proxyURL) {
   };
 };
 
+var requestOptionsTransport = function requestOptionsTransport(options) {
+  return function _requestOptionsTransport(args, cb) {
+    var instanceOptions = cloneDeep(options);
+    var requestArgs = defaults(instanceOptions, getRequestTransportArgs(args));
+    request.post(requestArgs, partial(handleRequestTranportRes, cb));
+  };
+};
 
 var requestTransport = function requestTransport(args, cb) {
   var requestArgs = getRequestTransportArgs(args);
   request.post(requestArgs, partial(handleRequestTranportRes, cb));
 };
 
-
 module.exports.proxiedRequestTransport = proxiedRequestTransport;
+module.exports.requestOptionsTransport = requestOptionsTransport;
 module.exports.requestTransport = requestTransport;
 
-},{"https-proxy-agent":197,"lodash":216,"request":230}],15:[function(require,module,exports){
+},{"https-proxy-agent":201,"lodash":216,"request":231}],15:[function(require,module,exports){
 /**
  * Helper to make a new ws WebSocket instance.
  */
@@ -1684,6 +1872,27 @@ var HttpsProxyAgent = require('https-proxy-agent');
 var WebSocket = require('ws');
 var globalHelpers = require('../../helpers');
 
+var factory = function wsTransportFactory(logger) {
+  return function wsTransport(socketUrl, opts) {
+    var wsTransportOpts = opts || {};
+    var wsOpts = {};
+    var proxyURL = wsTransportOpts.proxyURL || process.env.https_proxy;
+
+    if (proxyURL) {
+      if (logger) {
+        logger('info', 'Using https proxy: ' + proxyURL);
+      }
+      wsOpts.agent = new HttpsProxyAgent(proxyURL);
+    }
+
+    wsOpts.headers = {
+      'User-Agent': globalHelpers.getVersionString()
+    };
+
+    return new WebSocket(socketUrl, wsOpts);
+  };
+};
+
 /**
  *
  * @param {String} socketUrl
@@ -1691,26 +1900,13 @@ var globalHelpers = require('../../helpers');
  * @param {String} opts.proxyURL
  * @returns {*}
  */
-var wsTransport = function wsTransport(socketUrl, opts) {
-  var wsTransportOpts = opts || {};
-  var wsOpts = {};
-  var proxyURL = wsTransportOpts.proxyURL || process.env.https_proxy;
+var wsTransport = factory();
 
-  if (proxyURL) {
-    console.log('Using https proxy: ' + proxyURL);
-    wsOpts.agent = new HttpsProxyAgent(proxyURL);
-  }
-
-  wsOpts.headers = {
-    'User-Agent': globalHelpers.getVersionString()
-  };
-
-  return new WebSocket(socketUrl, wsOpts);
-};
 
 module.exports = wsTransport;
+module.exports.factory = factory;
 
-},{"../../helpers":58,"https-proxy-agent":197,"ws":309}],16:[function(require,module,exports){
+},{"../../helpers":60,"https-proxy-agent":201,"ws":308}],16:[function(require,module,exports){
 /**
  *
  */
@@ -1726,19 +1922,181 @@ var facets = require('./facets/index');
 /**
  * Slack Web API client.
  *
- * @param token The Slack API token to use with this client.
- * @param {Object=} opts
- * @param {Object} opts.retryConfig The configuration to use for the retry operation,
- *     {@see https://github.com/SEAPUNK/node-retry}
+ * @param token - The Slack API token to use with this client.
+ * @param {Object} [opts]
+ * @param {Object} [opts.retryConfig] - The configuration to use for the retry operation,
+ * see {@link https://github.com/tim-kos/node-retry|node-retry} for more details.
  * @constructor
  */
 function WebAPIClient(token, opts) {
   var clientOpts = opts || {};
   BaseAPIClient.call(this, token, clientOpts);
+  this.logger('debug', 'WebAPIClient initialized');
 }
 
 inherits(WebAPIClient, BaseAPIClient);
 
+/**
+ * @name WebAPIClient#api
+ * @type {ApiFacet}
+ * @see {@link /node-slack-sdk/reference/ApiFacet|ApiFacet}
+ */
+
+ /**
+ * @name WebAPIClient#auth
+ * @type {AuthFacet}
+ * @see {@link /node-slack-sdk/reference/AuthFacet|AuthFacet}
+ */
+
+ /**
+ * @name WebAPIClient#bots
+ * @type {BotsFacet}
+ * @see {@link /node-slack-sdk/reference/BotsFacet|BotsFacet}
+ */
+
+ /**
+ * @name WebAPIClient#channels
+ * @type {ChannelsFacet}
+ * @see {@link /node-slack-sdk/reference/ChannelsFacet|ChannelsFacet}
+ */
+
+ /**
+ * @name WebAPIClient#chat
+ * @type {ChatFacet}
+ * @see {@link /node-slack-sdk/reference/ChatFacet|ChatFacet}
+ */
+
+ /**
+ * @name WebAPIClient#conversations
+ * @type {ConversationsFacet}
+ * @see {@link /node-slack-sdk/reference/ConversationsFacet|ConversationsFacet}
+ */
+
+ /**
+ * @name WebAPIClient#dialog
+ * @type {DialogFacet}
+ * @see {@link /node-slack-sdk/reference/DialogFacet|DialogFacet}
+ */
+
+ /**
+ * @name WebAPIClient#dnd
+ * @type {DndFacet}
+ * @see {@link /node-slack-sdk/reference/DndFacet|DndFacet}
+ */
+
+ /**
+ * @name WebAPIClient#emoji
+ * @type {EmojiFacet}
+ * @see {@link /node-slack-sdk/reference/EmojiFacet|EmojiFacet}
+ */
+
+ /**
+ * @name WebAPIClient#files.comments
+ * @type {FilesCommentsFacet}
+ * @see {@link /node-slack-sdk/reference/FilesCommentsFacet|FilesCommentsFacet}
+ */
+
+ /**
+ * @name WebAPIClient#files
+ * @type {FilesFacet}
+ * @see {@link /node-slack-sdk/reference/FilesFacet|FilesFacet}
+ */
+
+ /**
+ * @name WebAPIClient#groups
+ * @type {GroupsFacet}
+ * @see {@link /node-slack-sdk/reference/GroupsFacet|GroupsFacet}
+ */
+
+ /**
+ * @name WebAPIClient#im
+ * @type {ImFacet}
+ * @see {@link /node-slack-sdk/reference/ImFacet|ImFacet}
+ */
+
+ /**
+ * @name WebAPIClient#mpim
+ * @type {MpimFacet}
+ * @see {@link /node-slack-sdk/reference/MpimFacet|MpimFacet}
+ */
+
+ /**
+ * @name WebAPIClient#oauth
+ * @type {OauthFacet}
+ * @see {@link /node-slack-sdk/reference/OauthFacet|OauthFacet}
+ */
+
+ /**
+ * @name WebAPIClient#pins
+ * @type {PinsFacet}
+ * @see {@link /node-slack-sdk/reference/PinsFacet|PinsFacet}
+ */
+
+ /**
+ * @name WebAPIClient#presence
+ * @type {PresenceFacet}
+ * @see {@link /node-slack-sdk/reference/PresenceFacet|PresenceFacet}
+ */
+
+ /**
+ * @name WebAPIClient#reactions
+ * @type {ReactionsFacet}
+ * @see {@link /node-slack-sdk/reference/ReactionsFacet|ReactionsFacet}
+ */
+
+ /**
+ * @name WebAPIClient#reminders
+ * @type {RemindersFacet}
+ * @see {@link /node-slack-sdk/reference/RemindersFacet|RemindersFacet}
+ */
+
+ /**
+ * @name WebAPIClient#rtm
+ * @type {RtmFacet}
+ * @see {@link /node-slack-sdk/reference/RtmFacet|RtmFacet}
+ */
+
+ /**
+ * @name WebAPIClient#search
+ * @type {SearchFacet}
+ * @see {@link /node-slack-sdk/reference/SearchFacet|SearchFacet}
+ */
+
+ /**
+ * @name WebAPIClient#stars
+ * @type {StarsFacet}
+ * @see {@link /node-slack-sdk/reference/StarsFacet|StarsFacet}
+ */
+
+ /**
+ * @name WebAPIClient#team
+ * @type {TeamFacet}
+ * @see {@link /node-slack-sdk/reference/TeamFacet|TeamFacet}
+ */
+
+ /**
+ * @name WebAPIClient#usergroups
+ * @type {UsergroupsFacet}
+ * @see {@link /node-slack-sdk/reference/UsergroupsFacet|UsergroupsFacet}
+ */
+
+ /**
+ * @name WebAPIClient#usergroups.users
+ * @type {UsergroupsUsersFacet}
+ * @see {@link /node-slack-sdk/reference/UsergroupsUsersFacet|UsergroupsUsersFacet}
+ */
+
+ /**
+ * @name WebAPIClient#users
+ * @type {UsersFacet}
+ * @see {@link /node-slack-sdk/reference/UsersFacet|UsersFacet}
+ */
+
+ /**
+ * @name WebAPIClient#users.profiles
+ * @type {UsersProfilesFacet}
+ * @see {@link /node-slack-sdk/reference/UsersProfilesFacet|UsersProfilesFacet}
+ */
 
 /** @inheritDocs **/
 WebAPIClient.prototype._createFacets = function _createFacets() {
@@ -1765,7 +2123,7 @@ WebAPIClient.prototype._createFacets = function _createFacets() {
 
 module.exports = WebAPIClient;
 
-},{"../client":2,"./facets/index":28,"inherits":198,"lodash":216}],17:[function(require,module,exports){
+},{"../client":2,"./facets/index":30,"inherits":202,"lodash":216}],17:[function(require,module,exports){
 /**
  * API Facet to make calls to methods in the api namespace.
  *
@@ -1775,6 +2133,9 @@ module.exports = WebAPIClient;
  */
 
 
+ /**
+  * @constructor
+  */
 function ApiFacet(makeAPICall) {
   this.name = 'api';
   this.makeAPICall = makeAPICall;
@@ -1807,7 +2168,9 @@ module.exports = ApiFacet;
  *
  */
 
-
+/**
+ * @constructor
+ */
 function AuthFacet(makeAPICall) {
   this.name = 'auth';
   this.makeAPICall = makeAPICall;
@@ -1850,7 +2213,9 @@ module.exports = AuthFacet;
  *
  */
 
-
+/**
+ * @constructor
+ */
 function BotsFacet(makeAPICall) {
   this.name = 'bots';
   this.makeAPICall = makeAPICall;
@@ -1888,13 +2253,16 @@ module.exports = BotsFacet;
  *   - list: {@link https://api.slack.com/methods/channels.list|channels.list}
  *   - mark: {@link https://api.slack.com/methods/channels.mark|channels.mark}
  *   - rename: {@link https://api.slack.com/methods/channels.rename|channels.rename}
+ *   - replies: {@link https://api.slack.com/methods/channels.replies|channels.replies}
  *   - setPurpose: {@link https://api.slack.com/methods/channels.setPurpose|channels.setPurpose}
  *   - setTopic: {@link https://api.slack.com/methods/channels.setTopic|channels.setTopic}
  *   - unarchive: {@link https://api.slack.com/methods/channels.unarchive|channels.unarchive}
  *
  */
 
-
+/**
+ * @constructor
+ */
 function ChannelsFacet(makeAPICall) {
   this.name = 'channels';
   this.makeAPICall = makeAPICall;
@@ -2089,6 +2457,23 @@ ChannelsFacet.prototype.rename = function rename(channel, name, optCb) {
 
 
 /**
+ * Retrieve a thread of messages posted to a channel.
+ * @see {@link https://api.slack.com/methods/channels.replies|channels.replies}
+ *
+ * @param {?} channel - Channel to fetch thread from
+ * @param {?} thread_ts - Unique identifier of a thread's parent message.
+ * @param {function=} optCb Optional callback, if not using promises.
+ */
+ChannelsFacet.prototype.replies = function replies(channel, threadTs, optCb) {
+  var requiredArgs = {
+    channel: channel,
+    thread_ts: threadTs
+  };
+
+  return this.makeAPICall('channels.replies', requiredArgs, null, optCb);
+};
+
+/**
  * Sets the purpose for a channel.
  * @see {@link https://api.slack.com/methods/channels.setPurpose|channels.setPurpose}
  *
@@ -2149,12 +2534,16 @@ module.exports = ChannelsFacet;
  * This provides functions to call:
  *   - delete: {@link https://api.slack.com/methods/chat.delete|chat.delete}
  *   - meMessage: {@link https://api.slack.com/methods/chat.meMessage|chat.meMessage}
+ *   - postEphemeral: {@link https://api.slack.com/methods/chat.postEphemeral|chat.postEphemeral}
  *   - postMessage: {@link https://api.slack.com/methods/chat.postMessage|chat.postMessage}
  *   - update: {@link https://api.slack.com/methods/chat.update|chat.update}
+ *   - getPermalink: {@link https://api.slack.com/methods/chat.getPermalink|chat.getPermalink}
  *
  */
 
-
+/**
+ * @constructor
+ */
 function ChatFacet(makeAPICall) {
   this.name = 'chat';
   this.makeAPICall = makeAPICall;
@@ -2200,6 +2589,36 @@ ChatFacet.prototype.meMessage = function meMessage(channel, text, optCb) {
   return this.makeAPICall('chat.meMessage', requiredArgs, null, optCb);
 };
 
+
+/**
+ * Sends an ephemeral message to a user in a channel.
+ * @see {@link https://api.slack.com/methods/chat.postEphemeral|chat.postEphemeral}
+ *
+ * @param {?} channel - Channel, private group, or IM channel to send message to. Can be an
+ *   encoded ID, or a name. See [below](#channels) for more details.
+ * @param {?} text - Text of the message to send. See below for an explanation of
+ *   [formatting](#formatting). This field is usually required, unless you're providing only
+ *   `attachments` instead.
+* @param {?} user - `id` of the user who will receive the ephemeral message.
+ *   The user should be in the channel specified by the `channel` argument.
+ * @param {Object=} opts
+ * @param {?} opts.parse - Change how messages are treated. Defaults to `none`. See
+ *   [below](#formatting).
+ * @param {?} opts.link_names - Find and link channel names and usernames.
+ * @param {?} opts.attachments - Structured message attachments.
+ * @param {?} opts.as_user - Pass true to post the message as the authed user, instead of as a
+ *   bot. Defaults to false. See [authorship](#authorship) below.
+ * @param {function=} optCb Optional callback, if not using promises.
+ */
+ChatFacet.prototype.postEphemeral = function postEphemeral(channel, text, user, opts, optCb) {
+  var requiredArgs = {
+    channel: channel,
+    text: text,
+    user: user
+  };
+
+  return this.makeAPICall('chat.postEphemeral', requiredArgs, opts, optCb);
+};
 
 /**
  * Sends a message to a channel.
@@ -2268,10 +2687,430 @@ ChatFacet.prototype.update = function update(ts, channel, text, opts, optCb) {
   return this.makeAPICall('chat.update', requiredArgs, opts, optCb);
 };
 
+/**
+ * Unfurl a URL within a message by defining its message attachment.
+ * @see {@link https://api.slack.com/methods/chat.unfurl|chat.unfurl}
+ *
+ * @param {?} ts - Timestamp of the message to be updated.
+ * @param {?} channel - Channel of the message to be updated.
+ * @param {string} unfurls - a map of URLs to structured message attachments
+ * @param {Object=} opts
+ * @param {?} opts.user_auth_required - Pass true to require user authorization.
+ * @param {function=} optCb Optional callback, if not using promises.
+ */
+ChatFacet.prototype.unfurl = function unfurl(ts, channel, unfurls, opts, optCb) {
+  var requiredArgs = {
+    ts: ts,
+    channel: channel,
+    unfurls: unfurls
+  };
+
+  return this.makeAPICall('chat.unfurl', requiredArgs, opts, optCb);
+};
+
+/**
+ * Retrieve a permalink URL for a specific extant message.
+ * @see {@link https://api.slack.com/methods/chat.getPermalink|chat.getPermalink}
+ *
+ * @param {?} channel - The ID of the conversation or channel containing the message.
+ * @param {?} ts - A message's ts value, uniquely identifying it within a channel.
+ * @param {function=} optCb Optional callback, if not using promises.
+ */
+ChatFacet.prototype.getPermalink = function getPermalink(channel, ts, optCb) {
+  var requiredArgs = {
+    channel: channel,
+    message_ts: ts
+  };
+
+  return this.makeAPICall('chat.getPermalink', requiredArgs, null, optCb);
+};
 
 module.exports = ChatFacet;
 
 },{}],22:[function(require,module,exports){
+/**
+ * API Facet to make calls to methods in the conversations namespace.
+ *
+ * This provides functions to call:
+ *   - archive: {@link https://api.slack.com/methods/conversations.archive|conversations.archive}
+ *   - close: {@link https://api.slack.com/methods/conversations.close|conversations.close}
+ *   - create: {@link https://api.slack.com/methods/conversations.create|conversations.create}
+ *   - history: {@link https://api.slack.com/methods/conversations.history|conversations.history}
+ *   - info: {@link https://api.slack.com/methods/conversations.info|conversations.info}
+ *   - invite: {@link https://api.slack.com/methods/conversations.invite|conversations.invite}
+ *   - join: {@link https://api.slack.com/methods/conversations.join|conversations.join}
+ *   - kick: {@link https://api.slack.com/methods/conversations.kick|conversations.kick}
+ *   - leave: {@link https://api.slack.com/methods/conversations.leave|conversations.leave}
+ *   - list: {@link https://api.slack.com/methods/conversations.list|conversations.list}
+ *   - members: {@link https://api.slack.com/methods/conversations.members|conversations.members}
+ *   - open: {@link https://api.slack.com/methods/conversations.open|conversations.open}
+ *   - rename: {@link https://api.slack.com/methods/conversations.rename|conversations.rename}
+ *   - replies: {@link https://api.slack.com/methods/conversations.replies|conversations.replies}
+ *   - setPurpose: {@link https://api.slack.com/methods/conversations.setPurpose|conversations.setPurpose}
+ *   - setTopic: {@link https://api.slack.com/methods/conversations.setTopic|conversations.setTopic}
+ *   - unarchive: {@link https://api.slack.com/methods/conversations.unarchive|conversations.unarchive}
+ *
+ */
+
+/**
+ * @constructor
+ */
+function ConversationsFacet(makeAPICall) {
+  this.name = 'conversations';
+  this.makeAPICall = makeAPICall;
+}
+
+
+/**
+ * Archives a conversation.
+ * @see {@link https://api.slack.com/methods/conversations.archive|conversations.archive}
+ *
+ * @param {?} channel - ID of conversation to archive
+ * @param {function=} optCb Optional callback, if not using promises.
+ */
+ConversationsFacet.prototype.archive = function archive(channel, optCb) {
+  var requiredArgs = {
+    channel: channel
+  };
+
+  return this.makeAPICall('conversations.archive', requiredArgs, null, optCb);
+};
+
+/**
+ * Closes a direct message or multi-person direct message.
+ * @see {@link https://api.slack.com/methods/conversations.close|conversations.close}
+ *
+ * @param {?} channel - Conversation to close.
+ * @param {function=} optCb Optional callback, if not using promises.
+ */
+ConversationsFacet.prototype.close = function close(channel, optCb) {
+  var requiredArgs = {
+    channel: channel
+  };
+
+  return this.makeAPICall('conversations.close', requiredArgs, null, optCb);
+};
+
+/**
+ * Initiates a public or private channel-based conversation
+ * @see {@link https://api.slack.com/methods/conversations.create|conversations.create}
+ *
+ * @param {?} name - Name of the public or private channel to create
+ * @param {Object=} opts
+ * @param {?} opts.is_private - Create a private channel instead of a public one
+ * @param {function=} optCb Optional callback, if not using promises.
+ */
+ConversationsFacet.prototype.create = function create(name, opts, optCb) {
+  var requiredArgs = {
+    name: name
+  };
+
+  return this.makeAPICall('conversations.create', requiredArgs, opts, optCb);
+};
+
+/**
+ * Fetches a conversation's history of messages and events.
+ * @see {@link https://api.slack.com/methods/conversations.history|conversations.history}
+ *
+ * @param {?} channel - Conversation ID to fetch history for.
+ * @param {Object=} opts
+ * @param {?} opts.latest - End of time range of messages to include in results.
+ * @param {?} opts.oldest - Start of time range of messages to include in results.
+ * @param {?} opts.cursor - Paginate through collections of data by setting the cursor parameter to
+ * a next_cursor attribute returned by a previous request's response_metadata. Default value fetches
+ * the first "page" of the collection. See pagination for more detail.
+ * @param {?} opts.limit - The maximum number of items to return. Fewer than the requested number of
+ * items may be returned, even if the end of the users list hasn't been reached.
+ * @param {function=} optCb Optional callback, if not using promises.
+ */
+ConversationsFacet.prototype.history = function history(channel, opts, optCb) {
+  var requiredArgs = {
+    channel: channel
+  };
+
+  return this.makeAPICall('conversations.history', requiredArgs, opts, optCb);
+};
+
+
+/**
+ * Retrieve information about a conversation.
+ * @see {@link https://api.slack.com/methods/conversations.info|conversations.info}
+ *
+ * @param {?} channel - Channel to get info on
+ * @param {Object=} opts
+ * @param {?} opts.include_locale - Set this to `true` to receive the locale for this conversation.
+ * Defaults to `false`
+ * @param {function=} optCb Optional callback, if not using promises.
+ */
+ConversationsFacet.prototype.info = function info(channel, opts, optCb) {
+  var requiredArgs = {
+    channel: channel
+  };
+
+  return this.makeAPICall('conversations.info', requiredArgs, opts, optCb);
+};
+
+
+/**
+ * Invites users to a channel.
+ * @see {@link https://api.slack.com/methods/conversations.invite|conversations.invite}
+ *
+ * @param {?} channel - The ID of the public or private channel to invite user(s) to.
+ * @param {?} users - A comma separated list of user IDs. Up to 30 users may be listed.
+ * @param {function=} optCb Optional callback, if not using promises.
+ */
+ConversationsFacet.prototype.invite = function invite(channel, users, optCb) {
+  var requiredArgs = {
+    channel: channel,
+    users: users
+  };
+
+  return this.makeAPICall('conversations.invite', requiredArgs, null, optCb);
+};
+
+
+/**
+ * Joins an existing conversation.
+ * @see {@link https://api.slack.com/methods/conversations.join|conversations.join}
+ *
+ * @param {?} channel - ID of conversation to join
+ * @param {function=} optCb Optional callback, if not using promises.
+ */
+ConversationsFacet.prototype.join = function join(channel, optCb) {
+  var requiredArgs = {
+    channel: channel
+  };
+
+  return this.makeAPICall('conversations.join', requiredArgs, null, optCb);
+};
+
+
+/**
+ * Removes a user from a conversation.
+ * @see {@link https://api.slack.com/methods/conversations.kick|conversations.kick}
+ *
+ * @param {?} channel - ID of conversation to remove user from.
+ * @param {?} user - User to remove from channel.
+ * @param {function=} optCb Optional callback, if not using promises.
+ */
+ConversationsFacet.prototype.kick = function kick(channel, user, optCb) {
+  var requiredArgs = {
+    channel: channel,
+    user: user
+  };
+
+  return this.makeAPICall('conversations.kick', requiredArgs, null, optCb);
+};
+
+
+/**
+ * Leaves a channel.
+ * @see {@link https://api.slack.com/methods/conversations.leave|conversations.leave}
+ *
+ * @param {?} channel - Channel to leave
+ * @param {function=} optCb Optional callback, if not using promises.
+ */
+ConversationsFacet.prototype.leave = function leave(channel, optCb) {
+  var requiredArgs = {
+    channel: channel
+  };
+
+  return this.makeAPICall('conversations.leave', requiredArgs, null, optCb);
+};
+
+
+/**
+ * Lists all conversations in a Slack team.
+ * @see {@link https://api.slack.com/methods/conversations.list|conversations.list}
+ *
+ * @param {Object=} opts
+ * @param {?} opts.exclude_archived - Set to `true` to exclude archived channels from the list
+ * @param {?} opts.types - Mix and match channel types by providing a comma-separated list of any
+ * combination of `public_channel`, `private_channel`, `mpim`, `im`
+ * @param {?} opts.cursor - Paginate through collections of data by setting the cursor parameter to
+ * a next_cursor attribute returned by a previous request's response_metadata. Default value fetches
+ * the first "page" of the collection. See pagination for more detail.
+ * @param {?} opts.limit - The maximum number of items to return. Fewer than the requested number of
+ * items may be returned, even if the end of the users list hasn't been reached.
+ * @param {function=} optCb Optional callback, if not using promises.
+ */
+ConversationsFacet.prototype.list = function list(opts, optCb) {
+  return this.makeAPICall('conversations.list', null, opts, optCb);
+};
+
+
+/**
+ * Retrieve members of a conversation.
+ * @see {@link https://api.slack.com/methods/conversations.members|conversations.members}
+ *
+ * @param {?} channel - ID of the conversation to retrieve members for
+ * @param {Object=} opts
+ * @param {?} opts.cursor - Paginate through collections of data by setting the cursor parameter to
+ * a next_cursor attribute returned by a previous request's response_metadata. Default value fetches
+ * the first "page" of the collection. See pagination for more detail.
+ * @param {?} opts.limit - The maximum number of items to return. Fewer than the requested number of
+ * items may be returned, even if the end of the users list hasn't been reached.
+ * @param {function=} optCb Optional callback, if not using promises.
+ */
+ConversationsFacet.prototype.members = function members(channel, opts, optCb) {
+  var requiredArgs = {
+    channel: channel
+  };
+
+  return this.makeAPICall('conversations.members', requiredArgs, opts, optCb);
+};
+
+/**
+ * Opens or resumes a direct message or multi-person direct message.
+ * @see {@link https://api.slack.com/methods/conversations.open|conversations.open}
+ *
+ * @param {Object=} opts
+ * @param {?} opts.channel - Resume a conversation by supplying an im or mpim's ID. Or provide the
+ * users field instead.
+ * @param {?} opts.return_im - Boolean, indicates you want the full IM channel definition in the
+ * response.
+ * @param {?} opts.users - Comma separated lists of users. If only one user is included, this
+ * creates a 1:1 DM. The ordering of the users is preserved whenever a multi-person direct message
+ * is returned. Supply a channel when not supplying users.
+ * @param {function=} optCb Optional callback, if not using promises.
+ */
+ConversationsFacet.prototype.open = function open(opts, optCb) {
+  return this.makeAPICall('conversations.open', null, opts, optCb);
+};
+
+/**
+ * Renames a conversation.
+ * @see {@link https://api.slack.com/methods/conversations.rename|conversations.rename}
+ *
+ * @param {?} channel - ID of conversation to rename
+ * @param {?} name - New name for conversation.
+ * @param {function=} optCb Optional callback, if not using promises.
+ */
+ConversationsFacet.prototype.rename = function rename(channel, name, optCb) {
+  var requiredArgs = {
+    channel: channel,
+    name: name
+  };
+
+  return this.makeAPICall('conversations.rename', requiredArgs, null, optCb);
+};
+
+/**
+ * Retrieve a thread of messages posted to a conversation
+ * @see {@link https://api.slack.com/methods/conversations.replies|conversations.replies}
+ *
+ * @param {?} channel - Conversation ID to fetch thread from
+ * @param {?} ts - Unique identifier of a thread's parent message
+ * @param {Object=} opts
+ * @param {?} opts.cursor - Paginate through collections of data by setting the cursor parameter to
+ * a next_cursor attribute returned by a previous request's response_metadata. Default value fetches
+ * the first "page" of the collection. See pagination for more detail.
+ * @param {?} opts.limit - The maximum number of items to return. Fewer than the requested number of
+ * items may be returned, even if the end of the users list hasn't been reached.
+ * @param {function=} optCb Optional callback, if not using promises.
+ */
+ConversationsFacet.prototype.replies = function replies(channel, ts, opts, optCb) {
+  var requiredArgs = {
+    channel: channel,
+    ts: ts
+  };
+
+  return this.makeAPICall('conversations.replies', requiredArgs, opts, optCb);
+};
+
+/**
+ * Sets the purpose for a conversation.
+ * @see {@link https://api.slack.com/methods/conversations.setPurpose|conversations.setPurpose}
+ *
+ * @param {?} channel - Conversation to set the purpose of
+ * @param {?} purpose - A new, specialer purpose
+ * @param {function=} optCb Optional callback, if not using promises.
+ */
+ConversationsFacet.prototype.setPurpose = function setPurpose(channel, purpose, optCb) {
+  var requiredArgs = {
+    channel: channel,
+    purpose: purpose
+  };
+
+  return this.makeAPICall('conversations.setPurpose', requiredArgs, null, optCb);
+};
+
+
+/**
+ * Sets the topic for a conversation.
+ * @see {@link https://api.slack.com/methods/conversations.setTopic|conversations.setTopic}
+ *
+ * @param {?} channel - Conversation to set the topic of
+ * @param {?} topic - The new topic string. Does not support formatting or linkification.
+ * @param {function=} optCb Optional callback, if not using promises.
+ */
+ConversationsFacet.prototype.setTopic = function setTopic(channel, topic, optCb) {
+  var requiredArgs = {
+    channel: channel,
+    topic: topic
+  };
+
+  return this.makeAPICall('conversations.setTopic', requiredArgs, null, optCb);
+};
+
+
+/**
+ * Reverses conversation archival.
+ * @see {@link https://api.slack.com/methods/conversations.unarchive|conversations.unarchive}
+ *
+ * @param {?} channel - ID of conversation to unarchive
+ * @param {function=} optCb Optional callback, if not using promises.
+ */
+ConversationsFacet.prototype.unarchive = function unarchive(channel, optCb) {
+  var requiredArgs = {
+    channel: channel
+  };
+
+  return this.makeAPICall('conversations.unarchive', requiredArgs, null, optCb);
+};
+
+
+module.exports = ConversationsFacet;
+
+},{}],23:[function(require,module,exports){
+/**
+ * API Facet to make calls to methods in the dialog namespace.
+ *
+ * This provides functions to call:
+ *   - open: {@link https://api.slack.com/methods/dialog.open|dialog.open}
+ *
+ */
+
+/**
+ * @constructor
+ */
+function DialogFacet(makeAPICall) {
+  this.name = 'dialog';
+  this.makeAPICall = makeAPICall;
+}
+
+
+/**
+ * Opens a dialog corresponding to the trigger.
+ * @see {@link https://api.slack.com/methods/dialog.open|dialog.open}
+ *
+ * @param {?} dialog - The dialog definition, as a JSON-encoded string.
+ * @param {?} triggerId - The trigger that this dialog opens in response to.
+ * @param {function=} optCb Optional callback, if not using promises.
+ */
+DialogFacet.prototype.open = function open(dialog, triggerId, optCb) {
+  var requiredArgs = {
+    dialog: dialog,
+    trigger_id: triggerId
+  };
+
+  return this.makeAPICall('dialog.open', requiredArgs, null, optCb);
+};
+
+
+module.exports = DialogFacet;
+
+},{}],24:[function(require,module,exports){
 /**
  * API Facet to make calls to methods in the dnd namespace.
  *
@@ -2284,7 +3123,9 @@ module.exports = ChatFacet;
  *
  */
 
-
+/**
+ * @constructor
+ */
 function DndFacet(makeAPICall) {
   this.name = 'dnd';
   this.makeAPICall = makeAPICall;
@@ -2357,7 +3198,7 @@ DndFacet.prototype.teamInfo = function teamInfo(opts, optCb) {
 
 module.exports = DndFacet;
 
-},{}],23:[function(require,module,exports){
+},{}],25:[function(require,module,exports){
 /**
  * API Facet to make calls to methods in the emoji namespace.
  *
@@ -2366,7 +3207,9 @@ module.exports = DndFacet;
  *
  */
 
-
+/**
+ * @constructor
+ */
 function EmojiFacet(makeAPICall) {
   this.name = 'emoji';
   this.makeAPICall = makeAPICall;
@@ -2386,7 +3229,7 @@ EmojiFacet.prototype.list = function list(optCb) {
 
 module.exports = EmojiFacet;
 
-},{}],24:[function(require,module,exports){
+},{}],26:[function(require,module,exports){
 /**
  * API Facet to make calls to methods in the files.comments namespace.
  *
@@ -2397,7 +3240,9 @@ module.exports = EmojiFacet;
  *
  */
 
-
+/**
+ * @constructor
+ */
 function FilesCommentsFacet(makeAPICall) {
   this.name = 'files.comments';
   this.makeAPICall = makeAPICall;
@@ -2465,7 +3310,7 @@ FilesCommentsFacet.prototype.edit = function edit(file, id, comment, optCb) {
 
 module.exports = FilesCommentsFacet;
 
-},{}],25:[function(require,module,exports){
+},{}],27:[function(require,module,exports){
 /**
  * API Facet to make calls to methods in the files namespace.
  *
@@ -2479,7 +3324,9 @@ module.exports = FilesCommentsFacet;
  *
  */
 
-
+/**
+ * @constructor
+ */
 function FilesFacet(makeAPICall) {
   this.name = 'files';
   this.makeAPICall = makeAPICall;
@@ -2611,7 +3458,7 @@ FilesFacet.prototype.upload = function upload(filename, opts, optCb) {
 
 module.exports = FilesFacet;
 
-},{}],26:[function(require,module,exports){
+},{}],28:[function(require,module,exports){
 /**
  * API Facet to make calls to methods in the groups namespace.
  *
@@ -2629,13 +3476,16 @@ module.exports = FilesFacet;
  *   - mark: {@link https://api.slack.com/methods/groups.mark|groups.mark}
  *   - open: {@link https://api.slack.com/methods/groups.open|groups.open}
  *   - rename: {@link https://api.slack.com/methods/groups.rename|groups.rename}
+ *   - replies: {@link https://api.slack.com/methods/groups.replies|groups.replies}
  *   - setPurpose: {@link https://api.slack.com/methods/groups.setPurpose|groups.setPurpose}
  *   - setTopic: {@link https://api.slack.com/methods/groups.setTopic|groups.setTopic}
  *   - unarchive: {@link https://api.slack.com/methods/groups.unarchive|groups.unarchive}
  *
  */
 
-
+/**
+ * @constructor
+ */
 function GroupsFacet(makeAPICall) {
   this.name = 'groups';
   this.makeAPICall = makeAPICall;
@@ -2860,6 +3710,22 @@ GroupsFacet.prototype.rename = function rename(channel, name, optCb) {
   return this.makeAPICall('groups.rename', requiredArgs, null, optCb);
 };
 
+/**
+ * Retrieve a thread of messages posted to a private channel.
+ * @see {@link https://api.slack.com/methods/groups.replies|groups.replies}
+ *
+ * @param {?} channel - Private channel to fetch thread from
+ * @param {?} thread_ts - Unique identifier of a thread's parent message
+ * @param {function=} optCb Optional callback, if not using promises.
+ */
+GroupsFacet.prototype.replies = function replies(channel, threadTs, optCb) {
+  var requiredArgs = {
+    channel: channel,
+    thread_ts: threadTs
+  };
+
+  return this.makeAPICall('groups.replies', requiredArgs, null, optCb);
+};
 
 /**
  * Sets the purpose for a private channel.
@@ -2915,7 +3781,7 @@ GroupsFacet.prototype.unarchive = function unarchive(channel, optCb) {
 
 module.exports = GroupsFacet;
 
-},{}],27:[function(require,module,exports){
+},{}],29:[function(require,module,exports){
 /**
  * API Facet to make calls to methods in the im namespace.
  *
@@ -2925,10 +3791,13 @@ module.exports = GroupsFacet;
  *   - list: {@link https://api.slack.com/methods/im.list|im.list}
  *   - mark: {@link https://api.slack.com/methods/im.mark|im.mark}
  *   - open: {@link https://api.slack.com/methods/im.open|im.open}
+ *   - replies: {@link https://api.slack.com/methods/im.replies|im.replies}
  *
  */
 
-
+/**
+ * @constructor
+ */
 function ImFacet(makeAPICall) {
   this.name = 'im';
   this.makeAPICall = makeAPICall;
@@ -3017,16 +3886,35 @@ ImFacet.prototype.open = function open(user, optCb) {
   return this.makeAPICall('im.open', requiredArgs, null, optCb);
 };
 
+/**
+ * Returns an entire thread (a message plus all the messages in reply to it).
+ * @see {@link https://api.slack.com/methods/im.replies|im.replies}
+ *
+ * @param {?} channel - Direct message channel to get replies from.
+ * @param {?} thread_ts - Timestamp of the parent message.
+ * @param {function=} optCb Optional callback, if not using promises.
+ */
+ImFacet.prototype.replies = function replies(channel, threadTs, optCb) {
+  var requiredArgs = {
+    channel: channel,
+    thread_ts: threadTs
+  };
+
+  return this.makeAPICall('im.replies', requiredArgs, null, optCb);
+};
+
 
 module.exports = ImFacet;
 
-},{}],28:[function(require,module,exports){
+},{}],30:[function(require,module,exports){
 module.exports = {
   ApiFacet: require('./api.js'),
   AuthFacet: require('./auth.js'),
   BotsFacet: require('./bots'),
   ChannelsFacet: require('./channels.js'),
   ChatFacet: require('./chat.js'),
+  ConversationsFacet: require('./conversations.js'),
+  DialogFacet: require('./dialog.js'),
   DndFacet: require('./dnd.js'),
   EmojiFacet: require('./emoji.js'),
   FilesFacet: require('./files.js'),
@@ -3049,7 +3937,7 @@ module.exports = {
   UsersProfileFacet: require('./users.profile.js')
 };
 
-},{"./api.js":17,"./auth.js":18,"./bots":19,"./channels.js":20,"./chat.js":21,"./dnd.js":22,"./emoji.js":23,"./files.comments.js":24,"./files.js":25,"./groups.js":26,"./im":27,"./mpim.js":29,"./oauth.js":30,"./pins.js":31,"./presence.js":32,"./reactions.js":33,"./reminders.js":34,"./rtm.js":35,"./search.js":36,"./stars.js":37,"./team.js":38,"./usergroups.js":39,"./usergroups.users.js":40,"./users.js":41,"./users.profile.js":42}],29:[function(require,module,exports){
+},{"./api.js":17,"./auth.js":18,"./bots":19,"./channels.js":20,"./chat.js":21,"./conversations.js":22,"./dialog.js":23,"./dnd.js":24,"./emoji.js":25,"./files.comments.js":26,"./files.js":27,"./groups.js":28,"./im":29,"./mpim.js":31,"./oauth.js":32,"./pins.js":33,"./presence.js":34,"./reactions.js":35,"./reminders.js":36,"./rtm.js":37,"./search.js":38,"./stars.js":39,"./team.js":40,"./usergroups.js":41,"./usergroups.users.js":42,"./users.js":43,"./users.profile.js":44}],31:[function(require,module,exports){
 /**
  * API Facet to make calls to methods in the mpim namespace.
  *
@@ -3062,7 +3950,9 @@ module.exports = {
  *
  */
 
-
+/**
+ * @constructor
+ */
 function MpimFacet(makeAPICall) {
   this.name = 'mpim';
   this.makeAPICall = makeAPICall;
@@ -3155,7 +4045,7 @@ MpimFacet.prototype.open = function open(users, optCb) {
 
 module.exports = MpimFacet;
 
-},{}],30:[function(require,module,exports){
+},{}],32:[function(require,module,exports){
 /**
  * API Facet to make calls to methods in the oauth namespace.
  *
@@ -3164,7 +4054,9 @@ module.exports = MpimFacet;
  *
  */
 
-
+/**
+ * @constructor
+ */
 function OauthFacet(makeAPICall) {
   this.name = 'oauth';
   this.makeAPICall = makeAPICall;
@@ -3195,7 +4087,7 @@ OauthFacet.prototype.access = function access(clientId, clientSecret, code, opts
 
 module.exports = OauthFacet;
 
-},{}],31:[function(require,module,exports){
+},{}],33:[function(require,module,exports){
 /**
  * API Facet to make calls to methods in the pins namespace.
  *
@@ -3206,7 +4098,9 @@ module.exports = OauthFacet;
  *
  */
 
-
+/**
+ * @constructor
+ */
 function PinsFacet(makeAPICall) {
   this.name = 'pins';
   this.makeAPICall = makeAPICall;
@@ -3271,7 +4165,7 @@ PinsFacet.prototype.remove = function remove(channel, opts, optCb) {
 
 module.exports = PinsFacet;
 
-},{}],32:[function(require,module,exports){
+},{}],34:[function(require,module,exports){
 /**
  * API Facet to make calls to methods in the presence namespace.
  *
@@ -3280,7 +4174,9 @@ module.exports = PinsFacet;
  *
  */
 
-
+/**
+ * @constructor
+ */
 function PresenceFacet(makeAPICall) {
   this.name = 'presence';
   this.makeAPICall = makeAPICall;
@@ -3305,7 +4201,7 @@ PresenceFacet.prototype.set = function set(presence, optCb) {
 
 module.exports = PresenceFacet;
 
-},{}],33:[function(require,module,exports){
+},{}],35:[function(require,module,exports){
 /**
  * API Facet to make calls to methods in the reactions namespace.
  *
@@ -3317,7 +4213,9 @@ module.exports = PresenceFacet;
  *
  */
 
-
+/**
+ * @constructor
+ */
 function ReactionsFacet(makeAPICall) {
   this.name = 'reactions';
   this.makeAPICall = makeAPICall;
@@ -3401,7 +4299,7 @@ ReactionsFacet.prototype.remove = function remove(name, opts, optCb) {
 
 module.exports = ReactionsFacet;
 
-},{}],34:[function(require,module,exports){
+},{}],36:[function(require,module,exports){
 /**
  * API Facet to make calls to methods in the reminders namespace.
  *
@@ -3414,7 +4312,9 @@ module.exports = ReactionsFacet;
  *
  */
 
-
+/**
+ * @constructor
+ */
 function RemindersFacet(makeAPICall) {
   this.name = 'reminders';
   this.makeAPICall = makeAPICall;
@@ -3505,16 +4405,18 @@ RemindersFacet.prototype.list = function list(optCb) {
 
 module.exports = RemindersFacet;
 
-},{}],35:[function(require,module,exports){
+},{}],37:[function(require,module,exports){
 /**
  * API Facet to make calls to methods in the rtm namespace.
  *
  * This provides functions to call:
  *   - start: {@link https://api.slack.com/methods/rtm.start|rtm.start}
- *
+ *   - connect: {@link https://api.slack.com/methods/rtm.connect|rtm.connect}
  */
 
-
+/**
+ * @constructor
+ */
 function RtmFacet(makeAPICall) {
   this.name = 'rtm';
   this.makeAPICall = makeAPICall;
@@ -3525,21 +4427,38 @@ function RtmFacet(makeAPICall) {
  * Starts a Real Time Messaging session.
  * @see {@link https://api.slack.com/methods/rtm.start|rtm.start}
  *
- * @param {Object=} opts
- * @param {?} opts.simple_latest - Return timestamp only for latest message object of each channel
- *   (improves performance).
- * @param {?} opts.no_unreads - Skip unread counts for each channel (improves performance).
- * @param {?} opts.mpim_aware - Returns MPIMs to the client in the API response.
- * @param {function=} optCb Optional callback, if not using promises.
+ * @param {Object} opts
+ * @param {Boolean} opts.simple_latest  Return timestamp only for latest message object of each
+ *                                      channel (improves performance).
+ * @param {Boolean} opts.no_unreads     Skip unread counts for each channel (improves performance).
+ * @param {Boolean} opts.mpim_aware     Returns MPIMs to the client in the API response.
+ * @param {Boolean} opts.presence_sub   Support presence subscriptions on this socket connection.
+ * @param {Boolean} opts.include_locale Set this to `true` to receive the locale for users and
+ *                                      channels. Defaults to `false`
+ * @param {Function} optCb              Optional callback, if not using promises.
  */
 RtmFacet.prototype.start = function start(opts, optCb) {
   return this.makeAPICall('rtm.start', null, opts, optCb);
 };
 
 
+/**
+ * Starts a Real Time Messaging session using the lighter-weight rtm.connect.
+ * This will give us a WebSocket URL without the payload of `rtm.start`.
+ * @see {@link https://api.slack.com/methods/rtm.connect|rtm.connect}
+ *
+ * @param {Object} opts
+ * @param {Boolean} opts.presence_sub   Support presence subscriptions on this socket connection.
+ * @param {Function} optCb              Optional callback, if not using promises.
+ */
+RtmFacet.prototype.connect = function connect(opts, optCb) {
+  return this.makeAPICall('rtm.connect', null, opts, optCb);
+};
+
+
 module.exports = RtmFacet;
 
-},{}],36:[function(require,module,exports){
+},{}],38:[function(require,module,exports){
 /**
  * API Facet to make calls to methods in the search namespace.
  *
@@ -3550,7 +4469,9 @@ module.exports = RtmFacet;
  *
  */
 
-
+/**
+ * @constructor
+ */
 function SearchFacet(makeAPICall) {
   this.name = 'search';
   this.makeAPICall = makeAPICall;
@@ -3625,7 +4546,7 @@ SearchFacet.prototype.messages = function messages(query, opts, optCb) {
 
 module.exports = SearchFacet;
 
-},{}],37:[function(require,module,exports){
+},{}],39:[function(require,module,exports){
 /**
  * API Facet to make calls to methods in the stars namespace.
  *
@@ -3636,7 +4557,9 @@ module.exports = SearchFacet;
  *
  */
 
-
+/**
+ * @constructor
+ */
 function StarsFacet(makeAPICall) {
   this.name = 'stars';
   this.makeAPICall = makeAPICall;
@@ -3693,7 +4616,7 @@ StarsFacet.prototype.remove = function remove(opts, optCb) {
 
 module.exports = StarsFacet;
 
-},{}],38:[function(require,module,exports){
+},{}],40:[function(require,module,exports){
 /**
  * API Facet to make calls to methods in the team namespace.
  *
@@ -3705,7 +4628,9 @@ module.exports = StarsFacet;
  *
  */
 
-
+/**
+ * @constructor
+ */
 function TeamFacet(makeAPICall) {
   this.name = 'team';
   this.makeAPICall = makeAPICall;
@@ -3770,7 +4695,7 @@ TeamFacet.prototype.integrationLogs = function integrationLogs(opts, optCb) {
 
 module.exports = TeamFacet;
 
-},{}],39:[function(require,module,exports){
+},{}],41:[function(require,module,exports){
 /**
  * API Facet to make calls to methods in the usergroups namespace.
  *
@@ -3783,7 +4708,9 @@ module.exports = TeamFacet;
  *
  */
 
-
+/**
+ * @constructor
+ */
 function UsergroupsFacet(makeAPICall) {
   this.name = 'usergroups';
   this.makeAPICall = makeAPICall;
@@ -3890,7 +4817,7 @@ UsergroupsFacet.prototype.update = function update(usergroup, opts, optCb) {
 
 module.exports = UsergroupsFacet;
 
-},{}],40:[function(require,module,exports){
+},{}],42:[function(require,module,exports){
 /**
  * API Facet to make calls to methods in the usergroups.users namespace.
  *
@@ -3900,7 +4827,9 @@ module.exports = UsergroupsFacet;
  *
  */
 
-
+/**
+ * @constructor
+ */
 function UsergroupsUsersFacet(makeAPICall) {
   this.name = 'usergroups.users';
   this.makeAPICall = makeAPICall;
@@ -3948,7 +4877,9 @@ UsergroupsUsersFacet.prototype.update = function update(usergroup, users, opts, 
 
 module.exports = UsergroupsUsersFacet;
 
-},{}],41:[function(require,module,exports){
+},{}],43:[function(require,module,exports){
+var isFunction = require('lodash').isFunction;
+
 /**
  * API Facet to make calls to methods in the users namespace.
  *
@@ -3957,12 +4888,15 @@ module.exports = UsergroupsUsersFacet;
  *   - identity: {@link https://api.slack.com/methods/users.identity|users.identity}
  *   - info: {@link https://api.slack.com/methods/users.info|users.info}
  *   - list: {@link https://api.slack.com/methods/users.list|users.list}
+ *   - lookupByEmail: {@link https://api.slack.com/methods/users.lookupByEmail|users.lookupByEmail}
  *   - setActive: {@link https://api.slack.com/methods/users.setActive|users.setActive}
  *   - setPresence: {@link https://api.slack.com/methods/users.setPresence|users.setPresence}
  *
  */
 
-
+/**
+ * @constructor
+ */
 function UsersFacet(makeAPICall) {
   this.name = 'users';
   this.makeAPICall = makeAPICall;
@@ -3989,10 +4923,28 @@ UsersFacet.prototype.getPresence = function getPresence(user, optCb) {
  * Get a user's identity.
  * @see {@link https://api.slack.com/methods/users.identity|users.identity}
  *
+ * @param {Object=} options
+ * @param {?} opts.user - When calling this method with a workspace token, set this to
+ * the user ID of the user to retrieve the identity of
  * @param {function=} optCb Optional callback, if not using promises.
  */
-UsersFacet.prototype.identity = function identity(optCb) {
-  return this.makeAPICall('users.identity', null, null, optCb);
+UsersFacet.prototype.identity = function identity(options, optCb) {
+  var cb = null;
+  var opts = {};
+
+  cb = optCb;
+
+  if (options) {
+    if (isFunction(options)) {
+      cb = options;
+    } else {
+      if (options.user) {
+        opts.user = options.user;
+      }
+    }
+  }
+
+  return this.makeAPICall('users.identity', null, opts, cb);
 };
 
 
@@ -4018,10 +4970,29 @@ UsersFacet.prototype.info = function info(user, optCb) {
  *
  * @param {Object=} opts
  * @param {?} opts.presence - Whether to include presence data in the output
+ * @param {?} opts.include_locale - Set this to `true` to receive the locale for users. Defaults to
+ * `false`
  * @param {function=} optCb Optional callback, if not using promises.
  */
 UsersFacet.prototype.list = function list(opts, optCb) {
   return this.makeAPICall('users.list', null, opts, optCb);
+};
+
+
+/**
+ * Find a user with an email address.
+ * @see {@link https://api.slack.com/methods/users.lookupByEmail|users.lookupByEmail}
+ *
+ * @param {?} email - An email address belonging to a user in the workspace
+ * @param {Object=} opts
+ * @param {function=} optCb Optional callback, if not using promises.
+ */
+UsersFacet.prototype.lookupByEmail = function lookupByEmail(email, opts, optCb) {
+  var requiredArgs = {
+    email: email
+  };
+
+  return this.makeAPICall('users.lookupByEmail', requiredArgs, opts, optCb);
 };
 
 
@@ -4054,7 +5025,7 @@ UsersFacet.prototype.setPresence = function setPresence(presence, optCb) {
 
 module.exports = UsersFacet;
 
-},{}],42:[function(require,module,exports){
+},{"lodash":216}],44:[function(require,module,exports){
 /**
  * API Facet to make calls to methods in the users.profile namespace.
  *
@@ -4064,7 +5035,9 @@ module.exports = UsersFacet;
  *
  */
 
-
+/**
+ * @constructor
+ */
 function UsersProfileFacet(makeAPICall) {
   this.name = 'users.profile';
   this.makeAPICall = makeAPICall;
@@ -4094,14 +5067,14 @@ UsersProfileFacet.prototype.get = function get(opts, optCb) {
  * @param {?} value - Value to set a single key to. Usable only if profile is not passed.
  * @param {function=} optCb Optional callback, if not using promises.
  */
-UsersProfileFacet.prototype.set = function get(opts, optCb) {
+UsersProfileFacet.prototype.set = function set(opts, optCb) {
   return this.makeAPICall('users.profile.set', null, opts, optCb);
 };
 
 
 module.exports = UsersProfileFacet;
 
-},{}],43:[function(require,module,exports){
+},{}],45:[function(require,module,exports){
 /* eslint no-unused-vars: 0 */
 
 /**
@@ -4121,6 +5094,9 @@ var models = require('../models');
 
 /**
  *
+ * @deprecated SlackDataStore interface will be removed in v4.0.0. See
+ * {@link https://github.com/slackapi/node-slack-sdk/wiki/DataStore-v3.x-Migration-Guide|the migration guide}
+ * for details.
  * @param {Object} opts
  * @param {string=} opts.logLevel The log level for the logger.
  * @param {Function=} opts.logger Function to use for log calls, takes (logLevel, logString) params.
@@ -4134,6 +5110,9 @@ function SlackDataStore(opts) {
    * @type {Function}
    */
   this.logger = dataStoreOpts.logger || getLogger(dataStoreOpts.logLevel);
+
+  this.logger('warn', 'SlackDataStore is deprecated and will be removed in the next major ' +
+  'version. See project documentation for a migration guide.');
 
   forEach(messageHandlers, bind(function anonRegisterMessageHandler(handler, event) {
     this.registerMessageHandler(event, handler);
@@ -4498,6 +5477,7 @@ SlackDataStore.prototype.getChannelOrGroupByName = function getChannelOrGroupByN
  * @param {Object} data
  */
 SlackDataStore.prototype.cacheRtmStart = function cacheRtmStart(data) {
+  var self;
   this.clear();
 
   forEach(data.users || [], bind(function cacheRtmUser(user) {
@@ -4512,12 +5492,24 @@ SlackDataStore.prototype.cacheRtmStart = function cacheRtmStart(data) {
   forEach(data.groups || [], bind(function cacheRtmGroup(group) {
     this.setGroup(new models.Group(group));
   }, this));
+  forEach(data.mpims || [], bind(function cacheRtmMpim(mpim) {
+    // MPIMs are basically groups (they have the same prefix)
+    // NOTE: there is a Model class for MPDM, and it is used in the model helpers `getModelClass`
+    //       so this could be introducing some inconsistencies in behavior.
+    this.setGroup(new models.Group(mpim));
+  }, this));
   forEach(data.bots || [], bind(function cacheRtmBot(bot) {
     // Bots don't have a separate type currently, so treat them as simple objects
     this.setBot(bot);
   }, this));
 
-  this.getUserById(data.self.id).update(data.self);
+  self = this.getUserById(data.self.id);
+  if (self) {
+    self.update(data.self);
+  } else {
+    // If we got here from an rtm.connect, we may not have any users
+    this.setUser(new models.User(data.self));
+  }
   this.setTeam(data.team);
 };
 
@@ -4566,7 +5558,7 @@ SlackDataStore.prototype.handleRtmMessage = function handleRtmMessage(
 
 module.exports = SlackDataStore;
 
-},{"../clients/events/rtm":7,"../clients/events/utils":8,"../helpers":58,"../models":66,"./message-handlers":51,"lodash":216}],44:[function(require,module,exports){
+},{"../clients/events/rtm":7,"../clients/events/utils":8,"../helpers":60,"../models":68,"./message-handlers":53,"lodash":216}],46:[function(require,module,exports){
 /**
  * In memory data store for caching information from the Slack API.
  */
@@ -4582,6 +5574,9 @@ var models = require('../models');
 
 /**
  *
+ * @deprecated SlackMemoryDataStore will be removed in v4.0.0. See
+ * {@link https://github.com/slackapi/node-slack-sdk/wiki/DataStore-v3.x-Migration-Guide|the migration guide}
+ * for details.
  * @constructor
  */
 function SlackMemoryDataStore(opts) {
@@ -4701,7 +5696,7 @@ SlackMemoryDataStore.prototype.getDMById = function getDMById(dmId) {
 /** @inheritdoc */
 SlackMemoryDataStore.prototype.getDMByName = function getDMByName(name) {
   var user = this.getUserByName(name);
-  return find(this.dms, ['user', user.id]);
+  return (user) ? find(this.dms, ['user', user.id]) : undefined;
 };
 
 /** @inheritdoc */
@@ -4900,7 +5895,7 @@ SlackMemoryDataStore.prototype.removeTeam = function removeTeam(teamId) {
 
 module.exports = SlackMemoryDataStore;
 
-},{"../models":66,"./data-store":43,"inherits":198,"lodash":216}],45:[function(require,module,exports){
+},{"../models":68,"./data-store":45,"inherits":202,"lodash":216}],47:[function(require,module,exports){
 /**
  * Event handlers that can be re-used between channels, groups and DMs
  */
@@ -4987,7 +5982,7 @@ module.exports.handleUnarchive = handleUnarchive;
 module.exports.handleRename = handleRename;
 module.exports.handleLeave = handleLeave;
 
-},{}],46:[function(require,module,exports){
+},{}],48:[function(require,module,exports){
 /**
  * Handlers for all RTM `bot_*` events.
  */
@@ -5017,7 +6012,7 @@ var handlers = [
 
 module.exports = fromPairs(handlers);
 
-},{"../../clients/events/rtm":7,"lodash":216}],47:[function(require,module,exports){
+},{"../../clients/events/rtm":7,"lodash":216}],49:[function(require,module,exports){
 /**
  * Handlers for all RTM `channel_` events.
  */
@@ -5080,7 +6075,7 @@ var handlers = [
 
 module.exports = fromPairs(handlers);
 
-},{"../../clients/events/rtm":7,"../../models":66,"./base-channel":45,"./helpers":50,"lodash":216}],48:[function(require,module,exports){
+},{"../../clients/events/rtm":7,"../../models":68,"./base-channel":47,"./helpers":52,"lodash":216}],50:[function(require,module,exports){
 /**
  * Handlers for all RTM `im_` events.
  */
@@ -5133,7 +6128,7 @@ var handlers = [
 
 module.exports = fromPairs(handlers);
 
-},{"../../clients/events/rtm":7,"../../models":66,"./base-channel":45,"./helpers":50,"lodash":216}],49:[function(require,module,exports){
+},{"../../clients/events/rtm":7,"../../models":68,"./base-channel":47,"./helpers":52,"lodash":216}],51:[function(require,module,exports){
 /**
  * Handlers for all RTM `group_` events.
  */
@@ -5187,7 +6182,7 @@ var handlers = [
 
 module.exports = fromPairs(handlers);
 
-},{"../../clients/events/rtm":7,"../../models":66,"./base-channel":45,"./helpers":50,"lodash":216}],50:[function(require,module,exports){
+},{"../../clients/events/rtm":7,"../../models":68,"./base-channel":47,"./helpers":52,"lodash":216}],52:[function(require,module,exports){
 /**
  *
  */
@@ -5218,7 +6213,7 @@ var handleNewOrUpdatedUser = function handleNewOrUpdatedUser(dataStore, message)
 module.exports.handleNewOrUpdatedUser = handleNewOrUpdatedUser;
 module.exports.noopMessage = noopMessage;
 
-},{"../../models":66}],51:[function(require,module,exports){
+},{"../../models":68}],53:[function(require,module,exports){
 /**
  *
  */
@@ -5246,7 +6241,7 @@ forEach(handlerModules, function registerHandlerModule(mod) {
   });
 });
 
-},{"./bots":46,"./channels":47,"./dm":48,"./groups":49,"./message":52,"./presence":53,"./reactions":54,"./stars":55,"./team":56,"./user":57,"lodash":216}],52:[function(require,module,exports){
+},{"./bots":48,"./channels":49,"./dm":50,"./groups":51,"./message":54,"./presence":55,"./reactions":56,"./stars":57,"./team":58,"./user":59,"lodash":216}],54:[function(require,module,exports){
 /**
  * Handlers for all `message` event subtypes.
  */
@@ -5326,7 +6321,7 @@ var handlers = [
 
 module.exports = fromPairs(handlers);
 
-},{"../../clients/events/rtm":7,"../../clients/events/utils":8,"lodash":216}],53:[function(require,module,exports){
+},{"../../clients/events/rtm":7,"../../clients/events/utils":8,"lodash":216}],55:[function(require,module,exports){
 /**
  * Event handlers for RTM presence change events.
  */
@@ -5359,7 +6354,7 @@ var handlers = [
 
 module.exports = fromPairs(handlers);
 
-},{"../../clients/events/rtm":7,"lodash":216}],54:[function(require,module,exports){
+},{"../../clients/events/rtm":7,"lodash":216}],56:[function(require,module,exports){
 /**
  * Handlers for all RTM `reaction_xxx` events.
  */
@@ -5456,7 +6451,7 @@ var handlers = [
 
 module.exports = fromPairs(handlers);
 
-},{"../../clients/events/rtm":7,"lodash":216}],55:[function(require,module,exports){
+},{"../../clients/events/rtm":7,"lodash":216}],57:[function(require,module,exports){
 /**
  * Handlers for all RTM `star_` events.
  */
@@ -5475,7 +6470,7 @@ var handlers = [
 
 module.exports = fromPairs(handlers);
 
-},{"../../clients/events/rtm":7,"./helpers":50,"lodash":216}],56:[function(require,module,exports){
+},{"../../clients/events/rtm":7,"./helpers":52,"lodash":216}],58:[function(require,module,exports){
 /**
  * Handlers for all RTM `team_` events.
  */
@@ -5523,7 +6518,7 @@ var handlers = [
 
 module.exports = fromPairs(handlers);
 
-},{"../../clients/events/rtm":7,"./helpers":50,"lodash":216}],57:[function(require,module,exports){
+},{"../../clients/events/rtm":7,"./helpers":52,"lodash":216}],59:[function(require,module,exports){
 /**
  * Handlers for all RTM `user_*` events.
  */
@@ -5564,12 +6559,11 @@ var handlers = [
 
 module.exports = fromPairs(handlers);
 
-},{"../../clients/events/rtm":7,"./helpers":50,"lodash":216}],58:[function(require,module,exports){
+},{"../../clients/events/rtm":7,"./helpers":52,"lodash":216}],60:[function(require,module,exports){
 /**
  * Top level helpers.
  */
 
-var ConsoleTransport = require('winston').transports.Console;
 var bind = require('lodash').bind;
 var winston = require('winston');
 var os = require('os');
@@ -5579,13 +6573,12 @@ module.exports.name="@slack/client";module.exports.version="3.8.1";
 /**
  *
  * @param {string} optLogLevel
- * @param {Object} optTransport
  * @returns {function(this:*)|Function|*}
  */
-var getLogger = function getLogger(optLogLevel, optTransport) {
+var getLogger = function getLogger(optLogLevel) {
   var logger = new winston.Logger({
     level: optLogLevel || 'info',
-    transports: [optTransport || new ConsoleTransport()]
+    transports: [new winston.transports.Console()]
   });
   return bind(logger.log, logger);
 };
@@ -5628,7 +6621,7 @@ module.exports.getLogger = getLogger;
 module.exports.getVersionString = getVersionString;
 module.exports.appendToVersionString = appendToVersionString;
 
-},{"lodash":216,"os":undefined,"winston":292}],59:[function(require,module,exports){
+},{"lodash":216,"os":undefined,"winston":291}],61:[function(require,module,exports){
 /**
  *
  */
@@ -5787,7 +6780,7 @@ BaseChannel.prototype.updateMessage = function updateMessage(messageUpdatedMsg) 
 
 module.exports = BaseChannel;
 
-},{"./model":67,"inherits":198,"lodash":216}],60:[function(require,module,exports){
+},{"./model":69,"inherits":202,"lodash":216}],62:[function(require,module,exports){
 /**
  *
  */
@@ -5806,7 +6799,7 @@ inherits(ChannelGroup, BaseChannel);
 
 module.exports = ChannelGroup;
 
-},{"./base-channel":59,"inherits":198}],61:[function(require,module,exports){
+},{"./base-channel":61,"inherits":202}],63:[function(require,module,exports){
 /**
  * {@link https://api.slack.com/types/channel|Channel}
  */
@@ -5825,7 +6818,7 @@ inherits(Channel, ChannelGroup);
 
 module.exports = Channel;
 
-},{"./channel-group":60,"inherits":198}],62:[function(require,module,exports){
+},{"./channel-group":62,"inherits":202}],64:[function(require,module,exports){
 /**
  * {@link https://api.slack.com/types/im|DM}
  */
@@ -5844,7 +6837,7 @@ inherits(DM, BaseChannel);
 
 module.exports = DM;
 
-},{"./base-channel":59,"inherits":198}],63:[function(require,module,exports){
+},{"./base-channel":61,"inherits":202}],65:[function(require,module,exports){
 /**
  *
  */
@@ -5863,7 +6856,7 @@ inherits(File, Model);
 
 module.exports = File;
 
-},{"./model":67,"inherits":198}],64:[function(require,module,exports){
+},{"./model":69,"inherits":202}],66:[function(require,module,exports){
 /**
  * {@link https://api.slack.com/types/group|Group}
  */
@@ -5882,7 +6875,7 @@ inherits(Group, ChannelGroup);
 
 module.exports = Group;
 
-},{"./channel-group":60,"inherits":198}],65:[function(require,module,exports){
+},{"./channel-group":62,"inherits":202}],67:[function(require,module,exports){
 var hasKey = require('lodash').has;
 
 // Channel, file, group, DM, user, usergroup
@@ -5940,7 +6933,7 @@ var getModelClass = function getModelClass(obj) {
 module.exports.isModelObj = isModelObj;
 module.exports.getModelClass = getModelClass;
 
-},{"./channel":61,"./dm":62,"./file":63,"./group":64,"./mpdm":68,"./user":71,"./user-group":70,"lodash":216}],66:[function(require,module,exports){
+},{"./channel":63,"./dm":64,"./file":65,"./group":66,"./mpdm":70,"./user":73,"./user-group":72,"lodash":216}],68:[function(require,module,exports){
 module.exports = {
   Channel: require('./channel'),
   DM: require('./dm'),
@@ -5951,7 +6944,7 @@ module.exports = {
   UserGroup: require('./user-group')
 };
 
-},{"./channel":61,"./dm":62,"./file":63,"./group":64,"./mpdm":68,"./user":71,"./user-group":70}],67:[function(require,module,exports){
+},{"./channel":63,"./dm":64,"./file":65,"./group":66,"./mpdm":70,"./user":73,"./user-group":72}],69:[function(require,module,exports){
 /**
  *
  */
@@ -6129,7 +7122,7 @@ Model.prototype.toJSON = function toJSON() {
 
 module.exports = Model;
 
-},{"./helpers":65,"./property-type":69,"lodash":216}],68:[function(require,module,exports){
+},{"./helpers":67,"./property-type":71,"lodash":216}],70:[function(require,module,exports){
 /**
  *
  */
@@ -6148,7 +7141,7 @@ inherits(MPDM, ChannelGroup);
 
 module.exports = MPDM;
 
-},{"./channel-group":60,"inherits":198}],69:[function(require,module,exports){
+},{"./channel-group":62,"inherits":202}],71:[function(require,module,exports){
 var PROPERTY_TYPES = {
   SIMPLE: 0,
   MODEL: 1,
@@ -6157,7 +7150,7 @@ var PROPERTY_TYPES = {
 
 module.exports = PROPERTY_TYPES;
 
-},{}],70:[function(require,module,exports){
+},{}],72:[function(require,module,exports){
 /**
  *
  */
@@ -6176,7 +7169,7 @@ inherits(UserGroup, Model);
 
 module.exports = UserGroup;
 
-},{"./model":67,"inherits":198}],71:[function(require,module,exports){
+},{"./model":69,"inherits":202}],73:[function(require,module,exports){
 /**
  *
  */
@@ -6195,7 +7188,7 @@ inherits(User, Model);
 
 module.exports = User;
 
-},{"./model":67,"inherits":198}],72:[function(require,module,exports){
+},{"./model":69,"inherits":202}],74:[function(require,module,exports){
 
 /**
  * Module dependencies.
@@ -6222,11 +7215,16 @@ module.exports = Agent;
 
 function Agent (callback) {
   if (!(this instanceof Agent)) return new Agent(callback);
-  if ('function' != typeof callback) throw new Error('Must pass a "callback function"');
   EventEmitter.call(this);
-  this.callback = callback;
+  if ('function' === typeof callback) {
+    this.callback = callback;
+  }
 }
 inherits(Agent, EventEmitter);
+
+Agent.prototype.callback = function callback (req, opts, fn) {
+  fn(new Error('"agent-base" has no default implementation, you must subclass and override `callback()`'));
+};
 
 /**
  * Called by node-core's "_http_client.js" module when creating
@@ -6235,7 +7233,7 @@ inherits(Agent, EventEmitter);
  * @api public
  */
 
-Agent.prototype.addRequest = function (req, host, port, localAddress) {
+Agent.prototype.addRequest = function addRequest (req, host, port, localAddress) {
   var opts;
   if ('object' == typeof host) {
     // >= v0.11.x API
@@ -6298,7 +7296,7 @@ Agent.prototype.addRequest = function (req, host, port, localAddress) {
   sync = false;
 };
 
-},{"events":undefined,"extend":158,"util":undefined}],73:[function(require,module,exports){
+},{"events":undefined,"extend":162,"util":undefined}],75:[function(require,module,exports){
 // Copyright 2011 Mark Cavage <mcavage@gmail.com> All rights reserved.
 
 
@@ -6313,7 +7311,7 @@ module.exports = {
 
 };
 
-},{}],74:[function(require,module,exports){
+},{}],76:[function(require,module,exports){
 // Copyright 2011 Mark Cavage <mcavage@gmail.com> All rights reserved.
 
 var errors = require('./errors');
@@ -6342,7 +7340,7 @@ for (var e in errors) {
     module.exports[e] = errors[e];
 }
 
-},{"./errors":73,"./reader":75,"./types":76,"./writer":77}],75:[function(require,module,exports){
+},{"./errors":75,"./reader":77,"./types":78,"./writer":79}],77:[function(require,module,exports){
 // Copyright 2011 Mark Cavage <mcavage@gmail.com> All rights reserved.
 
 var assert = require('assert');
@@ -6605,7 +7603,7 @@ Reader.prototype._readTag = function(tag) {
 
 module.exports = Reader;
 
-},{"./errors":73,"./types":76,"assert":undefined}],76:[function(require,module,exports){
+},{"./errors":75,"./types":78,"assert":undefined}],78:[function(require,module,exports){
 // Copyright 2011 Mark Cavage <mcavage@gmail.com> All rights reserved.
 
 
@@ -6643,7 +7641,7 @@ module.exports = {
   Context: 128
 };
 
-},{}],77:[function(require,module,exports){
+},{}],79:[function(require,module,exports){
 // Copyright 2011 Mark Cavage <mcavage@gmail.com> All rights reserved.
 
 var assert = require('assert');
@@ -6961,7 +7959,7 @@ Writer.prototype._ensure = function(len) {
 
 module.exports = Writer;
 
-},{"./errors":73,"./types":76,"assert":undefined}],78:[function(require,module,exports){
+},{"./errors":75,"./types":78,"assert":undefined}],80:[function(require,module,exports){
 // Copyright 2011 Mark Cavage <mcavage@gmail.com> All rights reserved.
 
 // If you have no idea what ASN.1 or BER is, see this:
@@ -6983,7 +7981,7 @@ module.exports = {
 
 };
 
-},{"./ber/index":74}],79:[function(require,module,exports){
+},{"./ber/index":76}],81:[function(require,module,exports){
 // Copyright (c) 2012, Mark Cavage. All rights reserved.
 // Copyright 2015 Joyent, Inc.
 
@@ -7191,7 +8189,7 @@ function _setExports(ndebug) {
 
 module.exports = _setExports(process.env.NODE_NDEBUG);
 
-},{"assert":undefined,"stream":undefined,"util":undefined}],80:[function(require,module,exports){
+},{"assert":undefined,"stream":undefined,"util":undefined}],82:[function(require,module,exports){
 /*!
  * async
  * https://github.com/caolan/async
@@ -8458,7 +9456,7 @@ module.exports = _setExports(process.env.NODE_NDEBUG);
 
 }());
 
-},{}],81:[function(require,module,exports){
+},{}],83:[function(require,module,exports){
 module.exports =
 {
   parallel      : require('./parallel.js'),
@@ -8466,7 +9464,7 @@ module.exports =
   serialOrdered : require('./serialOrdered.js')
 };
 
-},{"./parallel.js":88,"./serial.js":89,"./serialOrdered.js":90}],82:[function(require,module,exports){
+},{"./parallel.js":90,"./serial.js":91,"./serialOrdered.js":92}],84:[function(require,module,exports){
 // API
 module.exports = abort;
 
@@ -8497,7 +9495,7 @@ function clean(key)
   }
 }
 
-},{}],83:[function(require,module,exports){
+},{}],85:[function(require,module,exports){
 var defer = require('./defer.js');
 
 // API
@@ -8533,7 +9531,7 @@ function async(callback)
   };
 }
 
-},{"./defer.js":84}],84:[function(require,module,exports){
+},{"./defer.js":86}],86:[function(require,module,exports){
 module.exports = defer;
 
 /**
@@ -8561,7 +9559,7 @@ function defer(fn)
   }
 }
 
-},{}],85:[function(require,module,exports){
+},{}],87:[function(require,module,exports){
 var async = require('./async.js')
   , abort = require('./abort.js')
   ;
@@ -8638,7 +9636,7 @@ function runJob(iterator, key, item, callback)
   return aborter;
 }
 
-},{"./abort.js":82,"./async.js":83}],86:[function(require,module,exports){
+},{"./abort.js":84,"./async.js":85}],88:[function(require,module,exports){
 // API
 module.exports = state;
 
@@ -8677,7 +9675,7 @@ function state(list, sortMethod)
   return initState;
 }
 
-},{}],87:[function(require,module,exports){
+},{}],89:[function(require,module,exports){
 var abort = require('./abort.js')
   , async = require('./async.js')
   ;
@@ -8708,7 +9706,7 @@ function terminator(callback)
   async(callback)(null, this.results);
 }
 
-},{"./abort.js":82,"./async.js":83}],88:[function(require,module,exports){
+},{"./abort.js":84,"./async.js":85}],90:[function(require,module,exports){
 var iterate    = require('./lib/iterate.js')
   , initState  = require('./lib/state.js')
   , terminator = require('./lib/terminator.js')
@@ -8753,7 +9751,7 @@ function parallel(list, iterator, callback)
   return terminator.bind(state, callback);
 }
 
-},{"./lib/iterate.js":85,"./lib/state.js":86,"./lib/terminator.js":87}],89:[function(require,module,exports){
+},{"./lib/iterate.js":87,"./lib/state.js":88,"./lib/terminator.js":89}],91:[function(require,module,exports){
 var serialOrdered = require('./serialOrdered.js');
 
 // Public API
@@ -8772,7 +9770,7 @@ function serial(list, iterator, callback)
   return serialOrdered(list, iterator, null, callback);
 }
 
-},{"./serialOrdered.js":90}],90:[function(require,module,exports){
+},{"./serialOrdered.js":92}],92:[function(require,module,exports){
 var iterate    = require('./lib/iterate.js')
   , initState  = require('./lib/state.js')
   , terminator = require('./lib/terminator.js')
@@ -8849,7 +9847,7 @@ function descending(a, b)
   return -1 * ascending(a, b);
 }
 
-},{"./lib/iterate.js":85,"./lib/state.js":86,"./lib/terminator.js":87}],91:[function(require,module,exports){
+},{"./lib/iterate.js":87,"./lib/state.js":88,"./lib/terminator.js":89}],93:[function(require,module,exports){
 
 /*!
  *  Copyright 2010 LearnBoost <dev@learnboost.com>
@@ -9063,7 +10061,7 @@ function canonicalizeResource (resource) {
 }
 module.exports.canonicalizeResource = canonicalizeResource
 
-},{"crypto":undefined,"url":undefined}],92:[function(require,module,exports){
+},{"crypto":undefined,"url":undefined}],94:[function(require,module,exports){
 var aws4 = exports,
     url = require('url'),
     querystring = require('querystring'),
@@ -9184,14 +10182,14 @@ RequestSigner.prototype.prepareRequest = function() {
       if (request.body && !headers['Content-Length'] && !headers['content-length'])
         headers['Content-Length'] = Buffer.byteLength(request.body)
 
-      if (this.credentials.sessionToken)
+      if (this.credentials.sessionToken && !headers['X-Amz-Security-Token'] && !headers['x-amz-security-token'])
         headers['X-Amz-Security-Token'] = this.credentials.sessionToken
 
-      if (this.service === 's3')
+      if (this.service === 's3' && !headers['X-Amz-Content-Sha256'] && !headers['x-amz-content-sha256'])
         headers['X-Amz-Content-Sha256'] = hash(this.request.body || '', 'hex')
 
-      if (headers['X-Amz-Date'])
-        this.datetime = headers['X-Amz-Date']
+      if (headers['X-Amz-Date'] || headers['x-amz-date'])
+        this.datetime = headers['X-Amz-Date'] || headers['x-amz-date']
       else
         headers['X-Amz-Date'] = this.getDateTime()
     }
@@ -9268,13 +10266,22 @@ RequestSigner.prototype.canonicalString = function() {
 
   var pathStr = this.parsedPath.path,
       query = this.parsedPath.query,
+      headers = this.request.headers,
       queryStr = '',
       normalizePath = this.service !== 's3',
       decodePath = this.service === 's3' || this.request.doNotEncodePath,
       decodeSlashesInPath = this.service === 's3',
       firstValOnly = this.service === 's3',
-      bodyHash = this.service === 's3' && this.request.signQuery ? 'UNSIGNED-PAYLOAD' :
-        (this.isCodeCommitGit ? '' : hash(this.request.body || '', 'hex'))
+      bodyHash
+
+  if (this.service === 's3' && this.request.signQuery) {
+    bodyHash = 'UNSIGNED-PAYLOAD'
+  } else if (this.isCodeCommitGit) {
+    bodyHash = ''
+  } else {
+    bodyHash = headers['X-Amz-Content-Sha256'] || headers['x-amz-content-sha256'] ||
+      hash(this.request.body || '', 'hex')
+  }
 
   if (query) {
     queryStr = encodeRfc3986(querystring.stringify(Object.keys(query).sort().reduce(function(obj, key) {
@@ -9290,8 +10297,8 @@ RequestSigner.prototype.canonicalString = function() {
       if (normalizePath && piece === '..') {
         path.pop()
       } else if (!normalizePath || piece !== '.') {
-        if (decodePath) piece = querystring.unescape(piece)
-        path.push(encodeRfc3986(querystring.escape(piece)))
+        if (decodePath) piece = decodeURIComponent(piece)
+        path.push(encodeRfc3986(encodeURIComponent(piece)))
       }
       return path
     }, []).join('/')
@@ -9360,7 +10367,7 @@ RequestSigner.prototype.parsePath = function() {
   // So if there are non-reserved chars (and it's not already all % encoded), just encode them all
   if (/[^0-9A-Za-z!'()*\-._~%/]/.test(path)) {
     path = path.split('/').map(function(piece) {
-      return querystring.escape(querystring.unescape(piece))
+      return encodeURIComponent(decodeURIComponent(piece))
     }).join('/')
   }
 
@@ -9388,7 +10395,7 @@ aws4.sign = function(request, credentials) {
   return new RequestSigner(request, credentials).sign()
 }
 
-},{"./lru":93,"crypto":undefined,"querystring":undefined,"url":undefined}],93:[function(require,module,exports){
+},{"./lru":95,"crypto":undefined,"querystring":undefined,"url":undefined}],95:[function(require,module,exports){
 module.exports = function(size) {
   return new LruCache(size)
 }
@@ -9486,7 +10493,7 @@ function DoublyLinkedNode(key, val) {
   this.next = null
 }
 
-},{}],94:[function(require,module,exports){
+},{}],96:[function(require,module,exports){
 'use strict';
 
 var crypto_hash_sha512 = require('tweetnacl').lowlevel.crypto_hash;
@@ -10044,7 +11051,7 @@ module.exports = {
       pbkdf: bcrypt_pbkdf
 };
 
-},{"tweetnacl":281}],95:[function(require,module,exports){
+},{"tweetnacl":283}],97:[function(require,module,exports){
 (function (__filename){
 
 /**
@@ -10213,8 +11220,8 @@ exports.getRoot = function getRoot (file) {
   }
 }
 
-}).call(this,"/Users/ddascal/Projects/openwhisk/openwhisk-slack/node_modules/bindings/bindings.js")
-},{"fs":undefined,"path":undefined}],96:[function(require,module,exports){
+}).call(this,"/Users/ddascal/Projects/adobe-apiplatform/openwhisk-slack/node_modules/bindings/bindings.js")
+},{"fs":undefined,"path":undefined}],98:[function(require,module,exports){
 "use strict";
 module.exports = function(Promise) {
 var SomePromiseArray = Promise._SomePromiseArray;
@@ -10237,7 +11244,7 @@ Promise.prototype.any = function () {
 
 };
 
-},{}],97:[function(require,module,exports){
+},{}],99:[function(require,module,exports){
 "use strict";
 var firstLineError;
 try {throw new Error(); } catch (e) {firstLineError = e;}
@@ -10400,7 +11407,7 @@ Async.prototype._reset = function () {
 module.exports = Async;
 module.exports.firstLineError = firstLineError;
 
-},{"./queue":121,"./schedule":124,"./util":131}],98:[function(require,module,exports){
+},{"./queue":123,"./schedule":126,"./util":133}],100:[function(require,module,exports){
 "use strict";
 module.exports = function(Promise, INTERNAL, tryConvertToPromise, debug) {
 var calledBind = false;
@@ -10469,7 +11476,7 @@ Promise.bind = function (thisArg, value) {
 };
 };
 
-},{}],99:[function(require,module,exports){
+},{}],101:[function(require,module,exports){
 "use strict";
 var old;
 if (typeof Promise !== "undefined") old = Promise;
@@ -10482,7 +11489,7 @@ var bluebird = require("./promise")();
 bluebird.noConflict = noConflict;
 module.exports = bluebird;
 
-},{"./promise":117}],100:[function(require,module,exports){
+},{"./promise":119}],102:[function(require,module,exports){
 "use strict";
 var cr = Object.create;
 if (cr) {
@@ -10607,7 +11614,7 @@ Promise.prototype.get = function (propertyName) {
 };
 };
 
-},{"./util":131}],101:[function(require,module,exports){
+},{"./util":133}],103:[function(require,module,exports){
 "use strict";
 module.exports = function(Promise, PromiseArray, apiRejection, debug) {
 var util = require("./util");
@@ -10738,7 +11745,7 @@ Promise.prototype._resultCancelled = function() {
 
 };
 
-},{"./util":131}],102:[function(require,module,exports){
+},{"./util":133}],104:[function(require,module,exports){
 "use strict";
 module.exports = function(NEXT_FILTER) {
 var util = require("./util");
@@ -10782,7 +11789,7 @@ function catchFilter(instances, cb, promise) {
 return catchFilter;
 };
 
-},{"./es5":108,"./util":131}],103:[function(require,module,exports){
+},{"./es5":110,"./util":133}],105:[function(require,module,exports){
 "use strict";
 module.exports = function(Promise) {
 var longStackTraces = false;
@@ -10853,7 +11860,7 @@ Context.activateLongStackTraces = function() {
 return Context;
 };
 
-},{}],104:[function(require,module,exports){
+},{}],106:[function(require,module,exports){
 "use strict";
 module.exports = function(Promise, Context) {
 var getDomain = Promise._getDomain;
@@ -10894,7 +11901,10 @@ Promise.prototype.suppressUnhandledRejections = function() {
 Promise.prototype._ensurePossibleRejectionHandled = function () {
     if ((this._bitField & 524288) !== 0) return;
     this._setRejectionIsUnhandled();
-    async.invokeLater(this._notifyUnhandledRejection, this, undefined);
+    var self = this;
+    setTimeout(function() {
+        self._notifyUnhandledRejection();
+    }, 1);
 };
 
 Promise.prototype._notifyUnhandledRejectionIsHandled = function () {
@@ -11771,7 +12781,7 @@ return {
 };
 };
 
-},{"./errors":107,"./util":131}],105:[function(require,module,exports){
+},{"./errors":109,"./util":133}],107:[function(require,module,exports){
 "use strict";
 module.exports = function(Promise) {
 function returner() {
@@ -11819,7 +12829,7 @@ Promise.prototype.catchReturn = function (value) {
 };
 };
 
-},{}],106:[function(require,module,exports){
+},{}],108:[function(require,module,exports){
 "use strict";
 module.exports = function(Promise, INTERNAL) {
 var PromiseReduce = Promise.reduce;
@@ -11851,7 +12861,7 @@ Promise.mapSeries = PromiseMapSeries;
 };
 
 
-},{}],107:[function(require,module,exports){
+},{}],109:[function(require,module,exports){
 "use strict";
 var es5 = require("./es5");
 var Objectfreeze = es5.freeze;
@@ -11969,7 +12979,7 @@ module.exports = {
     Warning: Warning
 };
 
-},{"./es5":108,"./util":131}],108:[function(require,module,exports){
+},{"./es5":110,"./util":133}],110:[function(require,module,exports){
 var isES5 = (function(){
     "use strict";
     return this === undefined;
@@ -12051,7 +13061,7 @@ if (isES5) {
     };
 }
 
-},{}],109:[function(require,module,exports){
+},{}],111:[function(require,module,exports){
 "use strict";
 module.exports = function(Promise, INTERNAL) {
 var PromiseMap = Promise.map;
@@ -12065,12 +13075,13 @@ Promise.filter = function (promises, fn, options) {
 };
 };
 
-},{}],110:[function(require,module,exports){
+},{}],112:[function(require,module,exports){
 "use strict";
-module.exports = function(Promise, tryConvertToPromise) {
+module.exports = function(Promise, tryConvertToPromise, NEXT_FILTER) {
 var util = require("./util");
 var CancellationError = Promise.CancellationError;
 var errorObj = util.errorObj;
+var catchFilter = require("./catch_filter")(NEXT_FILTER);
 
 function PassThroughHandlerContext(promise, type, handler) {
     this.promise = promise;
@@ -12122,7 +13133,9 @@ function finallyHandler(reasonOrValue) {
         var ret = this.isFinallyHandler()
             ? handler.call(promise._boundValue())
             : handler.call(promise._boundValue(), reasonOrValue);
-        if (ret !== undefined) {
+        if (ret === NEXT_FILTER) {
+            return ret;
+        } else if (ret !== undefined) {
             promise._setReturnedNonUndefined();
             var maybePromise = tryConvertToPromise(ret, promise);
             if (maybePromise instanceof Promise) {
@@ -12171,14 +13184,46 @@ Promise.prototype["finally"] = function (handler) {
                              finallyHandler);
 };
 
+
 Promise.prototype.tap = function (handler) {
     return this._passThrough(handler, 1, finallyHandler);
+};
+
+Promise.prototype.tapCatch = function (handlerOrPredicate) {
+    var len = arguments.length;
+    if(len === 1) {
+        return this._passThrough(handlerOrPredicate,
+                                 1,
+                                 undefined,
+                                 finallyHandler);
+    } else {
+         var catchInstances = new Array(len - 1),
+            j = 0, i;
+        for (i = 0; i < len - 1; ++i) {
+            var item = arguments[i];
+            if (util.isObject(item)) {
+                catchInstances[j++] = item;
+            } else {
+                return Promise.reject(new TypeError(
+                    "tapCatch statement predicate: "
+                    + "expecting an object but got " + util.classString(item)
+                ));
+            }
+        }
+        catchInstances.length = j;
+        var handler = arguments[i];
+        return this._passThrough(catchFilter(catchInstances, handler, this),
+                                 1,
+                                 undefined,
+                                 finallyHandler);
+    }
+
 };
 
 return PassThroughHandlerContext;
 };
 
-},{"./util":131}],111:[function(require,module,exports){
+},{"./catch_filter":104,"./util":133}],113:[function(require,module,exports){
 "use strict";
 module.exports = function(Promise,
                           apiRejection,
@@ -12338,7 +13383,7 @@ PromiseSpawn.prototype._continue = function (result) {
             if (maybePromise === null) {
                 this._promiseRejected(
                     new TypeError(
-                        "A value %s was yielded that could not be treated as a promise\u000a\u000a    See http://goo.gl/MqrFmX\u000a\u000a".replace("%s", value) +
+                        "A value %s was yielded that could not be treated as a promise\u000a\u000a    See http://goo.gl/MqrFmX\u000a\u000a".replace("%s", String(value)) +
                         "From coroutine:\u000a" +
                         this._stack.split("\n").slice(1, -7).join("\n")
                     )
@@ -12403,7 +13448,7 @@ Promise.spawn = function (generatorFunction) {
 };
 };
 
-},{"./errors":107,"./util":131}],112:[function(require,module,exports){
+},{"./errors":109,"./util":133}],114:[function(require,module,exports){
 "use strict";
 module.exports =
 function(Promise, PromiseArray, tryConvertToPromise, INTERNAL, async,
@@ -12573,7 +13618,7 @@ Promise.join = function () {
 
 };
 
-},{"./util":131}],113:[function(require,module,exports){
+},{"./util":133}],115:[function(require,module,exports){
 "use strict";
 module.exports = function(Promise,
                           PromiseArray,
@@ -12743,7 +13788,7 @@ Promise.map = function (promises, fn, options, _filter) {
 
 };
 
-},{"./util":131}],114:[function(require,module,exports){
+},{"./util":133}],116:[function(require,module,exports){
 "use strict";
 module.exports =
 function(Promise, INTERNAL, tryConvertToPromise, apiRejection, debug) {
@@ -12800,7 +13845,7 @@ Promise.prototype._resolveFromSyncValue = function (value) {
 };
 };
 
-},{"./util":131}],115:[function(require,module,exports){
+},{"./util":133}],117:[function(require,module,exports){
 "use strict";
 var util = require("./util");
 var maybeWrapAsError = util.maybeWrapAsError;
@@ -12853,7 +13898,7 @@ function nodebackForPromise(promise, multiArgs) {
 
 module.exports = nodebackForPromise;
 
-},{"./errors":107,"./es5":108,"./util":131}],116:[function(require,module,exports){
+},{"./errors":109,"./es5":110,"./util":133}],118:[function(require,module,exports){
 "use strict";
 module.exports = function(Promise) {
 var util = require("./util");
@@ -12913,7 +13958,7 @@ Promise.prototype.asCallback = Promise.prototype.nodeify = function (nodeback,
 };
 };
 
-},{"./util":131}],117:[function(require,module,exports){
+},{"./util":133}],119:[function(require,module,exports){
 "use strict";
 module.exports = function() {
 var makeSelfResolutionError = function () {
@@ -12968,30 +14013,31 @@ var createContext = Context.create;
 var debug = require("./debuggability")(Promise, Context);
 var CapturedTrace = debug.CapturedTrace;
 var PassThroughHandlerContext =
-    require("./finally")(Promise, tryConvertToPromise);
+    require("./finally")(Promise, tryConvertToPromise, NEXT_FILTER);
 var catchFilter = require("./catch_filter")(NEXT_FILTER);
 var nodebackForPromise = require("./nodeback");
 var errorObj = util.errorObj;
 var tryCatch = util.tryCatch;
 function check(self, executor) {
+    if (self == null || self.constructor !== Promise) {
+        throw new TypeError("the promise constructor cannot be invoked directly\u000a\u000a    See http://goo.gl/MqrFmX\u000a");
+    }
     if (typeof executor !== "function") {
         throw new TypeError("expecting a function but got " + util.classString(executor));
     }
-    if (self.constructor !== Promise) {
-        throw new TypeError("the promise constructor cannot be invoked directly\u000a\u000a    See http://goo.gl/MqrFmX\u000a");
-    }
+
 }
 
 function Promise(executor) {
+    if (executor !== INTERNAL) {
+        check(this, executor);
+    }
     this._bitField = 0;
     this._fulfillmentHandler0 = undefined;
     this._rejectionHandler0 = undefined;
     this._promise0 = undefined;
     this._receiver0 = undefined;
-    if (executor !== INTERNAL) {
-        check(this, executor);
-        this._resolveFromExecutor(executor);
-    }
+    this._resolveFromExecutor(executor);
     this._promiseCreated();
     this._fireEvent("promiseCreated", this);
 }
@@ -13010,8 +14056,8 @@ Promise.prototype.caught = Promise.prototype["catch"] = function (fn) {
             if (util.isObject(item)) {
                 catchInstances[j++] = item;
             } else {
-                return apiRejection("expecting an object but got " +
-                    "A catch statement predicate " + util.classString(item));
+                return apiRejection("Catch statement predicate: " +
+                    "expecting an object but got " + util.classString(item));
             }
         }
         catchInstances.length = j;
@@ -13390,6 +14436,7 @@ function(reason, synchronous, ignoreNonErrorWarnings) {
 };
 
 Promise.prototype._resolveFromExecutor = function (executor) {
+    if (executor === INTERNAL) return;
     var promise = this;
     this._captureStackTrace();
     this._pushContext();
@@ -13647,7 +14694,7 @@ require("./synchronous_inspection")(Promise);
 require("./join")(
     Promise, PromiseArray, tryConvertToPromise, INTERNAL, async, getDomain);
 Promise.Promise = Promise;
-Promise.version = "3.4.7";
+Promise.version = "3.5.1";
 require('./map.js')(Promise, PromiseArray, apiRejection, tryConvertToPromise, INTERNAL, debug);
 require('./call_get.js')(Promise);
 require('./using.js')(Promise, apiRejection, tryConvertToPromise, createContext, INTERNAL, debug);
@@ -13688,7 +14735,7 @@ require('./any.js')(Promise);
 
 };
 
-},{"./any.js":96,"./async":97,"./bind":98,"./call_get.js":100,"./cancel":101,"./catch_filter":102,"./context":103,"./debuggability":104,"./direct_resolve":105,"./each.js":106,"./errors":107,"./es5":108,"./filter.js":109,"./finally":110,"./generators.js":111,"./join":112,"./map.js":113,"./method":114,"./nodeback":115,"./nodeify.js":116,"./promise_array":118,"./promisify.js":119,"./props.js":120,"./race.js":122,"./reduce.js":123,"./settle.js":125,"./some.js":126,"./synchronous_inspection":127,"./thenables":128,"./timers.js":129,"./using.js":130,"./util":131}],118:[function(require,module,exports){
+},{"./any.js":98,"./async":99,"./bind":100,"./call_get.js":102,"./cancel":103,"./catch_filter":104,"./context":105,"./debuggability":106,"./direct_resolve":107,"./each.js":108,"./errors":109,"./es5":110,"./filter.js":111,"./finally":112,"./generators.js":113,"./join":114,"./map.js":115,"./method":116,"./nodeback":117,"./nodeify.js":118,"./promise_array":120,"./promisify.js":121,"./props.js":122,"./race.js":124,"./reduce.js":125,"./settle.js":127,"./some.js":128,"./synchronous_inspection":129,"./thenables":130,"./timers.js":131,"./using.js":132,"./util":133}],120:[function(require,module,exports){
 "use strict";
 module.exports = function(Promise, INTERNAL, tryConvertToPromise,
     apiRejection, Proxyable) {
@@ -13699,6 +14746,7 @@ function toResolutionValue(val) {
     switch(val) {
     case -2: return [];
     case -3: return {};
+    case -6: return new Map();
     }
 }
 
@@ -13874,7 +14922,7 @@ PromiseArray.prototype.getActualLength = function (len) {
 return PromiseArray;
 };
 
-},{"./util":131}],119:[function(require,module,exports){
+},{"./util":133}],121:[function(require,module,exports){
 "use strict";
 module.exports = function(Promise, INTERNAL) {
 var THIS = {};
@@ -14190,7 +15238,7 @@ Promise.promisifyAll = function (target, options) {
 };
 
 
-},{"./errors":107,"./nodeback":115,"./util":131}],120:[function(require,module,exports){
+},{"./errors":109,"./nodeback":117,"./util":133}],122:[function(require,module,exports){
 "use strict";
 module.exports = function(
     Promise, PromiseArray, tryConvertToPromise, apiRejection) {
@@ -14248,7 +15296,7 @@ function PropertiesPromiseArray(obj) {
     }
     this.constructor$(entries);
     this._isMap = isMap;
-    this._init$(undefined, -3);
+    this._init$(undefined, isMap ? -6 : -3);
 }
 util.inherits(PropertiesPromiseArray, PromiseArray);
 
@@ -14310,7 +15358,7 @@ Promise.props = function (promises) {
 };
 };
 
-},{"./es5":108,"./util":131}],121:[function(require,module,exports){
+},{"./es5":110,"./util":133}],123:[function(require,module,exports){
 "use strict";
 function arrayMove(src, srcIndex, dst, dstIndex, len) {
     for (var j = 0; j < len; ++j) {
@@ -14385,7 +15433,7 @@ Queue.prototype._resizeTo = function (capacity) {
 
 module.exports = Queue;
 
-},{}],122:[function(require,module,exports){
+},{}],124:[function(require,module,exports){
 "use strict";
 module.exports = function(
     Promise, INTERNAL, tryConvertToPromise, apiRejection) {
@@ -14436,7 +15484,7 @@ Promise.prototype.race = function () {
 
 };
 
-},{"./util":131}],123:[function(require,module,exports){
+},{"./util":133}],125:[function(require,module,exports){
 "use strict";
 module.exports = function(Promise,
                           PromiseArray,
@@ -14610,7 +15658,7 @@ function gotValue(value) {
 }
 };
 
-},{"./util":131}],124:[function(require,module,exports){
+},{"./util":133}],126:[function(require,module,exports){
 "use strict";
 var util = require("./util");
 var schedule;
@@ -14647,11 +15695,11 @@ if (util.isNode && typeof MutationObserver === "undefined") {
 
         var scheduleToggle = function() {
             if (toggleScheduled) return;
-                toggleScheduled = true;
-                div2.classList.toggle("foo");
-            };
+            toggleScheduled = true;
+            div2.classList.toggle("foo");
+        };
 
-            return function schedule(fn) {
+        return function schedule(fn) {
             var o = new MutationObserver(function() {
                 o.disconnect();
                 fn();
@@ -14673,7 +15721,7 @@ if (util.isNode && typeof MutationObserver === "undefined") {
 }
 module.exports = schedule;
 
-},{"./util":131}],125:[function(require,module,exports){
+},{"./util":133}],127:[function(require,module,exports){
 "use strict";
 module.exports =
     function(Promise, PromiseArray, debug) {
@@ -14718,7 +15766,7 @@ Promise.prototype.settle = function () {
 };
 };
 
-},{"./util":131}],126:[function(require,module,exports){
+},{"./util":133}],128:[function(require,module,exports){
 "use strict";
 module.exports =
 function(Promise, PromiseArray, apiRejection) {
@@ -14868,7 +15916,7 @@ Promise.prototype.some = function (howMany) {
 Promise._SomePromiseArray = SomePromiseArray;
 };
 
-},{"./errors":107,"./util":131}],127:[function(require,module,exports){
+},{"./errors":109,"./util":133}],129:[function(require,module,exports){
 "use strict";
 module.exports = function(Promise) {
 function PromiseInspection(promise) {
@@ -14973,7 +16021,7 @@ Promise.prototype._reason = function() {
 Promise.PromiseInspection = PromiseInspection;
 };
 
-},{}],128:[function(require,module,exports){
+},{}],130:[function(require,module,exports){
 "use strict";
 module.exports = function(Promise, INTERNAL) {
 var util = require("./util");
@@ -15061,7 +16109,7 @@ function doThenable(x, then, context) {
 return tryConvertToPromise;
 };
 
-},{"./util":131}],129:[function(require,module,exports){
+},{"./util":133}],131:[function(require,module,exports){
 "use strict";
 module.exports = function(Promise, INTERNAL, debug) {
 var util = require("./util");
@@ -15156,7 +16204,7 @@ Promise.prototype.timeout = function (ms, message) {
 
 };
 
-},{"./util":131}],130:[function(require,module,exports){
+},{"./util":133}],132:[function(require,module,exports){
 "use strict";
 module.exports = function (Promise, apiRejection, tryConvertToPromise,
     createContext, INTERNAL, debug) {
@@ -15384,7 +16432,7 @@ module.exports = function (Promise, apiRejection, tryConvertToPromise,
 
 };
 
-},{"./errors":107,"./util":131}],131:[function(require,module,exports){
+},{"./errors":109,"./util":133}],133:[function(require,module,exports){
 "use strict";
 var es5 = require("./es5");
 var canEvaluate = typeof navigator == "undefined";
@@ -15610,10 +16658,11 @@ function safeToString(obj) {
 }
 
 function isError(obj) {
-    return obj !== null &&
+    return obj instanceof Error ||
+        (obj !== null &&
            typeof obj === "object" &&
            typeof obj.message === "string" &&
-           typeof obj.name === "string";
+           typeof obj.name === "string");
 }
 
 function markAsOriginatingFromRejection(e) {
@@ -15765,7 +16814,7 @@ if (ret.isNode) ret.toFastProperties(process);
 try {throw new Error(); } catch (e) {ret.lastLineError = e;}
 module.exports = ret;
 
-},{"./es5":108}],132:[function(require,module,exports){
+},{"./es5":110}],134:[function(require,module,exports){
 // Load modules
 
 var Http = require('http');
@@ -16085,7 +17134,7 @@ exports.badImplementation = function (message, data) {
     return err;
 };
 
-},{"hoek":191,"http":undefined}],133:[function(require,module,exports){
+},{"hoek":195,"http":undefined}],135:[function(require,module,exports){
 /*!
  * bufferutil: WebSocket buffer utils
  * Copyright(c) 2015 Einar Otto Stangvik <einaros@gmail.com>
@@ -16143,7 +17192,7 @@ const unmask = (buffer, mask) => {
 
 module.exports = { merge, mask, unmask };
 
-},{}],134:[function(require,module,exports){
+},{}],136:[function(require,module,exports){
 'use strict';
 
 try {
@@ -16152,7 +17201,7 @@ try {
   module.exports = require('./fallback');
 }
 
-},{"./fallback":133,"bindings":95}],135:[function(require,module,exports){
+},{"./fallback":135,"bindings":97}],137:[function(require,module,exports){
 function Caseless (dict) {
   this.dict = dict || {}
 }
@@ -16220,7 +17269,7 @@ module.exports.httpify = function (resp, headers) {
   return c
 }
 
-},{}],136:[function(require,module,exports){
+},{}],138:[function(require,module,exports){
 /*
 
 The MIT License (MIT)
@@ -16397,7 +17446,7 @@ for (var map in colors.maps) {
 }
 
 defineProps(colors, init());
-},{"./custom/trap":137,"./custom/zalgo":138,"./maps/america":139,"./maps/rainbow":140,"./maps/random":141,"./maps/zebra":142,"./styles":143,"./system/supports-colors":144}],137:[function(require,module,exports){
+},{"./custom/trap":139,"./custom/zalgo":140,"./maps/america":141,"./maps/rainbow":142,"./maps/random":143,"./maps/zebra":144,"./styles":145,"./system/supports-colors":146}],139:[function(require,module,exports){
 module['exports'] = function runTheTrap (text, options) {
   var result = "";
   text = text || "Run the trap, drop the bass";
@@ -16444,7 +17493,7 @@ module['exports'] = function runTheTrap (text, options) {
 
 }
 
-},{}],138:[function(require,module,exports){
+},{}],140:[function(require,module,exports){
 // please no
 module['exports'] = function zalgo(text, options) {
   text = text || "   he is here   ";
@@ -16550,7 +17599,7 @@ module['exports'] = function zalgo(text, options) {
   return heComes(text);
 }
 
-},{}],139:[function(require,module,exports){
+},{}],141:[function(require,module,exports){
 var colors = require('../colors');
 
 module['exports'] = (function() {
@@ -16563,7 +17612,7 @@ module['exports'] = (function() {
     }
   }
 })();
-},{"../colors":136}],140:[function(require,module,exports){
+},{"../colors":138}],142:[function(require,module,exports){
 var colors = require('../colors');
 
 module['exports'] = (function () {
@@ -16578,7 +17627,7 @@ module['exports'] = (function () {
 })();
 
 
-},{"../colors":136}],141:[function(require,module,exports){
+},{"../colors":138}],143:[function(require,module,exports){
 var colors = require('../colors');
 
 module['exports'] = (function () {
@@ -16587,13 +17636,13 @@ module['exports'] = (function () {
     return letter === " " ? letter : colors[available[Math.round(Math.random() * (available.length - 1))]](letter);
   };
 })();
-},{"../colors":136}],142:[function(require,module,exports){
+},{"../colors":138}],144:[function(require,module,exports){
 var colors = require('../colors');
 
 module['exports'] = function (letter, i, exploded) {
   return i % 2 === 0 ? letter : colors.inverse(letter);
 };
-},{"../colors":136}],143:[function(require,module,exports){
+},{"../colors":138}],145:[function(require,module,exports){
 /*
 The MIT License (MIT)
 
@@ -16671,7 +17720,7 @@ Object.keys(codes).forEach(function (key) {
   style.open = '\u001b[' + val[0] + 'm';
   style.close = '\u001b[' + val[1] + 'm';
 });
-},{}],144:[function(require,module,exports){
+},{}],146:[function(require,module,exports){
 /*
 The MIT License (MIT)
 
@@ -16733,7 +17782,7 @@ module.exports = (function () {
 
   return false;
 })();
-},{}],145:[function(require,module,exports){
+},{}],147:[function(require,module,exports){
 //
 // Remark: Requiring this file will use the "safe" colors API which will not touch String.prototype
 //
@@ -16743,10 +17792,11 @@ module.exports = (function () {
 //
 var colors = require('./lib/colors');
 module['exports'] = colors;
-},{"./lib/colors":136}],146:[function(require,module,exports){
+},{"./lib/colors":138}],148:[function(require,module,exports){
 var util = require('util');
 var Stream = require('stream').Stream;
 var DelayedStream = require('delayed-stream');
+var defer = require('./defer.js');
 
 module.exports = CombinedStream;
 function CombinedStream() {
@@ -16834,7 +17884,7 @@ CombinedStream.prototype._getNext = function() {
       this._handleErrors(stream);
     }
 
-    this._pipeNext(stream);
+    defer(this._pipeNext.bind(this, stream));
   }.bind(this));
 };
 
@@ -16933,7 +17983,118 @@ CombinedStream.prototype._emitError = function(err) {
   this.emit('error', err);
 };
 
-},{"delayed-stream":153,"stream":undefined,"util":undefined}],147:[function(require,module,exports){
+},{"./defer.js":149,"delayed-stream":157,"stream":undefined,"util":undefined}],149:[function(require,module,exports){
+arguments[4][86][0].apply(exports,arguments)
+},{"dup":86}],150:[function(require,module,exports){
+// Copyright Joyent, Inc. and other Node contributors.
+//
+// Permission is hereby granted, free of charge, to any person obtaining a
+// copy of this software and associated documentation files (the
+// "Software"), to deal in the Software without restriction, including
+// without limitation the rights to use, copy, modify, merge, publish,
+// distribute, sublicense, and/or sell copies of the Software, and to permit
+// persons to whom the Software is furnished to do so, subject to the
+// following conditions:
+//
+// The above copyright notice and this permission notice shall be included
+// in all copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+// OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+// MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN
+// NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM,
+// DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR
+// OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE
+// USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+// NOTE: These type checking functions intentionally don't use `instanceof`
+// because it is fragile and can be easily faked with `Object.create()`.
+
+function isArray(arg) {
+  if (Array.isArray) {
+    return Array.isArray(arg);
+  }
+  return objectToString(arg) === '[object Array]';
+}
+exports.isArray = isArray;
+
+function isBoolean(arg) {
+  return typeof arg === 'boolean';
+}
+exports.isBoolean = isBoolean;
+
+function isNull(arg) {
+  return arg === null;
+}
+exports.isNull = isNull;
+
+function isNullOrUndefined(arg) {
+  return arg == null;
+}
+exports.isNullOrUndefined = isNullOrUndefined;
+
+function isNumber(arg) {
+  return typeof arg === 'number';
+}
+exports.isNumber = isNumber;
+
+function isString(arg) {
+  return typeof arg === 'string';
+}
+exports.isString = isString;
+
+function isSymbol(arg) {
+  return typeof arg === 'symbol';
+}
+exports.isSymbol = isSymbol;
+
+function isUndefined(arg) {
+  return arg === void 0;
+}
+exports.isUndefined = isUndefined;
+
+function isRegExp(re) {
+  return objectToString(re) === '[object RegExp]';
+}
+exports.isRegExp = isRegExp;
+
+function isObject(arg) {
+  return typeof arg === 'object' && arg !== null;
+}
+exports.isObject = isObject;
+
+function isDate(d) {
+  return objectToString(d) === '[object Date]';
+}
+exports.isDate = isDate;
+
+function isError(e) {
+  return (objectToString(e) === '[object Error]' || e instanceof Error);
+}
+exports.isError = isError;
+
+function isFunction(arg) {
+  return typeof arg === 'function';
+}
+exports.isFunction = isFunction;
+
+function isPrimitive(arg) {
+  return arg === null ||
+         typeof arg === 'boolean' ||
+         typeof arg === 'number' ||
+         typeof arg === 'string' ||
+         typeof arg === 'symbol' ||  // ES6 symbol
+         typeof arg === 'undefined';
+}
+exports.isPrimitive = isPrimitive;
+
+exports.isBuffer = Buffer.isBuffer;
+
+function objectToString(o) {
+  return Object.prototype.toString.call(o);
+}
+
+},{}],151:[function(require,module,exports){
 // Load modules
 
 var Crypto = require('crypto');
@@ -17003,7 +18164,7 @@ exports.fixedTimeComparison = function (a, b) {
 
 
 
-},{"boom":132,"crypto":undefined}],148:[function(require,module,exports){
+},{"boom":134,"crypto":undefined}],152:[function(require,module,exports){
 /*
     cycle.js
     2013-02-19
@@ -17175,7 +18336,7 @@ cycle.retrocycle = function retrocycle($) {
     return $;
 };
 
-},{}],149:[function(require,module,exports){
+},{}],153:[function(require,module,exports){
 /**
  * This is the web browser implementation of `debug()`.
  *
@@ -17218,20 +18379,20 @@ function useColors() {
   // NB: In an Electron preload script, document will be defined but not fully
   // initialized. Since we know we're in Chrome, we'll just detect this case
   // explicitly
-  if (typeof window !== 'undefined' && window && typeof window.process !== 'undefined' && window.process.type === 'renderer') {
+  if (typeof window !== 'undefined' && window.process && window.process.type === 'renderer') {
     return true;
   }
 
   // is webkit? http://stackoverflow.com/a/16459606/376773
   // document is undefined in react-native: https://github.com/facebook/react-native/pull/1632
-  return (typeof document !== 'undefined' && document && 'WebkitAppearance' in document.documentElement.style) ||
+  return (typeof document !== 'undefined' && document.documentElement && document.documentElement.style && document.documentElement.style.WebkitAppearance) ||
     // is firebug? http://stackoverflow.com/a/398120/376773
-    (typeof window !== 'undefined' && window && window.console && (console.firebug || (console.exception && console.table))) ||
+    (typeof window !== 'undefined' && window.console && (window.console.firebug || (window.console.exception && window.console.table))) ||
     // is firefox >= v31?
     // https://developer.mozilla.org/en-US/docs/Tools/Web_Console#Styling_messages
-    (typeof navigator !== 'undefined' && navigator && navigator.userAgent && navigator.userAgent.toLowerCase().match(/firefox\/(\d+)/) && parseInt(RegExp.$1, 10) >= 31) ||
+    (typeof navigator !== 'undefined' && navigator.userAgent && navigator.userAgent.toLowerCase().match(/firefox\/(\d+)/) && parseInt(RegExp.$1, 10) >= 31) ||
     // double check webkit in userAgent just in case we are in a worker
-    (typeof navigator !== 'undefined' && navigator && navigator.userAgent && navigator.userAgent.toLowerCase().match(/applewebkit\/(\d+)/));
+    (typeof navigator !== 'undefined' && navigator.userAgent && navigator.userAgent.toLowerCase().match(/applewebkit\/(\d+)/));
 }
 
 /**
@@ -17326,14 +18487,17 @@ function save(namespaces) {
  */
 
 function load() {
+  var r;
   try {
-    return exports.storage.debug;
+    r = exports.storage.debug;
   } catch(e) {}
 
   // If debug isn't set in LS, and we're in Electron, try to load $DEBUG
-  if (typeof process !== 'undefined' && 'env' in process) {
-    return process.env.DEBUG;
+  if (!r && typeof process !== 'undefined' && 'env' in process) {
+    r = process.env.DEBUG;
   }
+
+  return r;
 }
 
 /**
@@ -17359,7 +18523,7 @@ function localstorage() {
   } catch (e) {}
 }
 
-},{"./debug":150}],150:[function(require,module,exports){
+},{"./debug":154}],154:[function(require,module,exports){
 
 /**
  * This is the common logic for both the Node.js and web browser
@@ -17368,7 +18532,7 @@ function localstorage() {
  * Expose `debug()` as the module.
  */
 
-exports = module.exports = createDebug.debug = createDebug.default = createDebug;
+exports = module.exports = createDebug.debug = createDebug['default'] = createDebug;
 exports.coerce = coerce;
 exports.disable = disable;
 exports.enable = enable;
@@ -17500,7 +18664,10 @@ function createDebug(namespace) {
 function enable(namespaces) {
   exports.save(namespaces);
 
-  var split = (namespaces || '').split(/[\s,]+/);
+  exports.names = [];
+  exports.skips = [];
+
+  var split = (typeof namespaces === 'string' ? namespaces : '').split(/[\s,]+/);
   var len = split.length;
 
   for (var i = 0; i < len; i++) {
@@ -17560,7 +18727,7 @@ function coerce(val) {
   return val;
 }
 
-},{"ms":220}],151:[function(require,module,exports){
+},{"ms":220}],155:[function(require,module,exports){
 /**
  * Detect Electron renderer process, which is node, but we should
  * treat as a browser.
@@ -17572,7 +18739,7 @@ if (typeof process !== 'undefined' && process.type === 'renderer') {
   module.exports = require('./node.js');
 }
 
-},{"./browser.js":149,"./node.js":152}],152:[function(require,module,exports){
+},{"./browser.js":153,"./node.js":156}],156:[function(require,module,exports){
 /**
  * Module dependencies.
  */
@@ -17613,7 +18780,7 @@ exports.inspectOpts = Object.keys(process.env).filter(function (key) {
   var prop = key
     .substring(6)
     .toLowerCase()
-    .replace(/_([a-z])/, function (_, k) { return k.toUpperCase() });
+    .replace(/_([a-z])/g, function (_, k) { return k.toUpperCase() });
 
   // coerce string value into JS value
   var val = process.env[key];
@@ -17633,11 +18800,12 @@ exports.inspectOpts = Object.keys(process.env).filter(function (key) {
  *   $ DEBUG_FD=3 node script.js 3>debug.log
  */
 
-if ('DEBUG_FD' in process.env) {
-  util.deprecate(function(){}, '`DEBUG_FD` is deprecated. Override `debug.log` if you want to use a different log function (https://git.io/vMUyr)')()
+var fd = parseInt(process.env.DEBUG_FD, 10) || 2;
+
+if (1 !== fd && 2 !== fd) {
+  util.deprecate(function(){}, 'except for stderr(2) and stdout(1), any other usage of DEBUG_FD is deprecated. Override debug.log if you want to use a different log function (https://git.io/debug_fd)')()
 }
 
-var fd = parseInt(process.env.DEBUG_FD, 10) || 2;
 var stream = 1 === fd ? process.stdout :
              2 === fd ? process.stderr :
              createWritableStdioStream(fd);
@@ -17659,7 +18827,9 @@ function useColors() {
 exports.formatters.o = function(v) {
   this.inspectOpts.colors = this.useColors;
   return util.inspect(v, this.inspectOpts)
-    .replace(/\s*\n\s*/g, ' ');
+    .split('\n').map(function(str) {
+      return str.trim()
+    }).join(' ');
 };
 
 /**
@@ -17805,7 +18975,12 @@ function createWritableStdioStream (fd) {
  */
 
 function init (debug) {
-  debug.inspectOpts = util._extend({}, exports.inspectOpts);
+  debug.inspectOpts = {};
+
+  var keys = Object.keys(exports.inspectOpts);
+  for (var i = 0; i < keys.length; i++) {
+    debug.inspectOpts[keys[i]] = exports.inspectOpts[keys[i]];
+  }
 }
 
 /**
@@ -17814,7 +18989,7 @@ function init (debug) {
 
 exports.enable(load());
 
-},{"./debug":150,"fs":undefined,"net":undefined,"tty":undefined,"util":undefined}],153:[function(require,module,exports){
+},{"./debug":154,"fs":undefined,"net":undefined,"tty":undefined,"util":undefined}],157:[function(require,module,exports){
 var Stream = require('stream').Stream;
 var util = require('util');
 
@@ -17923,7 +19098,7 @@ DelayedStream.prototype._checkIfMaxDataSizeExceeded = function() {
   this.emit('error', new Error(message));
 };
 
-},{"stream":undefined,"util":undefined}],154:[function(require,module,exports){
+},{"stream":undefined,"util":undefined}],158:[function(require,module,exports){
 var crypto = require("crypto");
 var BigInteger = require("jsbn").BigInteger;
 var ECPointFp = require("./lib/ec.js").ECPointFp;
@@ -17982,7 +19157,7 @@ exports.ECKey = function(curve, key, isPublic)
 }
 
 
-},{"./lib/ec.js":155,"./lib/sec.js":156,"crypto":undefined,"jsbn":211}],155:[function(require,module,exports){
+},{"./lib/ec.js":159,"./lib/sec.js":160,"crypto":undefined,"jsbn":210}],159:[function(require,module,exports){
 // Basic Javascript Elliptic Curve implementation
 // Ported loosely from BouncyCastle's Java EC code
 // Only Fp curves implemented for now
@@ -18545,7 +19720,7 @@ var exports = {
 
 module.exports = exports
 
-},{"jsbn":211}],156:[function(require,module,exports){
+},{"jsbn":210}],160:[function(require,module,exports){
 // Named EC curves
 
 // Requires ec.js, jsbn.js, and jsbn2.js
@@ -18717,7 +19892,7 @@ module.exports = {
   "secp256r1":secp256r1
 }
 
-},{"./ec.js":155,"jsbn":211}],157:[function(require,module,exports){
+},{"./ec.js":159,"jsbn":210}],161:[function(require,module,exports){
 'use strict';
 
 var has = Object.prototype.hasOwnProperty;
@@ -19008,7 +20183,7 @@ if ('undefined' !== typeof module) {
   module.exports = EventEmitter;
 }
 
-},{}],158:[function(require,module,exports){
+},{}],162:[function(require,module,exports){
 'use strict';
 
 var hasOwn = Object.prototype.hasOwnProperty;
@@ -19037,17 +20212,17 @@ var isPlainObject = function isPlainObject(obj) {
 	// Own properties are enumerated firstly, so to speed up,
 	// if last one is own, then all properties are own.
 	var key;
-	for (key in obj) {/**/}
+	for (key in obj) { /**/ }
 
 	return typeof key === 'undefined' || hasOwn.call(obj, key);
 };
 
 module.exports = function extend() {
-	var options, name, src, copy, copyIsArray, clone,
-		target = arguments[0],
-		i = 1,
-		length = arguments.length,
-		deep = false;
+	var options, name, src, copy, copyIsArray, clone;
+	var target = arguments[0];
+	var i = 1;
+	var length = arguments.length;
+	var deep = false;
 
 	// Handle a deep copy situation
 	if (typeof target === 'boolean') {
@@ -19055,7 +20230,8 @@ module.exports = function extend() {
 		target = arguments[1] || {};
 		// skip the boolean and the target
 		i = 2;
-	} else if ((typeof target !== 'object' && typeof target !== 'function') || target == null) {
+	}
+	if (target == null || (typeof target !== 'object' && typeof target !== 'function')) {
 		target = {};
 	}
 
@@ -19095,8 +20271,7 @@ module.exports = function extend() {
 	return target;
 };
 
-
-},{}],159:[function(require,module,exports){
+},{}],163:[function(require,module,exports){
 /*
  * extsprintf.js: extended POSIX-style sprintf
  */
@@ -19108,6 +20283,8 @@ var mod_util = require('util');
  * Public interface
  */
 exports.sprintf = jsSprintf;
+exports.printf = jsPrintf;
+exports.fprintf = jsFprintf;
 
 /*
  * Stripped down version of s[n]printf(3c).  We make a best effort to throw an
@@ -19206,6 +20383,10 @@ function jsSprintf(fmt)
 			    arg.toString());
 			break;
 
+		case 'x':
+			ret += doPad(pad, width, left, arg.toString(16));
+			break;
+
 		case 'j': /* non-standard */
 			if (width === 0)
 				width = 10;
@@ -19224,6 +20405,17 @@ function jsSprintf(fmt)
 
 	ret += fmt;
 	return (ret);
+}
+
+function jsPrintf() {
+	var args = Array.prototype.slice.call(arguments);
+	args.unshift(process.stdout);
+	jsFprintf.apply(null, args);
+}
+
+function jsFprintf(stream) {
+	var args = Array.prototype.slice.call(arguments, 1);
+	return (stream.write(jsSprintf.apply(this, args)));
 }
 
 function doPad(chr, width, left, str)
@@ -19264,7 +20456,7 @@ function dumpException(ex)
 	return (ret);
 }
 
-},{"assert":undefined,"util":undefined}],160:[function(require,module,exports){
+},{"assert":undefined,"util":undefined}],164:[function(require,module,exports){
 module.exports = ForeverAgent
 ForeverAgent.SSL = ForeverAgentSSL
 
@@ -19404,7 +20596,7 @@ function createConnectionSSL (port, host, options) {
   return tls.connect(options);
 }
 
-},{"http":undefined,"https":undefined,"net":undefined,"tls":undefined,"util":undefined}],161:[function(require,module,exports){
+},{"http":undefined,"https":undefined,"net":undefined,"tls":undefined,"util":undefined}],165:[function(require,module,exports){
 var CombinedStream = require('combined-stream');
 var util = require('util');
 var path = require('path');
@@ -19846,7 +21038,11 @@ FormData.prototype._error = function(err) {
   }
 };
 
-},{"./populate.js":162,"asynckit":81,"combined-stream":146,"fs":undefined,"http":undefined,"https":undefined,"mime-types":219,"path":undefined,"url":undefined,"util":undefined}],162:[function(require,module,exports){
+FormData.prototype.toString = function () {
+  return '[object FormData]';
+};
+
+},{"./populate.js":166,"asynckit":83,"combined-stream":148,"fs":undefined,"http":undefined,"https":undefined,"mime-types":219,"path":undefined,"url":undefined,"util":undefined}],166:[function(require,module,exports){
 // populates missing values
 module.exports = function(dst, src) {
 
@@ -19858,7 +21054,7 @@ module.exports = function(dst, src) {
   return dst;
 };
 
-},{}],163:[function(require,module,exports){
+},{}],167:[function(require,module,exports){
 var util = require('util')
 
 var INDENT_START = /[\{\[]/
@@ -19921,7 +21117,7 @@ module.exports = function() {
   return line
 }
 
-},{"util":undefined}],164:[function(require,module,exports){
+},{"util":undefined}],168:[function(require,module,exports){
 var isProperty = require('is-property')
 
 var gen = function(obj, prop) {
@@ -19935,7 +21131,7 @@ gen.property = function (prop) {
 
 module.exports = gen
 
-},{"is-property":202}],165:[function(require,module,exports){
+},{"is-property":207}],169:[function(require,module,exports){
 'use strict'
 
 function ValidationError (errors) {
@@ -19947,7 +21143,7 @@ ValidationError.prototype = Error.prototype
 
 module.exports = ValidationError
 
-},{}],166:[function(require,module,exports){
+},{}],170:[function(require,module,exports){
 'use strict'
 
 var Promise = require('pinkie-promise')
@@ -19971,7 +21167,7 @@ Object.keys(schemas).map(function (name) {
   module.exports[name] = promisify(schemas[name])
 })
 
-},{"./runner":167,"./schemas":175,"pinkie-promise":223}],167:[function(require,module,exports){
+},{"./runner":171,"./schemas":179,"pinkie-promise":224}],171:[function(require,module,exports){
 'use strict'
 
 var schemas = require('./schemas')
@@ -20002,7 +21198,7 @@ module.exports = function (schema, data, cb) {
   return valid
 }
 
-},{"./error":165,"./schemas":175,"is-my-json-valid":201}],168:[function(require,module,exports){
+},{"./error":169,"./schemas":179,"is-my-json-valid":206}],172:[function(require,module,exports){
 module.exports={
   "properties": {
     "beforeRequest": {
@@ -20017,7 +21213,7 @@ module.exports={
   }
 }
 
-},{}],169:[function(require,module,exports){
+},{}],173:[function(require,module,exports){
 module.exports={
   "oneOf": [{
     "type": "object",
@@ -20050,7 +21246,7 @@ module.exports={
   }]
 }
 
-},{}],170:[function(require,module,exports){
+},{}],174:[function(require,module,exports){
 module.exports={
   "type": "object",
   "required": [
@@ -20079,7 +21275,7 @@ module.exports={
   }
 }
 
-},{}],171:[function(require,module,exports){
+},{}],175:[function(require,module,exports){
 module.exports={
   "type": "object",
   "required": [
@@ -20115,7 +21311,7 @@ module.exports={
   }
 }
 
-},{}],172:[function(require,module,exports){
+},{}],176:[function(require,module,exports){
 module.exports={
   "type": "object",
   "required": [
@@ -20135,7 +21331,7 @@ module.exports={
   }
 }
 
-},{}],173:[function(require,module,exports){
+},{}],177:[function(require,module,exports){
 module.exports={
   "type": "object",
   "optional": true,
@@ -20188,7 +21384,7 @@ module.exports={
   }
 }
 
-},{}],174:[function(require,module,exports){
+},{}],178:[function(require,module,exports){
 module.exports={
   "type": "object",
   "required": [
@@ -20201,7 +21397,7 @@ module.exports={
   }
 }
 
-},{}],175:[function(require,module,exports){
+},{}],179:[function(require,module,exports){
 'use strict'
 
 var schemas = {
@@ -20252,7 +21448,7 @@ schemas.har.properties.log = schemas.log
 
 module.exports = schemas
 
-},{"./cache.json":168,"./cacheEntry.json":169,"./content.json":170,"./cookie.json":171,"./creator.json":172,"./entry.json":173,"./har.json":174,"./log.json":176,"./page.json":177,"./pageTimings.json":178,"./postData.json":179,"./record.json":180,"./request.json":181,"./response.json":182,"./timings.json":183}],176:[function(require,module,exports){
+},{"./cache.json":172,"./cacheEntry.json":173,"./content.json":174,"./cookie.json":175,"./creator.json":176,"./entry.json":177,"./har.json":178,"./log.json":180,"./page.json":181,"./pageTimings.json":182,"./postData.json":183,"./record.json":184,"./request.json":185,"./response.json":186,"./timings.json":187}],180:[function(require,module,exports){
 module.exports={
   "type": "object",
   "required": [
@@ -20288,7 +21484,7 @@ module.exports={
   }
 }
 
-},{}],177:[function(require,module,exports){
+},{}],181:[function(require,module,exports){
 module.exports={
   "type": "object",
   "optional": true,
@@ -20320,7 +21516,7 @@ module.exports={
   }
 }
 
-},{}],178:[function(require,module,exports){
+},{}],182:[function(require,module,exports){
 module.exports={
   "type": "object",
   "properties": {
@@ -20338,7 +21534,7 @@ module.exports={
   }
 }
 
-},{}],179:[function(require,module,exports){
+},{}],183:[function(require,module,exports){
 module.exports={
   "type": "object",
   "optional": true,
@@ -20381,7 +21577,7 @@ module.exports={
   }
 }
 
-},{}],180:[function(require,module,exports){
+},{}],184:[function(require,module,exports){
 module.exports={
   "type": "object",
   "required": [
@@ -20401,7 +21597,7 @@ module.exports={
   }
 }
 
-},{}],181:[function(require,module,exports){
+},{}],185:[function(require,module,exports){
 module.exports={
   "type": "object",
   "required": [
@@ -20458,7 +21654,7 @@ module.exports={
   }
 }
 
-},{}],182:[function(require,module,exports){
+},{}],186:[function(require,module,exports){
 module.exports={
   "type": "object",
   "required": [
@@ -20512,7 +21708,7 @@ module.exports={
   }
 }
 
-},{}],183:[function(require,module,exports){
+},{}],187:[function(require,module,exports){
 module.exports={
   "required": [
     "send",
@@ -20554,7 +21750,7 @@ module.exports={
   }
 }
 
-},{}],184:[function(require,module,exports){
+},{}],188:[function(require,module,exports){
 // Load modules
 
 var Url = require('url');
@@ -20925,7 +22121,7 @@ exports.message = function (host, port, message, options) {
 
 
 
-},{"./crypto":185,"./utils":188,"cryptiles":147,"hoek":191,"url":undefined}],185:[function(require,module,exports){
+},{"./crypto":189,"./utils":192,"cryptiles":151,"hoek":195,"url":undefined}],189:[function(require,module,exports){
 // Load modules
 
 var Crypto = require('crypto');
@@ -21053,7 +22249,7 @@ exports.timestampMessage = function (credentials, localtimeOffsetMsec) {
     return { ts: now, tsm: tsm };
 };
 
-},{"./utils":188,"crypto":undefined,"url":undefined}],186:[function(require,module,exports){
+},{"./utils":192,"crypto":undefined,"url":undefined}],190:[function(require,module,exports){
 // Export sub-modules
 
 exports.error = exports.Error = require('boom');
@@ -21070,7 +22266,7 @@ exports.uri = {
 };
 
 
-},{"./client":184,"./crypto":185,"./server":187,"./utils":188,"boom":132,"sntp":245}],187:[function(require,module,exports){
+},{"./client":188,"./crypto":189,"./server":191,"./utils":192,"boom":134,"sntp":246}],191:[function(require,module,exports){
 // Load modules
 
 var Boom = require('boom');
@@ -21620,7 +22816,7 @@ internals.nonceFunc = function (key, nonce, ts, nonceCallback) {
     return nonceCallback();         // No validation
 };
 
-},{"./crypto":185,"./utils":188,"boom":132,"cryptiles":147,"hoek":191}],188:[function(require,module,exports){
+},{"./crypto":189,"./utils":192,"boom":134,"cryptiles":151,"hoek":195}],192:[function(require,module,exports){
 // Load modules
 
 var Sntp = require('sntp');
@@ -21806,50 +23002,31 @@ exports.unauthorized = function (message, attributes) {
 };
 
 
-},{"../package.json":189,"boom":132,"sntp":245}],189:[function(require,module,exports){
+},{"../package.json":193,"boom":134,"sntp":246}],193:[function(require,module,exports){
 module.exports={
-  "_args": [
-    [
-      {
-        "raw": "hawk@~3.1.3",
-        "scope": null,
-        "escapedName": "hawk",
-        "name": "hawk",
-        "rawSpec": "~3.1.3",
-        "spec": ">=3.1.3 <3.2.0",
-        "type": "range"
-      },
-      "/Users/ddascal/Projects/openwhisk/openwhisk-slack/node_modules/request"
-    ]
-  ],
-  "_from": "hawk@>=3.1.3 <3.2.0",
+  "_from": "hawk@~3.1.3",
   "_id": "hawk@3.1.3",
-  "_inCache": true,
+  "_inBundle": false,
+  "_integrity": "sha1-B4REvXwWQLD+VA0sm3PVlnjo4cQ=",
   "_location": "/hawk",
-  "_nodeVersion": "5.4.1",
-  "_npmUser": {
-    "name": "hueniverse",
-    "email": "eran@hammer.io"
-  },
-  "_npmVersion": "3.3.12",
   "_phantomChildren": {},
   "_requested": {
+    "type": "range",
+    "registry": true,
     "raw": "hawk@~3.1.3",
-    "scope": null,
-    "escapedName": "hawk",
     "name": "hawk",
+    "escapedName": "hawk",
     "rawSpec": "~3.1.3",
-    "spec": ">=3.1.3 <3.2.0",
-    "type": "range"
+    "saveSpec": null,
+    "fetchSpec": "~3.1.3"
   },
   "_requiredBy": [
     "/request"
   ],
-  "_resolved": "https://registry.npmjs.org/hawk/-/hawk-3.1.3.tgz",
+  "_resolved": "https://artifactory.corp.adobe.com:443/artifactory/api/npm/npm-runner-release/hawk/-/hawk-3.1.3.tgz",
   "_shasum": "078444bd7c1640b0fe540d2c9b73d59678e8e1c4",
-  "_shrinkwrap": null,
   "_spec": "hawk@~3.1.3",
-  "_where": "/Users/ddascal/Projects/openwhisk/openwhisk-slack/node_modules/request",
+  "_where": "/Users/ddascal/Projects/adobe-apiplatform/openwhisk-slack/node_modules/request",
   "author": {
     "name": "Eran Hammer",
     "email": "eran@hammer.io",
@@ -21859,6 +23036,7 @@ module.exports={
   "bugs": {
     "url": "https://github.com/hueniverse/hawk/issues"
   },
+  "bundleDependencies": false,
   "contributors": [],
   "dependencies": {
     "boom": "2.x.x",
@@ -21866,20 +23044,15 @@ module.exports={
     "hoek": "2.x.x",
     "sntp": "1.x.x"
   },
+  "deprecated": false,
   "description": "HTTP Hawk Authentication Scheme",
   "devDependencies": {
     "code": "1.x.x",
     "lab": "5.x.x"
   },
-  "directories": {},
-  "dist": {
-    "shasum": "078444bd7c1640b0fe540d2c9b73d59678e8e1c4",
-    "tarball": "https://registry.npmjs.org/hawk/-/hawk-3.1.3.tgz"
-  },
   "engines": {
     "node": ">=0.10.32"
   },
-  "gitHead": "2f0b93b34ed9b0ebc865838ef70c6a4035591430",
   "homepage": "https://github.com/hueniverse/hawk#readme",
   "keywords": [
     "http",
@@ -21889,15 +23062,7 @@ module.exports={
   ],
   "license": "BSD-3-Clause",
   "main": "lib/index.js",
-  "maintainers": [
-    {
-      "name": "hueniverse",
-      "email": "eran@hueniverse.com"
-    }
-  ],
   "name": "hawk",
-  "optionalDependencies": {},
-  "readme": "ERROR: No README data found!",
   "repository": {
     "type": "git",
     "url": "git://github.com/hueniverse/hawk.git"
@@ -21909,7 +23074,7 @@ module.exports={
   "version": "3.1.3"
 }
 
-},{}],190:[function(require,module,exports){
+},{}],194:[function(require,module,exports){
 // Declare internals
 
 var internals = {};
@@ -22043,7 +23208,7 @@ internals.safeCharCodes = (function () {
     return safe;
 }());
 
-},{}],191:[function(require,module,exports){
+},{}],195:[function(require,module,exports){
 // Load modules
 
 var Crypto = require('crypto');
@@ -23038,7 +24203,7 @@ exports.shallow = function (source) {
     return target;
 };
 
-},{"./escape":190,"crypto":undefined,"path":undefined,"util":undefined}],192:[function(require,module,exports){
+},{"./escape":194,"crypto":undefined,"path":undefined,"util":undefined}],196:[function(require,module,exports){
 // Copyright 2015 Joyent, Inc.
 
 var parser = require('./parser');
@@ -23069,7 +24234,7 @@ module.exports = {
   verifyHMAC: verify.verifyHMAC
 };
 
-},{"./parser":193,"./signer":194,"./utils":195,"./verify":196}],193:[function(require,module,exports){
+},{"./parser":197,"./signer":198,"./utils":199,"./verify":200}],197:[function(require,module,exports){
 // Copyright 2012 Joyent, Inc.  All rights reserved.
 
 var assert = require('assert-plus');
@@ -23389,7 +24554,7 @@ module.exports = {
 
 };
 
-},{"./utils":195,"assert-plus":79,"util":undefined}],194:[function(require,module,exports){
+},{"./utils":199,"assert-plus":81,"util":undefined}],198:[function(require,module,exports){
 // Copyright 2012 Joyent, Inc.  All rights reserved.
 
 var assert = require('assert-plus');
@@ -23790,7 +24955,7 @@ module.exports = {
 
 };
 
-},{"./utils":195,"assert-plus":79,"crypto":undefined,"http":undefined,"jsprim":215,"sshpk":264,"util":undefined}],195:[function(require,module,exports){
+},{"./utils":199,"assert-plus":81,"crypto":undefined,"http":undefined,"jsprim":214,"sshpk":266,"util":undefined}],199:[function(require,module,exports){
 // Copyright 2012 Joyent, Inc.  All rights reserved.
 
 var assert = require('assert-plus');
@@ -23904,7 +25069,7 @@ module.exports = {
   }
 };
 
-},{"assert-plus":79,"sshpk":264,"util":undefined}],196:[function(require,module,exports){
+},{"assert-plus":81,"sshpk":266,"util":undefined}],200:[function(require,module,exports){
 // Copyright 2015 Joyent, Inc.
 
 var assert = require('assert-plus');
@@ -23994,7 +25159,7 @@ module.exports = {
   }
 };
 
-},{"./utils":195,"assert-plus":79,"crypto":undefined,"sshpk":264}],197:[function(require,module,exports){
+},{"./utils":199,"assert-plus":81,"crypto":undefined,"sshpk":266}],201:[function(require,module,exports){
 
 /**
  * Module dependencies.
@@ -24198,7 +25363,7 @@ function connect (req, opts, fn) {
   socket.write(msg);
 };
 
-},{"agent-base":72,"debug":151,"extend":158,"net":undefined,"tls":undefined,"url":undefined,"util":undefined}],198:[function(require,module,exports){
+},{"agent-base":74,"debug":155,"extend":162,"net":undefined,"tls":undefined,"url":undefined,"util":undefined}],202:[function(require,module,exports){
 try {
   var util = require('util');
   if (typeof util.inherits !== 'function') throw '';
@@ -24207,7 +25372,7 @@ try {
   module.exports = require('./inherits_browser.js');
 }
 
-},{"./inherits_browser.js":199,"util":undefined}],199:[function(require,module,exports){
+},{"./inherits_browser.js":203,"util":undefined}],203:[function(require,module,exports){
 if (typeof Object.create === 'function') {
   // implementation from standard node.js 'util' module
   module.exports = function inherits(ctor, superCtor) {
@@ -24232,23 +25397,141 @@ if (typeof Object.create === 'function') {
   }
 }
 
-},{}],200:[function(require,module,exports){
-exports['date-time'] = /^\d{4}-(?:0[0-9]{1}|1[0-2]{1})-[0-9]{2}[tT ]\d{2}:\d{2}:\d{2}(\.\d+)?([zZ]|[+-]\d{2}:\d{2})$/
+},{}],204:[function(require,module,exports){
+var reIpv4FirstPass = /^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$/
+
+var reSubnetString = /\/\d{1,3}(?=%|$)/
+var reForwardSlash = /\//
+var reZone = /%.*$/
+var reBadCharacters = /([^0-9a-f:/%])/i
+var reBadAddress = /([0-9a-f]{5,}|:{3,}|[^:]:$|^:[^:]|\/$)/i
+
+function validate4 (input) {
+  if (!(reIpv4FirstPass.test(input))) return false
+
+  var parts = input.split('.')
+
+  if (parts.length !== 4) return false
+
+  if (parts[0][0] === '0' && parts[0].length > 1) return false
+  if (parts[1][0] === '0' && parts[1].length > 1) return false
+  if (parts[2][0] === '0' && parts[2].length > 1) return false
+  if (parts[3][0] === '0' && parts[3].length > 1) return false
+
+  var n0 = Number(parts[0])
+  var n1 = Number(parts[1])
+  var n2 = Number(parts[2])
+  var n3 = Number(parts[3])
+
+  return (n0 >= 0 && n0 < 256 && n1 >= 0 && n1 < 256 && n2 >= 0 && n2 < 256 && n3 >= 0 && n3 < 256)
+}
+
+function validate6 (input) {
+  var withoutSubnet = input.replace(reSubnetString, '')
+  var hasSubnet = (input.length !== withoutSubnet.length)
+
+  // FIXME: this should probably be an option in the future
+  if (hasSubnet) return false
+
+  if (!hasSubnet) {
+    if (reForwardSlash.test(input)) return false
+  }
+
+  var withoutZone = withoutSubnet.replace(reZone, '')
+  var lastPartSeparator = withoutZone.lastIndexOf(':')
+
+  if (lastPartSeparator === -1) return false
+
+  var lastPart = withoutZone.substring(lastPartSeparator + 1)
+  var hasV4Part = validate4(lastPart)
+  var address = (hasV4Part ? withoutZone.substring(0, lastPartSeparator + 1) + '1234:5678' : withoutZone)
+
+  if (reBadCharacters.test(address)) return false
+  if (reBadAddress.test(address)) return false
+
+  var halves = address.split('::')
+
+  if (halves.length > 2) return false
+
+  if (halves.length === 2) {
+    var first = (halves[0] === '' ? [] : halves[0].split(':'))
+    var last = (halves[1] === '' ? [] : halves[1].split(':'))
+    var remainingLength = 8 - (first.length + last.length)
+
+    if (remainingLength <= 0) return false
+  } else {
+    if (address.split(':').length !== 8) return false
+  }
+
+  return true
+}
+
+function validate (input) {
+  return validate4(input) || validate6(input)
+}
+
+module.exports = function validator (options) {
+  if (!options) options = {}
+
+  if (options.version === 4) return validate4
+  if (options.version === 6) return validate6
+  if (options.version == null) return validate
+
+  throw new Error('Unknown version: ' + options.version)
+}
+
+module.exports['__all_regexes__'] = [
+  reIpv4FirstPass,
+  reSubnetString,
+  reForwardSlash,
+  reZone,
+  reBadCharacters,
+  reBadAddress
+]
+
+},{}],205:[function(require,module,exports){
+var createIpValidator = require('is-my-ip-valid')
+
+var reEmailWhitespace = /\s/
+var reHostnameFirstPass = /^[a-zA-Z0-9.-]+$/
+var reHostnamePart = /^([a-zA-Z0-9]|[a-zA-Z0-9][a-zA-Z0-9-]{0,61}[a-zA-Z0-9])$/
+var rePhoneFirstPass = /^\+[0-9][0-9 ]{5,27}[0-9]$/
+var rePhoneDoubleSpace = / {2}/
+var rePhoneGlobalSpace = / /g
+
+exports['date-time'] = /^\d{4}-(?:0[0-9]{1}|1[0-2]{1})-[0-9]{2}[tT ]\d{2}:\d{2}:\d{2}(?:\.\d+|)([zZ]|[+-]\d{2}:\d{2})$/
 exports['date'] = /^\d{4}-(?:0[0-9]{1}|1[0-2]{1})-[0-9]{2}$/
 exports['time'] = /^\d{2}:\d{2}:\d{2}$/
-exports['email'] = /^\S+@\S+$/
-exports['ip-address'] = exports['ipv4'] = /^(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$/
-exports['ipv6'] = /^\s*((([0-9A-Fa-f]{1,4}:){7}([0-9A-Fa-f]{1,4}|:))|(([0-9A-Fa-f]{1,4}:){6}(:[0-9A-Fa-f]{1,4}|((25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(\.(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){3})|:))|(([0-9A-Fa-f]{1,4}:){5}(((:[0-9A-Fa-f]{1,4}){1,2})|:((25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(\.(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){3})|:))|(([0-9A-Fa-f]{1,4}:){4}(((:[0-9A-Fa-f]{1,4}){1,3})|((:[0-9A-Fa-f]{1,4})?:((25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(\.(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){3}))|:))|(([0-9A-Fa-f]{1,4}:){3}(((:[0-9A-Fa-f]{1,4}){1,4})|((:[0-9A-Fa-f]{1,4}){0,2}:((25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(\.(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){3}))|:))|(([0-9A-Fa-f]{1,4}:){2}(((:[0-9A-Fa-f]{1,4}){1,5})|((:[0-9A-Fa-f]{1,4}){0,3}:((25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(\.(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){3}))|:))|(([0-9A-Fa-f]{1,4}:){1}(((:[0-9A-Fa-f]{1,4}){1,6})|((:[0-9A-Fa-f]{1,4}){0,4}:((25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(\.(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){3}))|:))|(:(((:[0-9A-Fa-f]{1,4}){1,7})|((:[0-9A-Fa-f]{1,4}){0,5}:((25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(\.(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){3}))|:)))(%.+)?\s*$/
+exports['email'] = function (input) { return (input.indexOf('@') !== -1) && (!reEmailWhitespace.test(input)) }
+exports['ip-address'] = exports['ipv4'] = createIpValidator({ version: 4 })
+exports['ipv6'] = createIpValidator({ version: 6 })
 exports['uri'] = /^[a-zA-Z][a-zA-Z0-9+-.]*:[^\s]*$/
 exports['color'] = /(#?([0-9A-Fa-f]{3,6})\b)|(aqua)|(black)|(blue)|(fuchsia)|(gray)|(green)|(lime)|(maroon)|(navy)|(olive)|(orange)|(purple)|(red)|(silver)|(teal)|(white)|(yellow)|(rgb\(\s*\b([0-9]|[1-9][0-9]|1[0-9][0-9]|2[0-4][0-9]|25[0-5])\b\s*,\s*\b([0-9]|[1-9][0-9]|1[0-9][0-9]|2[0-4][0-9]|25[0-5])\b\s*,\s*\b([0-9]|[1-9][0-9]|1[0-9][0-9]|2[0-4][0-9]|25[0-5])\b\s*\))|(rgb\(\s*(\d?\d%|100%)+\s*,\s*(\d?\d%|100%)+\s*,\s*(\d?\d%|100%)+\s*\))/
-exports['hostname'] = /^([a-zA-Z0-9]|[a-zA-Z0-9][a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])(\.([a-zA-Z0-9]|[a-zA-Z0-9][a-zA-Z0-9\-]{0,61}[a-zA-Z0-9]))*$/
+exports['hostname'] = function (input) {
+  if (!(reHostnameFirstPass.test(input))) return false
+
+  var parts = input.split('.')
+
+  for (var i = 0; i < parts.length; i++) {
+    if (!(reHostnamePart.test(parts[i]))) return false
+  }
+
+  return true
+}
 exports['alpha'] = /^[a-zA-Z]+$/
 exports['alphanumeric'] = /^[a-zA-Z0-9]+$/
 exports['style'] = /\s*(.+?):\s*([^;]+);?/g
-exports['phone'] = /^\+(?:[0-9] ?){6,14}[0-9]$/
+exports['phone'] = function (input) {
+  if (!(rePhoneFirstPass.test(input))) return false
+  if (rePhoneDoubleSpace.test(input)) return false
+
+  var digits = input.substring(1).replace(rePhoneGlobalSpace, '').length
+
+  return (digits >= 7 && digits <= 15)
+}
 exports['utc-millisec'] = /^[0-9]{1,15}\.?[0-9]{0,15}$/
 
-},{}],201:[function(require,module,exports){
+},{"is-my-ip-valid":204}],206:[function(require,module,exports){
 var genobj = require('generate-object-property')
 var genfun = require('generate-function')
 var jsonpointer = require('jsonpointer')
@@ -24326,7 +25609,7 @@ types.object = function(name) {
 }
 
 types.number = function(name) {
-  return 'typeof '+name+' === "number"'
+  return 'typeof '+name+' === "number" && isFinite('+name+')'
 }
 
 types.integer = function(name) {
@@ -24360,10 +25643,6 @@ var isMultipleOf = function(name, multipleOf) {
   return !res;
 }
 
-var toType = function(node) {
-  return node.type
-}
-
 var compile = function(schema, cache, root, reporter, opts) {
   var fmts = opts ? xtend(formats, opts.formats) : formats
   var scope = {unique:unique, formats:fmts, isMultipleOf:isMultipleOf}
@@ -24392,7 +25671,7 @@ var compile = function(schema, cache, root, reporter, opts) {
     return v
   }
 
-  var visit = function(name, node, reporter, filter) {
+  var visit = function(name, node, reporter, filter, schemaPath) {
     var properties = node.properties
     var type = node.type
     var tuple = false
@@ -24412,7 +25691,14 @@ var compile = function(schema, cache, root, reporter, opts) {
       if (reporter === true) {
         validate('if (validate.errors === null) validate.errors = []')
         if (verbose) {
-          validate('validate.errors.push({field:%s,message:%s,value:%s,type:%s})', formatName(prop || name), JSON.stringify(msg), value || name, JSON.stringify(type))
+          validate(
+            'validate.errors.push({field:%s,message:%s,value:%s,type:%s,schemaPath:%s})',
+            formatName(prop || name),
+            JSON.stringify(msg),
+            value || name,
+            JSON.stringify(type),
+            JSON.stringify(schemaPath)
+          )
         } else {
           validate('validate.errors.push({field:%s,message:%s})', formatName(prop || name), JSON.stringify(msg))
         }
@@ -24431,6 +25717,10 @@ var compile = function(schema, cache, root, reporter, opts) {
 
     var valid = [].concat(type)
       .map(function(t) {
+        if (t && !types.hasOwnProperty(t)) {
+          throw new Error('Unknown type: ' + t)
+        }
+
         return types[t || 'any'](name)
       })
       .join(' || ') || 'true'
@@ -24450,7 +25740,7 @@ var compile = function(schema, cache, root, reporter, opts) {
       } else if (node.additionalItems) {
         var i = genloop()
         validate('for (var %s = %d; %s < %s.length; %s++) {', i, node.items.length, i, name, i)
-        visit(name+'['+i+']', node.additionalItems, reporter, filter)
+        visit(name+'['+i+']', node.additionalItems, reporter, filter, schemaPath.concat('additionalItems'))
         validate('}')
       }
     }
@@ -24468,10 +25758,6 @@ var compile = function(schema, cache, root, reporter, opts) {
     }
 
     if (Array.isArray(node.required)) {
-      var isUndefined = function(req) {
-        return genobj(name, req) + ' === undefined'
-      }
-
       var checkRequired = function (req) {
         var prop = genobj(name, req);
         validate('if (%s === undefined) {', prop)
@@ -24533,7 +25819,7 @@ var compile = function(schema, cache, root, reporter, opts) {
         }
         if (typeof deps === 'object') {
           validate('if (%s !== undefined) {', genobj(name, key))
-          visit(name, deps, reporter, filter)
+          visit(name, deps, reporter, filter, schemaPath.concat(['dependencies', key]))
           validate('}')
         }
       })
@@ -24567,7 +25853,7 @@ var compile = function(schema, cache, root, reporter, opts) {
         if (filter) validate('delete %s', name+'['+keys+'['+i+']]')
         error('has additional properties', null, JSON.stringify(name+'.') + ' + ' + keys + '['+i+']')
       } else {
-        visit(name+'['+keys+'['+i+']]', node.additionalProperties, reporter, filter)
+        visit(name+'['+keys+'['+i+']]', node.additionalProperties, reporter, filter, schemaPath.concat(['additionalProperties']))
       }
 
       validate
@@ -24598,7 +25884,7 @@ var compile = function(schema, cache, root, reporter, opts) {
     if (node.not) {
       var prev = gensym('prev')
       validate('var %s = errors', prev)
-      visit(name, node.not, false, filter)
+      visit(name, node.not, false, filter, schemaPath.concat('not'))
       validate('if (%s === errors) {', prev)
       error('negative schema matches')
       validate('} else {')
@@ -24611,7 +25897,7 @@ var compile = function(schema, cache, root, reporter, opts) {
 
       var i = genloop()
       validate('for (var %s = 0; %s < %s.length; %s++) {', i, i, name, i)
-      visit(name+'['+i+']', node.items, reporter, filter)
+      visit(name+'['+i+']', node.items, reporter, filter, schemaPath.concat('items'))
       validate('}')
 
       if (type !== 'array') validate('}')
@@ -24628,7 +25914,7 @@ var compile = function(schema, cache, root, reporter, opts) {
       Object.keys(node.patternProperties).forEach(function(key) {
         var p = patterns(key)
         validate('if (%s.test(%s)) {', p, keys+'['+i+']')
-        visit(name+'['+keys+'['+i+']]', node.patternProperties[key], reporter, filter)
+        visit(name+'['+keys+'['+i+']]', node.patternProperties[key], reporter, filter, schemaPath.concat(['patternProperties', key]))
         validate('}')
       })
 
@@ -24646,8 +25932,8 @@ var compile = function(schema, cache, root, reporter, opts) {
     }
 
     if (node.allOf) {
-      node.allOf.forEach(function(sch) {
-        visit(name, sch, reporter, filter)
+      node.allOf.forEach(function(sch, key) {
+        visit(name, sch, reporter, filter, schemaPath.concat(['allOf', key]))
       })
     }
 
@@ -24661,7 +25947,7 @@ var compile = function(schema, cache, root, reporter, opts) {
           validate('if (errors !== %s) {', prev)
             ('errors = %s', prev)
         }
-        visit(name, sch, false, false)
+        visit(name, sch, false, false, schemaPath)
       })
       node.anyOf.forEach(function(sch, i) {
         if (i) validate('}')
@@ -24680,7 +25966,7 @@ var compile = function(schema, cache, root, reporter, opts) {
         ('var %s = 0', passes)
 
       node.oneOf.forEach(function(sch, i) {
-        visit(name, sch, false, false)
+        visit(name, sch, false, false, schemaPath)
         validate('if (%s === errors) {', prev)
           ('%s++', passes)
         ('} else {')
@@ -24788,7 +26074,13 @@ var compile = function(schema, cache, root, reporter, opts) {
       Object.keys(properties).forEach(function(p) {
         if (Array.isArray(type) && type.indexOf('null') !== -1) validate('if (%s !== null) {', name)
 
-        visit(genobj(name, p), properties[p], reporter, filter)
+        visit(
+          genobj(name, p),
+          properties[p],
+          reporter,
+          filter,
+          schemaPath.concat(tuple ? p : ['properties', p])
+        )
 
         if (Array.isArray(type) && type.indexOf('null') !== -1) validate('}')
       })
@@ -24804,7 +26096,7 @@ var compile = function(schema, cache, root, reporter, opts) {
       ('validate.errors = null')
       ('var errors = 0')
 
-  visit('data', schema, reporter, opts && opts.filter)
+  visit('data', schema, reporter, opts && opts.filter, [])
 
   validate
       ('return errors === 0')
@@ -24844,13 +26136,13 @@ module.exports.filter = function(schema, opts) {
   }
 }
 
-},{"./formats":200,"generate-function":163,"generate-object-property":164,"jsonpointer":214,"xtend":324}],202:[function(require,module,exports){
+},{"./formats":205,"generate-function":167,"generate-object-property":168,"jsonpointer":213,"xtend":323}],207:[function(require,module,exports){
 "use strict"
 function isProperty(str) {
   return /^[$A-Z\_a-z\xaa\xb5\xba\xc0-\xd6\xd8-\xf6\xf8-\u02c1\u02c6-\u02d1\u02e0-\u02e4\u02ec\u02ee\u0370-\u0374\u0376\u0377\u037a-\u037d\u0386\u0388-\u038a\u038c\u038e-\u03a1\u03a3-\u03f5\u03f7-\u0481\u048a-\u0527\u0531-\u0556\u0559\u0561-\u0587\u05d0-\u05ea\u05f0-\u05f2\u0620-\u064a\u066e\u066f\u0671-\u06d3\u06d5\u06e5\u06e6\u06ee\u06ef\u06fa-\u06fc\u06ff\u0710\u0712-\u072f\u074d-\u07a5\u07b1\u07ca-\u07ea\u07f4\u07f5\u07fa\u0800-\u0815\u081a\u0824\u0828\u0840-\u0858\u08a0\u08a2-\u08ac\u0904-\u0939\u093d\u0950\u0958-\u0961\u0971-\u0977\u0979-\u097f\u0985-\u098c\u098f\u0990\u0993-\u09a8\u09aa-\u09b0\u09b2\u09b6-\u09b9\u09bd\u09ce\u09dc\u09dd\u09df-\u09e1\u09f0\u09f1\u0a05-\u0a0a\u0a0f\u0a10\u0a13-\u0a28\u0a2a-\u0a30\u0a32\u0a33\u0a35\u0a36\u0a38\u0a39\u0a59-\u0a5c\u0a5e\u0a72-\u0a74\u0a85-\u0a8d\u0a8f-\u0a91\u0a93-\u0aa8\u0aaa-\u0ab0\u0ab2\u0ab3\u0ab5-\u0ab9\u0abd\u0ad0\u0ae0\u0ae1\u0b05-\u0b0c\u0b0f\u0b10\u0b13-\u0b28\u0b2a-\u0b30\u0b32\u0b33\u0b35-\u0b39\u0b3d\u0b5c\u0b5d\u0b5f-\u0b61\u0b71\u0b83\u0b85-\u0b8a\u0b8e-\u0b90\u0b92-\u0b95\u0b99\u0b9a\u0b9c\u0b9e\u0b9f\u0ba3\u0ba4\u0ba8-\u0baa\u0bae-\u0bb9\u0bd0\u0c05-\u0c0c\u0c0e-\u0c10\u0c12-\u0c28\u0c2a-\u0c33\u0c35-\u0c39\u0c3d\u0c58\u0c59\u0c60\u0c61\u0c85-\u0c8c\u0c8e-\u0c90\u0c92-\u0ca8\u0caa-\u0cb3\u0cb5-\u0cb9\u0cbd\u0cde\u0ce0\u0ce1\u0cf1\u0cf2\u0d05-\u0d0c\u0d0e-\u0d10\u0d12-\u0d3a\u0d3d\u0d4e\u0d60\u0d61\u0d7a-\u0d7f\u0d85-\u0d96\u0d9a-\u0db1\u0db3-\u0dbb\u0dbd\u0dc0-\u0dc6\u0e01-\u0e30\u0e32\u0e33\u0e40-\u0e46\u0e81\u0e82\u0e84\u0e87\u0e88\u0e8a\u0e8d\u0e94-\u0e97\u0e99-\u0e9f\u0ea1-\u0ea3\u0ea5\u0ea7\u0eaa\u0eab\u0ead-\u0eb0\u0eb2\u0eb3\u0ebd\u0ec0-\u0ec4\u0ec6\u0edc-\u0edf\u0f00\u0f40-\u0f47\u0f49-\u0f6c\u0f88-\u0f8c\u1000-\u102a\u103f\u1050-\u1055\u105a-\u105d\u1061\u1065\u1066\u106e-\u1070\u1075-\u1081\u108e\u10a0-\u10c5\u10c7\u10cd\u10d0-\u10fa\u10fc-\u1248\u124a-\u124d\u1250-\u1256\u1258\u125a-\u125d\u1260-\u1288\u128a-\u128d\u1290-\u12b0\u12b2-\u12b5\u12b8-\u12be\u12c0\u12c2-\u12c5\u12c8-\u12d6\u12d8-\u1310\u1312-\u1315\u1318-\u135a\u1380-\u138f\u13a0-\u13f4\u1401-\u166c\u166f-\u167f\u1681-\u169a\u16a0-\u16ea\u16ee-\u16f0\u1700-\u170c\u170e-\u1711\u1720-\u1731\u1740-\u1751\u1760-\u176c\u176e-\u1770\u1780-\u17b3\u17d7\u17dc\u1820-\u1877\u1880-\u18a8\u18aa\u18b0-\u18f5\u1900-\u191c\u1950-\u196d\u1970-\u1974\u1980-\u19ab\u19c1-\u19c7\u1a00-\u1a16\u1a20-\u1a54\u1aa7\u1b05-\u1b33\u1b45-\u1b4b\u1b83-\u1ba0\u1bae\u1baf\u1bba-\u1be5\u1c00-\u1c23\u1c4d-\u1c4f\u1c5a-\u1c7d\u1ce9-\u1cec\u1cee-\u1cf1\u1cf5\u1cf6\u1d00-\u1dbf\u1e00-\u1f15\u1f18-\u1f1d\u1f20-\u1f45\u1f48-\u1f4d\u1f50-\u1f57\u1f59\u1f5b\u1f5d\u1f5f-\u1f7d\u1f80-\u1fb4\u1fb6-\u1fbc\u1fbe\u1fc2-\u1fc4\u1fc6-\u1fcc\u1fd0-\u1fd3\u1fd6-\u1fdb\u1fe0-\u1fec\u1ff2-\u1ff4\u1ff6-\u1ffc\u2071\u207f\u2090-\u209c\u2102\u2107\u210a-\u2113\u2115\u2119-\u211d\u2124\u2126\u2128\u212a-\u212d\u212f-\u2139\u213c-\u213f\u2145-\u2149\u214e\u2160-\u2188\u2c00-\u2c2e\u2c30-\u2c5e\u2c60-\u2ce4\u2ceb-\u2cee\u2cf2\u2cf3\u2d00-\u2d25\u2d27\u2d2d\u2d30-\u2d67\u2d6f\u2d80-\u2d96\u2da0-\u2da6\u2da8-\u2dae\u2db0-\u2db6\u2db8-\u2dbe\u2dc0-\u2dc6\u2dc8-\u2dce\u2dd0-\u2dd6\u2dd8-\u2dde\u2e2f\u3005-\u3007\u3021-\u3029\u3031-\u3035\u3038-\u303c\u3041-\u3096\u309d-\u309f\u30a1-\u30fa\u30fc-\u30ff\u3105-\u312d\u3131-\u318e\u31a0-\u31ba\u31f0-\u31ff\u3400-\u4db5\u4e00-\u9fcc\ua000-\ua48c\ua4d0-\ua4fd\ua500-\ua60c\ua610-\ua61f\ua62a\ua62b\ua640-\ua66e\ua67f-\ua697\ua6a0-\ua6ef\ua717-\ua71f\ua722-\ua788\ua78b-\ua78e\ua790-\ua793\ua7a0-\ua7aa\ua7f8-\ua801\ua803-\ua805\ua807-\ua80a\ua80c-\ua822\ua840-\ua873\ua882-\ua8b3\ua8f2-\ua8f7\ua8fb\ua90a-\ua925\ua930-\ua946\ua960-\ua97c\ua984-\ua9b2\ua9cf\uaa00-\uaa28\uaa40-\uaa42\uaa44-\uaa4b\uaa60-\uaa76\uaa7a\uaa80-\uaaaf\uaab1\uaab5\uaab6\uaab9-\uaabd\uaac0\uaac2\uaadb-\uaadd\uaae0-\uaaea\uaaf2-\uaaf4\uab01-\uab06\uab09-\uab0e\uab11-\uab16\uab20-\uab26\uab28-\uab2e\uabc0-\uabe2\uac00-\ud7a3\ud7b0-\ud7c6\ud7cb-\ud7fb\uf900-\ufa6d\ufa70-\ufad9\ufb00-\ufb06\ufb13-\ufb17\ufb1d\ufb1f-\ufb28\ufb2a-\ufb36\ufb38-\ufb3c\ufb3e\ufb40\ufb41\ufb43\ufb44\ufb46-\ufbb1\ufbd3-\ufd3d\ufd50-\ufd8f\ufd92-\ufdc7\ufdf0-\ufdfb\ufe70-\ufe74\ufe76-\ufefc\uff21-\uff3a\uff41-\uff5a\uff66-\uffbe\uffc2-\uffc7\uffca-\uffcf\uffd2-\uffd7\uffda-\uffdc][$A-Z\_a-z\xaa\xb5\xba\xc0-\xd6\xd8-\xf6\xf8-\u02c1\u02c6-\u02d1\u02e0-\u02e4\u02ec\u02ee\u0370-\u0374\u0376\u0377\u037a-\u037d\u0386\u0388-\u038a\u038c\u038e-\u03a1\u03a3-\u03f5\u03f7-\u0481\u048a-\u0527\u0531-\u0556\u0559\u0561-\u0587\u05d0-\u05ea\u05f0-\u05f2\u0620-\u064a\u066e\u066f\u0671-\u06d3\u06d5\u06e5\u06e6\u06ee\u06ef\u06fa-\u06fc\u06ff\u0710\u0712-\u072f\u074d-\u07a5\u07b1\u07ca-\u07ea\u07f4\u07f5\u07fa\u0800-\u0815\u081a\u0824\u0828\u0840-\u0858\u08a0\u08a2-\u08ac\u0904-\u0939\u093d\u0950\u0958-\u0961\u0971-\u0977\u0979-\u097f\u0985-\u098c\u098f\u0990\u0993-\u09a8\u09aa-\u09b0\u09b2\u09b6-\u09b9\u09bd\u09ce\u09dc\u09dd\u09df-\u09e1\u09f0\u09f1\u0a05-\u0a0a\u0a0f\u0a10\u0a13-\u0a28\u0a2a-\u0a30\u0a32\u0a33\u0a35\u0a36\u0a38\u0a39\u0a59-\u0a5c\u0a5e\u0a72-\u0a74\u0a85-\u0a8d\u0a8f-\u0a91\u0a93-\u0aa8\u0aaa-\u0ab0\u0ab2\u0ab3\u0ab5-\u0ab9\u0abd\u0ad0\u0ae0\u0ae1\u0b05-\u0b0c\u0b0f\u0b10\u0b13-\u0b28\u0b2a-\u0b30\u0b32\u0b33\u0b35-\u0b39\u0b3d\u0b5c\u0b5d\u0b5f-\u0b61\u0b71\u0b83\u0b85-\u0b8a\u0b8e-\u0b90\u0b92-\u0b95\u0b99\u0b9a\u0b9c\u0b9e\u0b9f\u0ba3\u0ba4\u0ba8-\u0baa\u0bae-\u0bb9\u0bd0\u0c05-\u0c0c\u0c0e-\u0c10\u0c12-\u0c28\u0c2a-\u0c33\u0c35-\u0c39\u0c3d\u0c58\u0c59\u0c60\u0c61\u0c85-\u0c8c\u0c8e-\u0c90\u0c92-\u0ca8\u0caa-\u0cb3\u0cb5-\u0cb9\u0cbd\u0cde\u0ce0\u0ce1\u0cf1\u0cf2\u0d05-\u0d0c\u0d0e-\u0d10\u0d12-\u0d3a\u0d3d\u0d4e\u0d60\u0d61\u0d7a-\u0d7f\u0d85-\u0d96\u0d9a-\u0db1\u0db3-\u0dbb\u0dbd\u0dc0-\u0dc6\u0e01-\u0e30\u0e32\u0e33\u0e40-\u0e46\u0e81\u0e82\u0e84\u0e87\u0e88\u0e8a\u0e8d\u0e94-\u0e97\u0e99-\u0e9f\u0ea1-\u0ea3\u0ea5\u0ea7\u0eaa\u0eab\u0ead-\u0eb0\u0eb2\u0eb3\u0ebd\u0ec0-\u0ec4\u0ec6\u0edc-\u0edf\u0f00\u0f40-\u0f47\u0f49-\u0f6c\u0f88-\u0f8c\u1000-\u102a\u103f\u1050-\u1055\u105a-\u105d\u1061\u1065\u1066\u106e-\u1070\u1075-\u1081\u108e\u10a0-\u10c5\u10c7\u10cd\u10d0-\u10fa\u10fc-\u1248\u124a-\u124d\u1250-\u1256\u1258\u125a-\u125d\u1260-\u1288\u128a-\u128d\u1290-\u12b0\u12b2-\u12b5\u12b8-\u12be\u12c0\u12c2-\u12c5\u12c8-\u12d6\u12d8-\u1310\u1312-\u1315\u1318-\u135a\u1380-\u138f\u13a0-\u13f4\u1401-\u166c\u166f-\u167f\u1681-\u169a\u16a0-\u16ea\u16ee-\u16f0\u1700-\u170c\u170e-\u1711\u1720-\u1731\u1740-\u1751\u1760-\u176c\u176e-\u1770\u1780-\u17b3\u17d7\u17dc\u1820-\u1877\u1880-\u18a8\u18aa\u18b0-\u18f5\u1900-\u191c\u1950-\u196d\u1970-\u1974\u1980-\u19ab\u19c1-\u19c7\u1a00-\u1a16\u1a20-\u1a54\u1aa7\u1b05-\u1b33\u1b45-\u1b4b\u1b83-\u1ba0\u1bae\u1baf\u1bba-\u1be5\u1c00-\u1c23\u1c4d-\u1c4f\u1c5a-\u1c7d\u1ce9-\u1cec\u1cee-\u1cf1\u1cf5\u1cf6\u1d00-\u1dbf\u1e00-\u1f15\u1f18-\u1f1d\u1f20-\u1f45\u1f48-\u1f4d\u1f50-\u1f57\u1f59\u1f5b\u1f5d\u1f5f-\u1f7d\u1f80-\u1fb4\u1fb6-\u1fbc\u1fbe\u1fc2-\u1fc4\u1fc6-\u1fcc\u1fd0-\u1fd3\u1fd6-\u1fdb\u1fe0-\u1fec\u1ff2-\u1ff4\u1ff6-\u1ffc\u2071\u207f\u2090-\u209c\u2102\u2107\u210a-\u2113\u2115\u2119-\u211d\u2124\u2126\u2128\u212a-\u212d\u212f-\u2139\u213c-\u213f\u2145-\u2149\u214e\u2160-\u2188\u2c00-\u2c2e\u2c30-\u2c5e\u2c60-\u2ce4\u2ceb-\u2cee\u2cf2\u2cf3\u2d00-\u2d25\u2d27\u2d2d\u2d30-\u2d67\u2d6f\u2d80-\u2d96\u2da0-\u2da6\u2da8-\u2dae\u2db0-\u2db6\u2db8-\u2dbe\u2dc0-\u2dc6\u2dc8-\u2dce\u2dd0-\u2dd6\u2dd8-\u2dde\u2e2f\u3005-\u3007\u3021-\u3029\u3031-\u3035\u3038-\u303c\u3041-\u3096\u309d-\u309f\u30a1-\u30fa\u30fc-\u30ff\u3105-\u312d\u3131-\u318e\u31a0-\u31ba\u31f0-\u31ff\u3400-\u4db5\u4e00-\u9fcc\ua000-\ua48c\ua4d0-\ua4fd\ua500-\ua60c\ua610-\ua61f\ua62a\ua62b\ua640-\ua66e\ua67f-\ua697\ua6a0-\ua6ef\ua717-\ua71f\ua722-\ua788\ua78b-\ua78e\ua790-\ua793\ua7a0-\ua7aa\ua7f8-\ua801\ua803-\ua805\ua807-\ua80a\ua80c-\ua822\ua840-\ua873\ua882-\ua8b3\ua8f2-\ua8f7\ua8fb\ua90a-\ua925\ua930-\ua946\ua960-\ua97c\ua984-\ua9b2\ua9cf\uaa00-\uaa28\uaa40-\uaa42\uaa44-\uaa4b\uaa60-\uaa76\uaa7a\uaa80-\uaaaf\uaab1\uaab5\uaab6\uaab9-\uaabd\uaac0\uaac2\uaadb-\uaadd\uaae0-\uaaea\uaaf2-\uaaf4\uab01-\uab06\uab09-\uab0e\uab11-\uab16\uab20-\uab26\uab28-\uab2e\uabc0-\uabe2\uac00-\ud7a3\ud7b0-\ud7c6\ud7cb-\ud7fb\uf900-\ufa6d\ufa70-\ufad9\ufb00-\ufb06\ufb13-\ufb17\ufb1d\ufb1f-\ufb28\ufb2a-\ufb36\ufb38-\ufb3c\ufb3e\ufb40\ufb41\ufb43\ufb44\ufb46-\ufbb1\ufbd3-\ufd3d\ufd50-\ufd8f\ufd92-\ufdc7\ufdf0-\ufdfb\ufe70-\ufe74\ufe76-\ufefc\uff21-\uff3a\uff41-\uff5a\uff66-\uffbe\uffc2-\uffc7\uffca-\uffcf\uffd2-\uffd7\uffda-\uffdc0-9\u0300-\u036f\u0483-\u0487\u0591-\u05bd\u05bf\u05c1\u05c2\u05c4\u05c5\u05c7\u0610-\u061a\u064b-\u0669\u0670\u06d6-\u06dc\u06df-\u06e4\u06e7\u06e8\u06ea-\u06ed\u06f0-\u06f9\u0711\u0730-\u074a\u07a6-\u07b0\u07c0-\u07c9\u07eb-\u07f3\u0816-\u0819\u081b-\u0823\u0825-\u0827\u0829-\u082d\u0859-\u085b\u08e4-\u08fe\u0900-\u0903\u093a-\u093c\u093e-\u094f\u0951-\u0957\u0962\u0963\u0966-\u096f\u0981-\u0983\u09bc\u09be-\u09c4\u09c7\u09c8\u09cb-\u09cd\u09d7\u09e2\u09e3\u09e6-\u09ef\u0a01-\u0a03\u0a3c\u0a3e-\u0a42\u0a47\u0a48\u0a4b-\u0a4d\u0a51\u0a66-\u0a71\u0a75\u0a81-\u0a83\u0abc\u0abe-\u0ac5\u0ac7-\u0ac9\u0acb-\u0acd\u0ae2\u0ae3\u0ae6-\u0aef\u0b01-\u0b03\u0b3c\u0b3e-\u0b44\u0b47\u0b48\u0b4b-\u0b4d\u0b56\u0b57\u0b62\u0b63\u0b66-\u0b6f\u0b82\u0bbe-\u0bc2\u0bc6-\u0bc8\u0bca-\u0bcd\u0bd7\u0be6-\u0bef\u0c01-\u0c03\u0c3e-\u0c44\u0c46-\u0c48\u0c4a-\u0c4d\u0c55\u0c56\u0c62\u0c63\u0c66-\u0c6f\u0c82\u0c83\u0cbc\u0cbe-\u0cc4\u0cc6-\u0cc8\u0cca-\u0ccd\u0cd5\u0cd6\u0ce2\u0ce3\u0ce6-\u0cef\u0d02\u0d03\u0d3e-\u0d44\u0d46-\u0d48\u0d4a-\u0d4d\u0d57\u0d62\u0d63\u0d66-\u0d6f\u0d82\u0d83\u0dca\u0dcf-\u0dd4\u0dd6\u0dd8-\u0ddf\u0df2\u0df3\u0e31\u0e34-\u0e3a\u0e47-\u0e4e\u0e50-\u0e59\u0eb1\u0eb4-\u0eb9\u0ebb\u0ebc\u0ec8-\u0ecd\u0ed0-\u0ed9\u0f18\u0f19\u0f20-\u0f29\u0f35\u0f37\u0f39\u0f3e\u0f3f\u0f71-\u0f84\u0f86\u0f87\u0f8d-\u0f97\u0f99-\u0fbc\u0fc6\u102b-\u103e\u1040-\u1049\u1056-\u1059\u105e-\u1060\u1062-\u1064\u1067-\u106d\u1071-\u1074\u1082-\u108d\u108f-\u109d\u135d-\u135f\u1712-\u1714\u1732-\u1734\u1752\u1753\u1772\u1773\u17b4-\u17d3\u17dd\u17e0-\u17e9\u180b-\u180d\u1810-\u1819\u18a9\u1920-\u192b\u1930-\u193b\u1946-\u194f\u19b0-\u19c0\u19c8\u19c9\u19d0-\u19d9\u1a17-\u1a1b\u1a55-\u1a5e\u1a60-\u1a7c\u1a7f-\u1a89\u1a90-\u1a99\u1b00-\u1b04\u1b34-\u1b44\u1b50-\u1b59\u1b6b-\u1b73\u1b80-\u1b82\u1ba1-\u1bad\u1bb0-\u1bb9\u1be6-\u1bf3\u1c24-\u1c37\u1c40-\u1c49\u1c50-\u1c59\u1cd0-\u1cd2\u1cd4-\u1ce8\u1ced\u1cf2-\u1cf4\u1dc0-\u1de6\u1dfc-\u1dff\u200c\u200d\u203f\u2040\u2054\u20d0-\u20dc\u20e1\u20e5-\u20f0\u2cef-\u2cf1\u2d7f\u2de0-\u2dff\u302a-\u302f\u3099\u309a\ua620-\ua629\ua66f\ua674-\ua67d\ua69f\ua6f0\ua6f1\ua802\ua806\ua80b\ua823-\ua827\ua880\ua881\ua8b4-\ua8c4\ua8d0-\ua8d9\ua8e0-\ua8f1\ua900-\ua909\ua926-\ua92d\ua947-\ua953\ua980-\ua983\ua9b3-\ua9c0\ua9d0-\ua9d9\uaa29-\uaa36\uaa43\uaa4c\uaa4d\uaa50-\uaa59\uaa7b\uaab0\uaab2-\uaab4\uaab7\uaab8\uaabe\uaabf\uaac1\uaaeb-\uaaef\uaaf5\uaaf6\uabe3-\uabea\uabec\uabed\uabf0-\uabf9\ufb1e\ufe00-\ufe0f\ufe20-\ufe26\ufe33\ufe34\ufe4d-\ufe4f\uff10-\uff19\uff3f]*$/.test(str)
 }
 module.exports = isProperty
-},{}],203:[function(require,module,exports){
+},{}],208:[function(require,module,exports){
 module.exports      = isTypedArray
 isTypedArray.strict = isStrictTypedArray
 isTypedArray.loose  = isLooseTypedArray
@@ -24893,7 +26185,7 @@ function isLooseTypedArray(arr) {
   return names[toString.call(arr)]
 }
 
-},{}],204:[function(require,module,exports){
+},{}],209:[function(require,module,exports){
 var stream = require('stream')
 
 
@@ -24922,1638 +26214,7 @@ module.exports.isReadable = isReadable
 module.exports.isWritable = isWritable
 module.exports.isDuplex   = isDuplex
 
-},{"stream":undefined}],205:[function(require,module,exports){
-"use strict";
-
-/*
- * Copyright (c) 2014 Mega Limited
- * under the MIT License.
- * 
- * Authors: Guy K. Kloss
- * 
- * You should have received a copy of the license along with this program.
- */
-
-var dh = require('./lib/dh');
-var eddsa = require('./lib/eddsa');
-var curve255 = require('./lib/curve255');
-var utils = require('./lib/utils');
-    
-    /**
-     * @exports jodid25519
-     * Curve 25519-based cryptography collection.
-     *
-     * @description
-     * EC Diffie-Hellman (ECDH) based on Curve25519 and digital signatures
-     * (EdDSA) based on Ed25519.
-     */
-    var ns = {};
-    
-    /** Module version indicator as string (format: [major.minor.patch]). */
-    ns.VERSION = '0.7.1';
-
-    ns.dh = dh;
-    ns.eddsa = eddsa;
-    ns.curve255 = curve255;
-    ns.utils = utils;
-
-module.exports = ns;
-
-},{"./lib/curve255":207,"./lib/dh":208,"./lib/eddsa":209,"./lib/utils":210}],206:[function(require,module,exports){
-"use strict";
-/**
- * @fileOverview
- * Core operations on curve 25519 required for the higher level modules.
- */
-
-/*
- * Copyright (c) 2007, 2013, 2014 Michele Bini
- * Copyright (c) 2014 Mega Limited
- * under the MIT License.
- *
- * Authors: Guy K. Kloss, Michele Bini
- *
- * You should have received a copy of the license along with this program.
- */
-
-var crypto = require('crypto');
-
-    /**
-     * @exports jodid25519/core
-     * Core operations on curve 25519 required for the higher level modules.
-     *
-     * @description
-     * Core operations on curve 25519 required for the higher level modules.
-     *
-     * <p>
-     * This core code is extracted from Michele Bini's curve255.js implementation,
-     * which is used as a base for Curve25519 ECDH and Ed25519 EdDSA operations.
-     * </p>
-     */
-    var ns = {};
-
-    function _setbit(n, c, v) {
-        var i = c >> 4;
-        var a = n[i];
-        a = a + (1 << (c & 0xf)) * v;
-        n[i] = a;
-    }
-
-    function _getbit(n, c) {
-        return (n[c >> 4] >> (c & 0xf)) & 1;
-    }
-
-    function _ZERO() {
-        return [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
-    }
-
-    function _ONE() {
-        return [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
-    }
-
-    // Basepoint.
-    function _BASE() {
-        return [9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
-    }
-
-    // return -1, 0, +1 when a is less than, equal, or greater than b
-    function _bigintcmp(a, b) {
-        // The following code is a bit tricky to avoid code branching
-        var c, abs_r, mask;
-        var r = 0;
-        for (c = 15; c >= 0; c--) {
-            var x = a[c];
-            var y = b[c];
-            r = r + (x - y) * (1 - r * r);
-            // http://graphics.stanford.edu/~seander/bithacks.html#IntegerAbs
-            // correct for [-294967295, 294967295]
-            mask = r >> 31;
-            abs_r = (r + mask) ^ mask;
-            // http://stackoverflow.com/questions/596467/how-do-i-convert-a-number-to-an-integer-in-javascript
-            // this rounds towards zero
-            r = ~~((r << 1) / (abs_r + 1));
-        }
-        return r;
-    }
-
-    function _bigintadd(a, b) {
-        var r = [];
-        var v;
-        r[0] = (v = a[0] + b[0]) & 0xffff;
-        r[1] = (v = (v >>> 16) + a[1] + b[1]) & 0xffff;
-        r[2] = (v = (v >>> 16) + a[2] + b[2]) & 0xffff;
-        r[3] = (v = (v >>> 16) + a[3] + b[3]) & 0xffff;
-        r[4] = (v = (v >>> 16) + a[4] + b[4]) & 0xffff;
-        r[5] = (v = (v >>> 16) + a[5] + b[5]) & 0xffff;
-        r[6] = (v = (v >>> 16) + a[6] + b[6]) & 0xffff;
-        r[7] = (v = (v >>> 16) + a[7] + b[7]) & 0xffff;
-        r[8] = (v = (v >>> 16) + a[8] + b[8]) & 0xffff;
-        r[9] = (v = (v >>> 16) + a[9] + b[9]) & 0xffff;
-        r[10] = (v = (v >>> 16) + a[10] + b[10]) & 0xffff;
-        r[11] = (v = (v >>> 16) + a[11] + b[11]) & 0xffff;
-        r[12] = (v = (v >>> 16) + a[12] + b[12]) & 0xffff;
-        r[13] = (v = (v >>> 16) + a[13] + b[13]) & 0xffff;
-        r[14] = (v = (v >>> 16) + a[14] + b[14]) & 0xffff;
-        r[15] = (v >>> 16) + a[15] + b[15];
-        return r;
-    }
-
-    function _bigintsub(a, b) {
-        var r = [];
-        var v;
-        r[0] = (v = 0x80000 + a[0] - b[0]) & 0xffff;
-        r[1] = (v = (v >>> 16) + 0x7fff8 + a[1] - b[1]) & 0xffff;
-        r[2] = (v = (v >>> 16) + 0x7fff8 + a[2] - b[2]) & 0xffff;
-        r[3] = (v = (v >>> 16) + 0x7fff8 + a[3] - b[3]) & 0xffff;
-        r[4] = (v = (v >>> 16) + 0x7fff8 + a[4] - b[4]) & 0xffff;
-        r[5] = (v = (v >>> 16) + 0x7fff8 + a[5] - b[5]) & 0xffff;
-        r[6] = (v = (v >>> 16) + 0x7fff8 + a[6] - b[6]) & 0xffff;
-        r[7] = (v = (v >>> 16) + 0x7fff8 + a[7] - b[7]) & 0xffff;
-        r[8] = (v = (v >>> 16) + 0x7fff8 + a[8] - b[8]) & 0xffff;
-        r[9] = (v = (v >>> 16) + 0x7fff8 + a[9] - b[9]) & 0xffff;
-        r[10] = (v = (v >>> 16) + 0x7fff8 + a[10] - b[10]) & 0xffff;
-        r[11] = (v = (v >>> 16) + 0x7fff8 + a[11] - b[11]) & 0xffff;
-        r[12] = (v = (v >>> 16) + 0x7fff8 + a[12] - b[12]) & 0xffff;
-        r[13] = (v = (v >>> 16) + 0x7fff8 + a[13] - b[13]) & 0xffff;
-        r[14] = (v = (v >>> 16) + 0x7fff8 + a[14] - b[14]) & 0xffff;
-        r[15] = (v >>> 16) - 8 + a[15] - b[15];
-        return r;
-    }
-
-    function _sqr8h(a7, a6, a5, a4, a3, a2, a1, a0) {
-        // 'division by 0x10000' can not be replaced by '>> 16' because
-        // more than 32 bits of precision are needed similarly
-        // 'multiplication by 2' cannot be replaced by '<< 1'
-        var r = [];
-        var v;
-        r[0] = (v = a0 * a0) & 0xffff;
-        r[1] = (v = (0 | (v / 0x10000)) + 2 * a0 * a1) & 0xffff;
-        r[2] = (v = (0 | (v / 0x10000)) + 2 * a0 * a2 + a1 * a1) & 0xffff;
-        r[3] = (v = (0 | (v / 0x10000)) + 2 * a0 * a3 + 2 * a1 * a2) & 0xffff;
-        r[4] = (v = (0 | (v / 0x10000)) + 2 * a0 * a4 + 2 * a1 * a3 + a2
-                    * a2) & 0xffff;
-        r[5] = (v = (0 | (v / 0x10000)) + 2 * a0 * a5 + 2 * a1 * a4 + 2
-                    * a2 * a3) & 0xffff;
-        r[6] = (v = (0 | (v / 0x10000)) + 2 * a0 * a6 + 2 * a1 * a5 + 2
-                    * a2 * a4 + a3 * a3) & 0xffff;
-        r[7] = (v = (0 | (v / 0x10000)) + 2 * a0 * a7 + 2 * a1 * a6 + 2
-                    * a2 * a5 + 2 * a3 * a4) & 0xffff;
-        r[8] = (v = (0 | (v / 0x10000)) + 2 * a1 * a7 + 2 * a2 * a6 + 2
-                    * a3 * a5 + a4 * a4) & 0xffff;
-        r[9] = (v = (0 | (v / 0x10000)) + 2 * a2 * a7 + 2 * a3 * a6 + 2
-                    * a4 * a5) & 0xffff;
-        r[10] = (v = (0 | (v / 0x10000)) + 2 * a3 * a7 + 2 * a4 * a6
-                     + a5 * a5) & 0xffff;
-        r[11] = (v = (0 | (v / 0x10000)) + 2 * a4 * a7 + 2 * a5 * a6) & 0xffff;
-        r[12] = (v = (0 | (v / 0x10000)) + 2 * a5 * a7 + a6 * a6) & 0xffff;
-        r[13] = (v = (0 | (v / 0x10000)) + 2 * a6 * a7) & 0xffff;
-        r[14] = (v = (0 | (v / 0x10000)) + a7 * a7) & 0xffff;
-        r[15] = 0 | (v / 0x10000);
-        return r;
-    }
-
-    function _sqrmodp(a) {
-        var x = _sqr8h(a[15], a[14], a[13], a[12], a[11], a[10], a[9],
-                       a[8]);
-        var z = _sqr8h(a[7], a[6], a[5], a[4], a[3], a[2], a[1], a[0]);
-        var y = _sqr8h(a[15] + a[7], a[14] + a[6], a[13] + a[5], a[12]
-                                                                 + a[4],
-                       a[11] + a[3], a[10] + a[2], a[9] + a[1], a[8]
-                                                                + a[0]);
-        var r = [];
-        var v;
-        r[0] = (v = 0x800000 + z[0] + (y[8] - x[8] - z[8] + x[0] - 0x80)
-                    * 38) & 0xffff;
-        r[1] = (v = 0x7fff80 + (v >>> 16) + z[1]
-                    + (y[9] - x[9] - z[9] + x[1]) * 38) & 0xffff;
-        r[2] = (v = 0x7fff80 + (v >>> 16) + z[2]
-                    + (y[10] - x[10] - z[10] + x[2]) * 38) & 0xffff;
-        r[3] = (v = 0x7fff80 + (v >>> 16) + z[3]
-                    + (y[11] - x[11] - z[11] + x[3]) * 38) & 0xffff;
-        r[4] = (v = 0x7fff80 + (v >>> 16) + z[4]
-                    + (y[12] - x[12] - z[12] + x[4]) * 38) & 0xffff;
-        r[5] = (v = 0x7fff80 + (v >>> 16) + z[5]
-                    + (y[13] - x[13] - z[13] + x[5]) * 38) & 0xffff;
-        r[6] = (v = 0x7fff80 + (v >>> 16) + z[6]
-                    + (y[14] - x[14] - z[14] + x[6]) * 38) & 0xffff;
-        r[7] = (v = 0x7fff80 + (v >>> 16) + z[7]
-                    + (y[15] - x[15] - z[15] + x[7]) * 38) & 0xffff;
-        r[8] = (v = 0x7fff80 + (v >>> 16) + z[8] + y[0] - x[0] - z[0]
-                    + x[8] * 38) & 0xffff;
-        r[9] = (v = 0x7fff80 + (v >>> 16) + z[9] + y[1] - x[1] - z[1]
-                    + x[9] * 38) & 0xffff;
-        r[10] = (v = 0x7fff80 + (v >>> 16) + z[10] + y[2] - x[2] - z[2]
-                     + x[10] * 38) & 0xffff;
-        r[11] = (v = 0x7fff80 + (v >>> 16) + z[11] + y[3] - x[3] - z[3]
-                     + x[11] * 38) & 0xffff;
-        r[12] = (v = 0x7fff80 + (v >>> 16) + z[12] + y[4] - x[4] - z[4]
-                     + x[12] * 38) & 0xffff;
-        r[13] = (v = 0x7fff80 + (v >>> 16) + z[13] + y[5] - x[5] - z[5]
-                     + x[13] * 38) & 0xffff;
-        r[14] = (v = 0x7fff80 + (v >>> 16) + z[14] + y[6] - x[6] - z[6]
-                     + x[14] * 38) & 0xffff;
-        r[15] = 0x7fff80 + (v >>> 16) + z[15] + y[7] - x[7] - z[7]
-                + x[15] * 38;
-        _reduce(r);
-        return r;
-    }
-
-    function _mul8h(a7, a6, a5, a4, a3, a2, a1, a0, b7, b6, b5, b4, b3,
-                    b2, b1, b0) {
-        // 'division by 0x10000' can not be replaced by '>> 16' because
-        // more than 32 bits of precision are needed
-        var r = [];
-        var v;
-        r[0] = (v = a0 * b0) & 0xffff;
-        r[1] = (v = (0 | (v / 0x10000)) + a0 * b1 + a1 * b0) & 0xffff;
-        r[2] = (v = (0 | (v / 0x10000)) + a0 * b2 + a1 * b1 + a2 * b0) & 0xffff;
-        r[3] = (v = (0 | (v / 0x10000)) + a0 * b3 + a1 * b2 + a2 * b1
-                    + a3 * b0) & 0xffff;
-        r[4] = (v = (0 | (v / 0x10000)) + a0 * b4 + a1 * b3 + a2 * b2
-                    + a3 * b1 + a4 * b0) & 0xffff;
-        r[5] = (v = (0 | (v / 0x10000)) + a0 * b5 + a1 * b4 + a2 * b3
-                    + a3 * b2 + a4 * b1 + a5 * b0) & 0xffff;
-        r[6] = (v = (0 | (v / 0x10000)) + a0 * b6 + a1 * b5 + a2 * b4
-                    + a3 * b3 + a4 * b2 + a5 * b1 + a6 * b0) & 0xffff;
-        r[7] = (v = (0 | (v / 0x10000)) + a0 * b7 + a1 * b6 + a2 * b5
-                    + a3 * b4 + a4 * b3 + a5 * b2 + a6 * b1 + a7 * b0) & 0xffff;
-        r[8] = (v = (0 | (v / 0x10000)) + a1 * b7 + a2 * b6 + a3 * b5
-                    + a4 * b4 + a5 * b3 + a6 * b2 + a7 * b1) & 0xffff;
-        r[9] = (v = (0 | (v / 0x10000)) + a2 * b7 + a3 * b6 + a4 * b5
-                    + a5 * b4 + a6 * b3 + a7 * b2) & 0xffff;
-        r[10] = (v = (0 | (v / 0x10000)) + a3 * b7 + a4 * b6 + a5 * b5
-                     + a6 * b4 + a7 * b3) & 0xffff;
-        r[11] = (v = (0 | (v / 0x10000)) + a4 * b7 + a5 * b6 + a6 * b5
-                     + a7 * b4) & 0xffff;
-        r[12] = (v = (0 | (v / 0x10000)) + a5 * b7 + a6 * b6 + a7 * b5) & 0xffff;
-        r[13] = (v = (0 | (v / 0x10000)) + a6 * b7 + a7 * b6) & 0xffff;
-        r[14] = (v = (0 | (v / 0x10000)) + a7 * b7) & 0xffff;
-        r[15] = (0 | (v / 0x10000));
-        return r;
-    }
-
-    function _mulmodp(a, b) {
-        // Karatsuba multiplication scheme: x*y = (b^2+b)*x1*y1 -
-        // b*(x1-x0)*(y1-y0) + (b+1)*x0*y0
-        var x = _mul8h(a[15], a[14], a[13], a[12], a[11], a[10], a[9],
-                       a[8], b[15], b[14], b[13], b[12], b[11], b[10],
-                       b[9], b[8]);
-        var z = _mul8h(a[7], a[6], a[5], a[4], a[3], a[2], a[1], a[0],
-                       b[7], b[6], b[5], b[4], b[3], b[2], b[1], b[0]);
-        var y = _mul8h(a[15] + a[7], a[14] + a[6], a[13] + a[5], a[12]
-                                                                 + a[4],
-                       a[11] + a[3], a[10] + a[2], a[9] + a[1], a[8]
-                                                                + a[0],
-                       b[15] + b[7], b[14] + b[6], b[13] + b[5], b[12]
-                                                                 + b[4],
-                       b[11] + b[3], b[10] + b[2], b[9] + b[1], b[8]
-                                                                + b[0]);
-        var r = [];
-        var v;
-        r[0] = (v = 0x800000 + z[0] + (y[8] - x[8] - z[8] + x[0] - 0x80)
-                    * 38) & 0xffff;
-        r[1] = (v = 0x7fff80 + (v >>> 16) + z[1]
-                    + (y[9] - x[9] - z[9] + x[1]) * 38) & 0xffff;
-        r[2] = (v = 0x7fff80 + (v >>> 16) + z[2]
-                    + (y[10] - x[10] - z[10] + x[2]) * 38) & 0xffff;
-        r[3] = (v = 0x7fff80 + (v >>> 16) + z[3]
-                    + (y[11] - x[11] - z[11] + x[3]) * 38) & 0xffff;
-        r[4] = (v = 0x7fff80 + (v >>> 16) + z[4]
-                    + (y[12] - x[12] - z[12] + x[4]) * 38) & 0xffff;
-        r[5] = (v = 0x7fff80 + (v >>> 16) + z[5]
-                    + (y[13] - x[13] - z[13] + x[5]) * 38) & 0xffff;
-        r[6] = (v = 0x7fff80 + (v >>> 16) + z[6]
-                    + (y[14] - x[14] - z[14] + x[6]) * 38) & 0xffff;
-        r[7] = (v = 0x7fff80 + (v >>> 16) + z[7]
-                    + (y[15] - x[15] - z[15] + x[7]) * 38) & 0xffff;
-        r[8] = (v = 0x7fff80 + (v >>> 16) + z[8] + y[0] - x[0] - z[0]
-                    + x[8] * 38) & 0xffff;
-        r[9] = (v = 0x7fff80 + (v >>> 16) + z[9] + y[1] - x[1] - z[1]
-                    + x[9] * 38) & 0xffff;
-        r[10] = (v = 0x7fff80 + (v >>> 16) + z[10] + y[2] - x[2] - z[2]
-                     + x[10] * 38) & 0xffff;
-        r[11] = (v = 0x7fff80 + (v >>> 16) + z[11] + y[3] - x[3] - z[3]
-                     + x[11] * 38) & 0xffff;
-        r[12] = (v = 0x7fff80 + (v >>> 16) + z[12] + y[4] - x[4] - z[4]
-                     + x[12] * 38) & 0xffff;
-        r[13] = (v = 0x7fff80 + (v >>> 16) + z[13] + y[5] - x[5] - z[5]
-                     + x[13] * 38) & 0xffff;
-        r[14] = (v = 0x7fff80 + (v >>> 16) + z[14] + y[6] - x[6] - z[6]
-                     + x[14] * 38) & 0xffff;
-        r[15] = 0x7fff80 + (v >>> 16) + z[15] + y[7] - x[7] - z[7]
-                + x[15] * 38;
-        _reduce(r);
-        return r;
-    }
-
-    function _reduce(arr) {
-        var aCopy = arr.slice(0);
-        var choice = [arr, aCopy];
-        var v = arr[15];
-        // Use the dummy copy instead of just returning to be more constant time.
-        var a = choice[(v < 0x8000) & 1];
-        a[15] = v & 0x7fff;
-        // >32-bits of precision are required here so '/ 0x8000' can not be
-        // replaced by the arithmetic equivalent '>>> 15'
-        v = (0 | (v / 0x8000)) * 19;
-        a[0] = (v += a[0]) & 0xffff;
-        v = v >>> 16;
-        a[1] = (v += a[1]) & 0xffff;
-        v = v >>> 16;
-        a[2] = (v += a[2]) & 0xffff;
-        v = v >>> 16;
-        a[3] = (v += a[3]) & 0xffff;
-        v = v >>> 16;
-        a[4] = (v += a[4]) & 0xffff;
-        v = v >>> 16;
-        a[5] = (v += a[5]) & 0xffff;
-        v = v >>> 16;
-        a[6] = (v += a[6]) & 0xffff;
-        v = v >>> 16;
-        a[7] = (v += a[7]) & 0xffff;
-        v = v >>> 16;
-        a[8] = (v += a[8]) & 0xffff;
-        v = v >>> 16;
-        a[9] = (v += a[9]) & 0xffff;
-        v = v >>> 16;
-        a[10] = (v += a[10]) & 0xffff;
-        v = v >>> 16;
-        a[11] = (v += a[11]) & 0xffff;
-        v = v >>> 16;
-        a[12] = (v += a[12]) & 0xffff;
-        v = v >>> 16;
-        a[13] = (v += a[13]) & 0xffff;
-        v = v >>> 16;
-        a[14] = (v += a[14]) & 0xffff;
-        v = v >>> 16;
-        a[15] += v;
-    }
-
-    function _addmodp(a, b) {
-        var r = [];
-        var v;
-        r[0] = (v = ((0 | (a[15] >>> 15)) + (0 | (b[15] >>> 15))) * 19
-                    + a[0] + b[0]) & 0xffff;
-        r[1] = (v = (v >>> 16) + a[1] + b[1]) & 0xffff;
-        r[2] = (v = (v >>> 16) + a[2] + b[2]) & 0xffff;
-        r[3] = (v = (v >>> 16) + a[3] + b[3]) & 0xffff;
-        r[4] = (v = (v >>> 16) + a[4] + b[4]) & 0xffff;
-        r[5] = (v = (v >>> 16) + a[5] + b[5]) & 0xffff;
-        r[6] = (v = (v >>> 16) + a[6] + b[6]) & 0xffff;
-        r[7] = (v = (v >>> 16) + a[7] + b[7]) & 0xffff;
-        r[8] = (v = (v >>> 16) + a[8] + b[8]) & 0xffff;
-        r[9] = (v = (v >>> 16) + a[9] + b[9]) & 0xffff;
-        r[10] = (v = (v >>> 16) + a[10] + b[10]) & 0xffff;
-        r[11] = (v = (v >>> 16) + a[11] + b[11]) & 0xffff;
-        r[12] = (v = (v >>> 16) + a[12] + b[12]) & 0xffff;
-        r[13] = (v = (v >>> 16) + a[13] + b[13]) & 0xffff;
-        r[14] = (v = (v >>> 16) + a[14] + b[14]) & 0xffff;
-        r[15] = (v >>> 16) + (a[15] & 0x7fff) + (b[15] & 0x7fff);
-        return r;
-    }
-
-    function _submodp(a, b) {
-        var r = [];
-        var v;
-        r[0] = (v = 0x80000
-                    + ((0 | (a[15] >>> 15)) - (0 | (b[15] >>> 15)) - 1)
-                    * 19 + a[0] - b[0]) & 0xffff;
-        r[1] = (v = (v >>> 16) + 0x7fff8 + a[1] - b[1]) & 0xffff;
-        r[2] = (v = (v >>> 16) + 0x7fff8 + a[2] - b[2]) & 0xffff;
-        r[3] = (v = (v >>> 16) + 0x7fff8 + a[3] - b[3]) & 0xffff;
-        r[4] = (v = (v >>> 16) + 0x7fff8 + a[4] - b[4]) & 0xffff;
-        r[5] = (v = (v >>> 16) + 0x7fff8 + a[5] - b[5]) & 0xffff;
-        r[6] = (v = (v >>> 16) + 0x7fff8 + a[6] - b[6]) & 0xffff;
-        r[7] = (v = (v >>> 16) + 0x7fff8 + a[7] - b[7]) & 0xffff;
-        r[8] = (v = (v >>> 16) + 0x7fff8 + a[8] - b[8]) & 0xffff;
-        r[9] = (v = (v >>> 16) + 0x7fff8 + a[9] - b[9]) & 0xffff;
-        r[10] = (v = (v >>> 16) + 0x7fff8 + a[10] - b[10]) & 0xffff;
-        r[11] = (v = (v >>> 16) + 0x7fff8 + a[11] - b[11]) & 0xffff;
-        r[12] = (v = (v >>> 16) + 0x7fff8 + a[12] - b[12]) & 0xffff;
-        r[13] = (v = (v >>> 16) + 0x7fff8 + a[13] - b[13]) & 0xffff;
-        r[14] = (v = (v >>> 16) + 0x7fff8 + a[14] - b[14]) & 0xffff;
-        r[15] = (v >>> 16) + 0x7ff8 + (a[15] & 0x7fff)
-                - (b[15] & 0x7fff);
-        return r;
-    }
-
-    function _invmodp(a) {
-        var c = a;
-        var i = 250;
-        while (--i) {
-            a = _sqrmodp(a);
-            a = _mulmodp(a, c);
-        }
-        a = _sqrmodp(a);
-        a = _sqrmodp(a);
-        a = _mulmodp(a, c);
-        a = _sqrmodp(a);
-        a = _sqrmodp(a);
-        a = _mulmodp(a, c);
-        a = _sqrmodp(a);
-        a = _mulmodp(a, c);
-        return a;
-    }
-
-    function _mulasmall(a) {
-        // 'division by 0x10000' can not be replaced by '>> 16' because
-        // more than 32 bits of precision are needed
-        var m = 121665;
-        var r = [];
-        var v;
-        r[0] = (v = a[0] * m) & 0xffff;
-        r[1] = (v = (0 | (v / 0x10000)) + a[1] * m) & 0xffff;
-        r[2] = (v = (0 | (v / 0x10000)) + a[2] * m) & 0xffff;
-        r[3] = (v = (0 | (v / 0x10000)) + a[3] * m) & 0xffff;
-        r[4] = (v = (0 | (v / 0x10000)) + a[4] * m) & 0xffff;
-        r[5] = (v = (0 | (v / 0x10000)) + a[5] * m) & 0xffff;
-        r[6] = (v = (0 | (v / 0x10000)) + a[6] * m) & 0xffff;
-        r[7] = (v = (0 | (v / 0x10000)) + a[7] * m) & 0xffff;
-        r[8] = (v = (0 | (v / 0x10000)) + a[8] * m) & 0xffff;
-        r[9] = (v = (0 | (v / 0x10000)) + a[9] * m) & 0xffff;
-        r[10] = (v = (0 | (v / 0x10000)) + a[10] * m) & 0xffff;
-        r[11] = (v = (0 | (v / 0x10000)) + a[11] * m) & 0xffff;
-        r[12] = (v = (0 | (v / 0x10000)) + a[12] * m) & 0xffff;
-        r[13] = (v = (0 | (v / 0x10000)) + a[13] * m) & 0xffff;
-        r[14] = (v = (0 | (v / 0x10000)) + a[14] * m) & 0xffff;
-        r[15] = (0 | (v / 0x10000)) + a[15] * m;
-        _reduce(r);
-        return r;
-    }
-
-    function _dbl(x, z) {
-        var x_2, z_2, m, n, o;
-        m = _sqrmodp(_addmodp(x, z));
-        n = _sqrmodp(_submodp(x, z));
-        o = _submodp(m, n);
-        x_2 = _mulmodp(n, m);
-        z_2 = _mulmodp(_addmodp(_mulasmall(o), m), o);
-        return [x_2, z_2];
-    }
-
-    function _sum(x, z, x_p, z_p, x_1) {
-        var x_3, z_3, p, q;
-        p = _mulmodp(_submodp(x, z), _addmodp(x_p, z_p));
-        q = _mulmodp(_addmodp(x, z), _submodp(x_p, z_p));
-        x_3 = _sqrmodp(_addmodp(p, q));
-        z_3 = _mulmodp(_sqrmodp(_submodp(p, q)), x_1);
-        return [x_3, z_3];
-    }
-
-    function _generateKey(curve25519) {
-        var buffer = crypto.randomBytes(32);
-
-        // For Curve25519 DH keys, we need to apply some bit mask on generated
-        // keys:
-        // * clear bit 0, 1, 2 of first byte
-        // * clear bit 7 of last byte
-        // * set bit 6 of last byte
-        if (curve25519 === true) {
-            buffer[0] &= 0xf8;
-            buffer[31] = (buffer[31] & 0x7f) | 0x40;
-        }
-        var result = [];
-        for (var i = 0; i < buffer.length; i++) {
-            result.push(String.fromCharCode(buffer[i]));
-        }
-        return result.join('');
-    }
-
-    // Expose some functions to the outside through this name space.
-    // Note: This is not part of the public API.
-    ns.getbit = _getbit;
-    ns.setbit = _setbit;
-    ns.addmodp = _addmodp;
-    ns.invmodp = _invmodp;
-    ns.mulmodp = _mulmodp;
-    ns.reduce = _reduce;
-    ns.dbl = _dbl;
-    ns.sum = _sum;
-    ns.ZERO = _ZERO;
-    ns.ONE = _ONE;
-    ns.BASE = _BASE;
-    ns.bigintadd = _bigintadd;
-    ns.bigintsub = _bigintsub;
-    ns.bigintcmp = _bigintcmp;
-    ns.mulmodp = _mulmodp;
-    ns.sqrmodp = _sqrmodp;
-    ns.generateKey = _generateKey;
-
-
-module.exports = ns;
-
-},{"crypto":undefined}],207:[function(require,module,exports){
-"use strict";
-/**
- * @fileOverview
- * Core operations on curve 25519 required for the higher level modules.
- */
-
-/*
- * Copyright (c) 2007, 2013, 2014 Michele Bini
- * Copyright (c) 2014 Mega Limited
- * under the MIT License.
- *
- * Authors: Guy K. Kloss, Michele Bini
- *
- * You should have received a copy of the license along with this program.
- */
-
-var core = require('./core');
-var utils = require('./utils');
-
-    /**
-     * @exports jodid25519/curve255
-     * Legacy compatibility module for Michele Bini's previous curve255.js.
-     *
-     * @description
-     * Legacy compatibility module for Michele Bini's previous curve255.js.
-     *
-     * <p>
-     * This code presents an API with all key formats as previously available
-     * from Michele Bini's curve255.js implementation.
-     * </p>
-     */
-    var ns = {};
-
-    function curve25519_raw(f, c) {
-        var a, x_1, q;
-
-        x_1 = c;
-        a = core.dbl(x_1, core.ONE());
-        q = [x_1, core.ONE()];
-
-        var n = 255;
-
-        while (core.getbit(f, n) == 0) {
-            n--;
-            // For correct constant-time operation, bit 255 should always be
-            // set to 1 so the following 'while' loop is never entered.
-            if (n < 0) {
-                return core.ZERO();
-            }
-        }
-        n--;
-
-        var aq = [a, q];
-
-        while (n >= 0) {
-            var r, s;
-            var b = core.getbit(f, n);
-            r = core.sum(aq[0][0], aq[0][1], aq[1][0], aq[1][1], x_1);
-            s = core.dbl(aq[1 - b][0], aq[1 - b][1]);
-            aq[1 - b] = s;
-            aq[b] = r;
-            n--;
-        }
-        q = aq[1];
-
-        q[1] = core.invmodp(q[1]);
-        q[0] = core.mulmodp(q[0], q[1]);
-        core.reduce(q[0]);
-        return q[0];
-    }
-
-    function curve25519b32(a, b) {
-        return _base32encode(curve25519(_base32decode(a),
-                                        _base32decode(b)));
-    }
-
-    function curve25519(f, c) {
-        if (!c) {
-            c = core.BASE();
-        }
-        f[0] &= 0xFFF8;
-        f[15] = (f[15] & 0x7FFF) | 0x4000;
-        return curve25519_raw(f, c);
-    }
-
-    function _hexEncodeVector(k) {
-        var hexKey = utils.hexEncode(k);
-        // Pad with '0' at the front.
-        hexKey = new Array(64 + 1 - hexKey.length).join('0') + hexKey;
-        // Invert bytes.
-        return hexKey.split(/(..)/).reverse().join('');
-    }
-
-    function _hexDecodeVector(v) {
-        // assert(length(x) == 64);
-        // Invert bytes.
-        var hexKey = v.split(/(..)/).reverse().join('');
-        return utils.hexDecode(hexKey);
-    }
-
-
-    // Expose some functions to the outside through this name space.
-
-    /**
-     * Computes the scalar product of a point on the curve 25519.
-     *
-     * This function is used for the DH key-exchange protocol.
-     *
-     * Before multiplication, some bit operations are applied to the
-     * private key to ensure it is a valid Curve25519 secret key.
-     * It is the user's responsibility to make sure that the private
-     * key is a uniformly random, secret value.
-     *
-     * @function
-     * @param f {array}
-     *     Private key.
-     * @param c {array}
-     *     Public point on the curve. If not given, the curve's base point is used.
-     * @returns {array}
-     *     Key point resulting from scalar product.
-     */
-    ns.curve25519 = curve25519;
-
-    /**
-     * Computes the scalar product of a point on the curve 25519.
-     *
-     * This variant does not make sure that the private key is valid.
-     * The user has the responsibility to ensure the private key is
-     * valid or that this results in a safe protocol.  Unless you know
-     * exactly what you are doing, you should not use this variant,
-     * please use 'curve25519' instead.
-     *
-     * @function
-     * @param f {array}
-     *     Private key.
-     * @param c {array}
-     *     Public point on the curve. If not given, the curve's base point is used.
-     * @returns {array}
-     *     Key point resulting from scalar product.
-     */
-    ns.curve25519_raw = curve25519_raw;
-
-    /**
-     * Encodes the internal representation of a key to a canonical hex
-     * representation.
-     *
-     * This is the format commonly used in other libraries and for
-     * test vectors, and is equivalent to the hex dump of the key in
-     * little-endian binary format.
-     *
-     * @function
-     * @param n {array}
-     *     Array representation of key.
-     * @returns {string}
-     *     Hexadecimal string representation of key.
-     */
-    ns.hexEncodeVector = _hexEncodeVector;
-
-    /**
-     * Decodes a canonical hex representation of a key
-     * to an internally compatible array representation.
-     *
-     * @function
-     * @param n {string}
-     *     Hexadecimal string representation of key.
-     * @returns {array}
-     *     Array representation of key.
-     */
-    ns.hexDecodeVector = _hexDecodeVector;
-
-    /**
-     * Encodes the internal representation of a key into a
-     * hexadecimal representation.
-     *
-     * This is a strict positional notation, most significant digit first.
-     *
-     * @function
-     * @param n {array}
-     *     Array representation of key.
-     * @returns {string}
-     *     Hexadecimal string representation of key.
-     */
-    ns.hexencode = utils.hexEncode;
-
-    /**
-     * Decodes a hex representation of a key to an internally
-     * compatible array representation.
-     *
-     * @function
-     * @param n {string}
-     *     Hexadecimal string representation of key.
-     * @returns {array}
-     *     Array representation of key.
-     */
-    ns.hexdecode = utils.hexDecode;
-
-    /**
-     * Encodes the internal representation of a key to a base32
-     * representation.
-     *
-     * @function
-     * @param n {array}
-     *     Array representation of key.
-     * @returns {string}
-     *     Base32 string representation of key.
-     */
-    ns.base32encode = utils.base32encode;
-
-    /**
-     * Decodes a base32 representation of a key to an internally
-     * compatible array representation.
-     *
-     * @function
-     * @param n {string}
-     *     Base32 string representation of key.
-     * @returns {array}
-     *     Array representation of key.
-     */
-    ns.base32decode = utils.base32decode;
-
-module.exports = ns;
-
-},{"./core":206,"./utils":210}],208:[function(require,module,exports){
-"use strict";
-/**
- * @fileOverview
- * EC Diffie-Hellman operations on Curve25519.
- */
-
-/*
- * Copyright (c) 2014 Mega Limited
- * under the MIT License.
- *
- * Authors: Guy K. Kloss
- *
- * You should have received a copy of the license along with this program.
- */
-
-var core = require('./core');
-var utils = require('./utils');
-var curve255 = require('./curve255');
-
-
-    /**
-     * @exports jodid25519/dh
-     * EC Diffie-Hellman operations on Curve25519.
-     *
-     * @description
-     * EC Diffie-Hellman operations on Curve25519.
-     */
-    var ns = {};
-
-
-    function _toString(vector) {
-        var u = new Uint16Array(vector);
-        return (new Buffer(new Uint8Array(u.buffer)));
-    }
-
-    function _fromString(vector) {
-        if (Buffer.isBuffer(vector)) {
-            var u = new Uint8Array(vector);
-            return (new Uint16Array(u.buffer));
-        }
-
-        var result = new Array(16);
-        for (var i = 0, l = 0; i < vector.length; i += 2) {
-            result[l] = (vector.charCodeAt(i + 1) << 8) | vector.charCodeAt(i);
-            l++;
-        }
-        return result;
-    }
-
-
-    /**
-     * Computes a key through scalar multiplication of a point on the curve 25519.
-     *
-     * This function is used for the DH key-exchange protocol. It computes a
-     * key based on a secret key with a public component (opponent's public key
-     * or curve base point if not given) by using scalar multiplication.
-     *
-     * Before multiplication, some bit operations are applied to the
-     * private key to ensure it is a valid Curve25519 secret key.
-     * It is the user's responsibility to make sure that the private
-     * key is a uniformly random, secret value.
-     *
-     * @function
-     * @param privateComponent {string}
-     *     Private point as byte string on the curve.
-     * @param publicComponent {string}
-     *     Public point as byte string on the curve. If not given, the curve's
-     *     base point is used.
-     * @returns {string}
-     *     Key point as byte string resulting from scalar product.
-     */
-    ns.computeKey = function(privateComponent, publicComponent) {
-        if (publicComponent) {
-            return _toString(curve255.curve25519(_fromString(privateComponent),
-                                                 _fromString(publicComponent)));
-        } else {
-            return _toString(curve255.curve25519(_fromString(privateComponent)));
-        }
-    };
-
-    /**
-     * Computes the public key to a private key on the curve 25519.
-     *
-     * Before multiplication, some bit operations are applied to the
-     * private key to ensure it is a valid Curve25519 secret key.
-     * It is the user's responsibility to make sure that the private
-     * key is a uniformly random, secret value.
-     *
-     * @function
-     * @param privateKey {string}
-     *     Private point as byte string on the curve.
-     * @returns {string}
-     *     Public key point as byte string resulting from scalar product.
-     */
-    ns.publicKey = function(privateKey) {
-        return _toString(curve255.curve25519(_fromString(privateKey)));
-    };
-
-
-    /**
-     * Generates a new random private key of 32 bytes length (256 bit).
-     *
-     * @function
-     * @returns {string}
-     *     Byte string containing a new random private key seed.
-     */
-    ns.generateKey = function() {
-        return core.generateKey(true);
-    };
-
-module.exports = ns;
-
-},{"./core":206,"./curve255":207,"./utils":210}],209:[function(require,module,exports){
-"use strict";
-/**
- * @fileOverview
- * Digital signature scheme based on Curve25519 (Ed25519 or EdDSA).
- */
-
-/*
- * Copyright (c) 2011, 2012, 2014 Ron Garret
- * Copyright (c) 2014 Mega Limited
- * under the MIT License.
- *
- * Authors: Guy K. Kloss, Ron Garret
- *
- * You should have received a copy of the license along with this program.
- */
-
-var core = require('./core');
-var curve255 = require('./curve255');
-var utils = require('./utils');
-var BigInteger = require('jsbn').BigInteger;
-var crypto = require('crypto');
-
-    /**
-     * @exports jodid25519/eddsa
-     * Digital signature scheme based on Curve25519 (Ed25519 or EdDSA).
-     *
-     * @description
-     * Digital signature scheme based on Curve25519 (Ed25519 or EdDSA).
-     *
-     * <p>
-     * This code is adapted from fast-djbec.js, a faster but more complicated
-     * version of the Ed25519 encryption scheme (as compared to djbec.js).
-     * It uses two different representations for big integers: The jsbn
-     * BigInteger class, which can represent arbitrary-length numbers, and a
-     * special fixed-length representation optimised for 256-bit integers.
-     * The reason both are needed is that the Ed25519 algorithm requires some
-     * 512-bit numbers.</p>
-    */
-    var ns = {};
-
-    function _bi255(value) {
-        if (!(this instanceof _bi255)) {
-            return new _bi255(value);
-        }
-        if (typeof value === 'undefined') {
-            return _ZERO;
-        }
-        var c = value.constructor;
-        if ((c === Array || c === Uint16Array || c === Uint32Array) && (value.length === 16)) {
-            this.n = value;
-        } else if ((c === Array) && (value.length === 32)) {
-            this.n = _bytes2bi255(value).n;
-        } else if (c === String) {
-            this.n = utils.hexDecode(value);
-        } else if (c === Number) {
-            this.n = [value & 0xffff,
-                      value >> 16, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
-        } else if (value instanceof _bi255) {
-            this.n = value.n.slice(0); // Copy constructor
-        } else {
-            throw "Bad argument for bignum: " + value;
-        }
-    }
-
-   _bi255.prototype = {
-        'toString' : function() {
-            return utils.hexEncode(this.n);
-        },
-        'toSource' : function() {
-            return '_' + utils.hexEncode(this.n);
-        },
-        'plus' : function(n1) {
-            return _bi255(core.bigintadd(this.n, n1.n));
-        },
-        'minus' : function(n1) {
-            return _bi255(core.bigintsub(this.n, n1.n)).modq();
-        },
-        'times' : function(n1) {
-            return _bi255(core.mulmodp(this.n, n1.n));
-        },
-        'divide' : function(n1) {
-            return this.times(n1.inv());
-        },
-        'sqr' : function() {
-            return _bi255(core.sqrmodp(this.n));
-        },
-        'cmp' : function(n1) {
-            return core.bigintcmp(this.n, n1.n);
-        },
-        'equals' : function(n1) {
-            return this.cmp(n1) === 0;
-        },
-        'isOdd' : function() {
-            return (this.n[0] & 1) === 1;
-        },
-        'shiftLeft' : function(cnt) {
-            _shiftL(this.n, cnt);
-            return this;
-        },
-        'shiftRight' : function(cnt) {
-            _shiftR(this.n, cnt);
-            return this;
-        },
-        'inv' : function() {
-            return _bi255(core.invmodp(this.n));
-        },
-        'pow' : function(e) {
-            return _bi255(_pow(this.n, e.n));
-        },
-        'modq' : function() {
-            return _modq(this);
-        },
-        'bytes' : function() {
-            return _bi255_bytes(this);
-        }
-    };
-
-    function _shiftL(n, cnt) {
-        var lastcarry = 0;
-        for (var i = 0; i < 16; i++) {
-            var carry = n[i] >> (16 - cnt);
-            n[i] = (n[i] << cnt) & 0xffff | lastcarry;
-            lastcarry = carry;
-        }
-        return n;
-    }
-
-    function _shiftR(n, cnt) {
-        var lastcarry = 0;
-        for (var i = 15; i >= 0; i--) {
-            var carry = n[i] << (16 - cnt) & 0xffff;
-            n[i] = (n[i] >> cnt) | lastcarry;
-            lastcarry = carry;
-        }
-        return n;
-    }
-
-    function _bi255_bytes(n) {
-        n = _bi255(n); // Make a copy because shiftRight is destructive
-        var a = new Array(32);
-        for (var i = 31; i >= 0; i--) {
-            a[i] = n.n[0] & 0xff;
-            n.shiftRight(8);
-        }
-        return a;
-    }
-
-    function _bytes2bi255(a) {
-        var n = _ZERO;
-        for (var i = 0; i < 32; i++) {
-            n.shiftLeft(8);
-            n = n.plus(_bi255(a[i]));
-        }
-        return n;
-    }
-
-    function _pow(n, e) {
-        var result = core.ONE();
-        for (var i = 0; i < 256; i++) {
-            if (core.getbit(e, i) === 1) {
-                result = core.mulmodp(result, n);
-            }
-            n = core.sqrmodp(n);
-        }
-        return result;
-    }
-
-    var _ZERO = _bi255(0);
-    var _ONE = _bi255(1);
-    var _TWO = _bi255(2);
-    // This is the core prime.
-    var _Q = _bi255([0xffff - 18, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff,
-                     0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff,
-                     0xffff, 0xffff, 0x7fff]);
-
-    function _modq(n) {
-        core.reduce(n.n);
-        if (n.cmp(_Q) >= 0) {
-            return _modq(n.minus(_Q));
-        }
-        if (n.cmp(_ZERO) === -1) {
-            return _modq(n.plus(_Q));
-        } else {
-            return n;
-        }
-    }
-
-    // _RECOVERY_EXPONENT = _Q.plus(_bi255(3)).divide(_bi255(8));
-    var _RECOVERY_EXPONENT = _bi255('0ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffe');
-    // _D = _Q.minus(_bi255(121665)).divide(_bi255(121666));
-    var _D = _bi255('52036cee2b6ffe738cc740797779e89800700a4d4141d8ab75eb4dca135978a3');
-    // _I = _TWO.pow(_Q.minus(_ONE).divide(_bi255(4)));
-    var _I = _bi255('2b8324804fc1df0b2b4d00993dfbd7a72f431806ad2fe478c4ee1b274a0ea0b0');
-    // _L = _TWO.pow(_bi255(252)).plus(_bi255('14def9dea2f79cd65812631a5cf5d3ed'));
-    var _L = _bi255('1000000000000000000000000000000014def9dea2f79cd65812631a5cf5d3ed');
-    var _L_BI = _bi('1000000000000000000000000000000014def9dea2f79cd65812631a5cf5d3ed', 16);
-
-
-    // ////////////////////////////////////////////////////////////
-
-    function _isoncurve(p) {
-        var x = p[0];
-        var y = p[1];
-        var xsqr = x.sqr();
-        var ysqr = y.sqr();
-        var v = _D.times(xsqr).times(ysqr);
-        return ysqr.minus(xsqr).minus(_ONE).minus(v).modq().equals(_ZERO);
-    }
-
-    function _xrecover(y) {
-        var ysquared = y.sqr();
-        var xx = ysquared.minus(_ONE).divide(_ONE.plus(_D.times(ysquared)));
-        var x = xx.pow(_RECOVERY_EXPONENT);
-        if (!(x.times(x).minus(xx).equals(_ZERO))) {
-            x = x.times(_I);
-        }
-        if (x.isOdd()) {
-            x = _Q.minus(x);
-        }
-        return x;
-    }
-
-    function _x_pt_add(pt1, pt2) {
-        var x1 = pt1[0];
-        var y1 = pt1[1];
-        var z1 = pt1[2];
-        var t1 = pt1[3];
-        var x2 = pt2[0];
-        var y2 = pt2[1];
-        var z2 = pt2[2];
-        var t2 = pt2[3];
-        var A = y1.minus(x1).times(y2.plus(x2));
-        var B = y1.plus(x1).times(y2.minus(x2));
-        var C = z1.times(_TWO).times(t2);
-        var D = t1.times(_TWO).times(z2);
-        var E = D.plus(C);
-        var F = B.minus(A);
-        var G = B.plus(A);
-        var H = D.minus(C);
-        return [E.times(F), G.times(H), F.times(G), E.times(H)];
-    }
-
-    function _xpt_double(pt1) {
-        var x1 = pt1[0];
-        var y1 = pt1[1];
-        var z1 = pt1[2];
-        var A = x1.times(x1);
-        var B = y1.times(y1);
-        var C = _TWO.times(z1).times(z1);
-        var D = _Q.minus(A);
-        var J = x1.plus(y1);
-        var E = J.times(J).minus(A).minus(B);
-        var G = D.plus(B);
-        var F = G.minus(C);
-        var H = D.minus(B);
-        return [E.times(F), G.times(H), F.times(G), E.times(H)];
-    }
-
-    function _xpt_mult(pt, n) {
-        if (n.equals(_ZERO)) {
-            return [_ZERO, _ONE, _ONE, _ZERO];
-        }
-        var odd = n.isOdd();
-        n.shiftRight(1);
-        var value = _xpt_double(_xpt_mult(pt, n));
-        return odd ? _x_pt_add(value, pt) : value;
-    }
-
-    function _pt_xform(pt) {
-        var x = pt[0];
-        var y = pt[1];
-        return [x, y, _ONE, x.times(y)];
-    }
-
-    function _pt_unxform(pt) {
-        var x = pt[0];
-        var y = pt[1];
-        var z = pt[2];
-        var invz = z.inv();
-        return [x.times(invz), y.times(invz)];
-    }
-
-    function _scalarmult(pt, n) {
-        return _pt_unxform(_xpt_mult(_pt_xform(pt), n));
-    }
-
-    function _bytesgetbit(bytes, n) {
-        return (bytes[bytes.length - (n >>> 3) - 1] >> (n & 7)) & 1;
-    }
-
-    function _xpt_mult_bytes(pt, bytes) {
-        var r = [_ZERO, _ONE, _ONE, _ZERO];
-        for (var i = (bytes.length << 3) - 1; i >= 0; i--) {
-            r = _xpt_double(r);
-            if (_bytesgetbit(bytes, i) === 1) {
-                r = _x_pt_add(r, pt);
-            }
-        }
-        return r;
-    }
-
-    function _scalarmultBytes(pt, bytes) {
-        return _pt_unxform(_xpt_mult_bytes(_pt_xform(pt), bytes));
-    }
-
-    var _by = _bi255(4).divide(_bi255(5));
-    var _bx = _xrecover(_by);
-    var _bp = [_bx, _by];
-
-    function _encodeint(n) {
-        return n.bytes(32).reverse();
-    }
-    function _decodeint(b) {
-        return _bi255(b.slice(0).reverse());
-    }
-
-    function _encodepoint(p) {
-        var v = _encodeint(p[1]);
-        if (p[0].isOdd()) {
-            v[31] |= 0x80;
-        }
-        return v;
-    }
-
-    function _decodepoint(v) {
-        v = v.slice(0);
-        var signbit = v[31] >> 7;
-        v[31] &= 127;
-        var y = _decodeint(v);
-        var x = _xrecover(y);
-        if ((x.n[0] & 1) !== signbit) {
-            x = _Q.minus(x);
-        }
-        var p = [x, y];
-        if (!_isoncurve(p)) {
-            throw ('Point is not on curve');
-        }
-        return p;
-    }
-
-    // //////////////////////////////////////////////////
-
-    /**
-     * Factory function to create a suitable BigInteger.
-     *
-     * @param value
-     *     The value for the big integer.
-     * @param base {integer}
-     *     Base of the conversion of elements in ``value``.
-     * @returns
-     *     A BigInteger object.
-     */
-    function _bi(value, base) {
-        if (base !== undefined) {
-            if (base === 256) {
-                return _bi(utils.string2bytes(value));
-            }
-            return new BigInteger(value, base);
-        } else if (typeof value === 'string') {
-            return new BigInteger(value, 10);
-        } else if ((value instanceof Array) || (value instanceof Uint8Array)
-          || Buffer.isBuffer(value)) {
-            return new BigInteger(value);
-        } else if (typeof value === 'number') {
-            return new BigInteger(value.toString(), 10);
-        } else {
-            throw "Can't convert " + value + " to BigInteger";
-        }
-    }
-
-    function _bi2bytes(n, cnt) {
-        if (cnt === undefined) {
-            cnt = (n.bitLength() + 7) >>> 3;
-        }
-        var bytes = new Array(cnt);
-        for (var i = cnt - 1; i >= 0; i--) {
-            bytes[i] = n[0] & 255; // n.and(0xff);
-            n = n.shiftRight(8);
-        }
-        return bytes;
-    }
-
-    BigInteger.prototype.bytes = function(n) {
-        return _bi2bytes(this, n);
-    };
-
-    // /////////////////////////////////////////////////////////
-
-    function _bytehash(s) {
-        var sha = crypto.createHash('sha512').update(s).digest();
-        return _bi2bytes(_bi(sha), 64).reverse();
-    }
-
-    function _stringhash(s) {
-        var sha = crypto.createHash('sha512').update(s).digest();
-        return _map(_chr, _bi2bytes(_bi(sha), 64)).join('');
-    }
-
-    function _inthash(s) {
-        // Need a leading 0 to prevent sign extension
-        return _bi([0].concat(_bytehash(s)));
-    }
-
-    function _inthash_lo(s) {
-        return _bi255(_bytehash(s).slice(32, 64));
-    }
-
-    function _inthash_mod_l(s) {
-        return _inthash(s).mod(_L_BI);
-    }
-
-    function _get_a(sk) {
-        var a = _inthash_lo(sk);
-        a.n[0] &= 0xfff8;
-        a.n[15] &= 0x3fff;
-        a.n[15] |= 0x4000;
-        return a;
-    }
-
-    function _publickey(sk) {
-        return _encodepoint(_scalarmult(_bp, _get_a(sk)));
-    }
-
-    function _map(f, l) {
-        var result = new Array(l.length);
-        for (var i = 0; i < l.length; i++) {
-            result[i] = f(l[i]);
-        }
-        return result;
-    }
-
-    function _chr(n) {
-        return String.fromCharCode(n);
-    }
-
-    function _ord(c) {
-        return c.charCodeAt(0);
-    }
-
-    function _pt_add(p1, p2) {
-        return _pt_unxform(_x_pt_add(_pt_xform(p1), _pt_xform(p2)));
-    }
-
-
-    // Exports for the API.
-
-    /**
-     * Checks whether a point is on the curve.
-     *
-     * @function
-     * @param point {string}
-     *     The point to check for in a byte string representation.
-     * @returns {boolean}
-     *     true if the point is on the curve, false otherwise.
-     */
-    ns.isOnCurve = function(point) {
-        try {
-            _isoncurve(_decodepoint(utils.string2bytes(point)));
-        } catch(e) {
-            if (e === 'Point is not on curve') {
-                return false;
-            } else {
-                throw e;
-            }
-        }
-        return true;
-    };
-
-
-    /**
-     * Computes the EdDSA public key.
-     *
-     * <p>Note: Seeds should be a byte string, not a unicode string containing
-     * multi-byte characters.</p>
-     *
-     * @function
-     * @param keySeed {string}
-     *     Private key seed in the form of a byte string.
-     * @returns {string}
-     *     Public key as byte string computed from the private key seed
-     *     (32 bytes).
-     */
-    ns.publicKey = function(keySeed) {
-        return utils.bytes2string(_publickey(keySeed));
-    };
-
-
-    /**
-     * Computes an EdDSA signature of a message.
-     *
-     * <p>Notes:</p>
-     *
-     * <ul>
-     *   <li>Unicode messages need to be converted to a byte representation
-     *   (e. g. UTF-8).</li>
-     *   <li>If `publicKey` is given, and it is *not* a point of the curve,
-     *   the signature will be faulty, but no error will be thrown.</li>
-     * </ul>
-     *
-     * @function
-     * @param message {string}
-     *     Message in the form of a byte string.
-     * @param keySeed {string}
-     *     Private key seed in the form of a byte string.
-     * @param publicKey {string}
-     *     Public key as byte string (if not present, it will be computed from
-     *     the private key seed).
-     * @returns {string}
-     *     Detached message signature in the form of a byte string (64 bytes).
-     */
-    ns.sign = function(message, keySeed, publicKey) {
-        if (publicKey === undefined) {
-            publicKey = _publickey(keySeed);
-        } else {
-            publicKey = utils.string2bytes(publicKey);
-        }
-        var a = _bi(_get_a(keySeed).toString(), 16);
-        var hs = _stringhash(keySeed);
-        var r = _bytehash(hs.slice(32, 64) + message);
-        var rp = _scalarmultBytes(_bp, r);
-        var erp = _encodepoint(rp);
-        r = _bi(r).mod(_bi(1, 10).shiftLeft(512));
-        var s = _map(_chr, erp).join('') + _map(_chr, publicKey).join('') + message;
-        s = _inthash_mod_l(s).multiply(a).add(r).mod(_L_BI);
-        return utils.bytes2string(erp.concat(_encodeint(s)));
-    };
-
-
-    /**
-     * Verifies an EdDSA signature of a message with the public key.
-     *
-     * <p>Note: Unicode messages need to be converted to a byte representation
-     * (e. g. UTF-8).</p>
-     *
-     * @function
-     * @param signature {string}
-     *     Message signature in the form of a byte string. Can be detached
-     *     (64 bytes), or attached to be sliced off.
-     * @param message {string}
-     *     Message in the form of a byte string.
-     * @param publicKey {string}
-     *     Public key as byte string (if not present, it will be computed from
-     *     the private key seed).
-     * @returns {boolean}
-     *     true, if the signature verifies.
-     */
-    ns.verify = function(signature, message, publicKey) {
-        signature = utils.string2bytes(signature.slice(0, 64));
-        publicKey = utils.string2bytes(publicKey);
-        var rpe = signature.slice(0, 32);
-        var rp = _decodepoint(rpe);
-        var a = _decodepoint(publicKey);
-        var s = _decodeint(signature.slice(32, 64));
-        var h = _inthash(utils.bytes2string(rpe.concat(publicKey)) + message);
-        var v1 = _scalarmult(_bp, s);
-        var value = _scalarmultBytes(a, _bi2bytes(h));
-        var v2 = _pt_add(rp, value);
-        return v1[0].equals(v2[0]) && v1[1].equals(v2[1]);
-    };
-
-
-    /**
-     * Generates a new random private key seed of 32 bytes length (256 bit).
-     *
-     * @function
-     * @returns {string}
-     *     Byte string containing a new random private key seed.
-     */
-    ns.generateKeySeed = function() {
-        return core.generateKey(false);
-    };
-
-module.exports = ns;
-
-},{"./core":206,"./curve255":207,"./utils":210,"crypto":undefined,"jsbn":211}],210:[function(require,module,exports){
-"use strict";
-/**
- * @fileOverview
- * A collection of general utility functions..
- */
-
-/*
- * Copyright (c) 2011, 2012, 2014 Ron Garret
- * Copyright (c) 2007, 2013, 2014 Michele Bini
- * Copyright (c) 2014 Mega Limited
- * under the MIT License.
- *
- * Authors: Guy K. Kloss, Michele Bini, Ron Garret
- *
- * You should have received a copy of the license along with this program.
- */
-
-var core = require('./core');
-
-    /**
-     * @exports jodid25519/utils
-     * A collection of general utility functions..
-     *
-     * @description
-     * A collection of general utility functions..
-     */
-    var ns = {};
-
-    var _HEXCHARS = "0123456789abcdef";
-
-    function _hexencode(vector) {
-        var result = [];
-        for (var i = vector.length - 1; i >= 0; i--) {
-            var value = vector[i];
-            result.push(_HEXCHARS.substr((value >>> 12) & 0x0f, 1));
-            result.push(_HEXCHARS.substr((value >>> 8) & 0x0f, 1));
-            result.push(_HEXCHARS.substr((value >>> 4) & 0x0f, 1));
-            result.push(_HEXCHARS.substr(value & 0x0f, 1));
-        }
-        return result.join('');
-    }
-
-    function _hexdecode(vector) {
-        var result = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
-        for (var i = vector.length - 1, l = 0; i >= 0; i -= 4) {
-            result[l] = (_HEXCHARS.indexOf(vector.charAt(i)))
-                      | (_HEXCHARS.indexOf(vector.charAt(i - 1)) << 4)
-                      | (_HEXCHARS.indexOf(vector.charAt(i - 2)) << 8)
-                      | (_HEXCHARS.indexOf(vector.charAt(i - 3)) << 12);
-            l++;
-        }
-        return result;
-    }
-
-    var _BASE32CHARS = "abcdefghijklmnopqrstuvwxyz234567";
-
-    var _BASE32VALUES = (function () {
-        var result = {};
-        for (var i = 0; i < _BASE32CHARS.length; i++) {
-            result[_BASE32CHARS.charAt(i)] = i;
-        }
-        return result;
-    })();
-
-    function _base32encode(n) {
-        var c;
-        var r = "";
-        for (c = 0; c < 255; c += 5) {
-            r = _BASE32CHARS.substr(core.getbit(n, c)
-                                    + (core.getbit(n, c + 1) << 1)
-                                    + (core.getbit(n, c + 2) << 2)
-                                    + (core.getbit(n, c + 3) << 3)
-                                    + (core.getbit(n, c + 4) << 4), 1)
-                                    + r;
-        }
-        return r;
-    }
-
-    function _base32decode(n) {
-        var c = 0;
-        var r = core.ZERO();
-        var l = n.length;
-        for (c = 0; (l > 0) && (c < 255); c += 5) {
-            l--;
-            var v = _BASE32VALUES[n.substr(l, 1)];
-            core.setbit(r, c, v & 1);
-            v >>= 1;
-            core.setbit(r, c + 1, v & 1);
-            v >>= 1;
-            core.setbit(r, c + 2, v & 1);
-            v >>= 1;
-            core.setbit(r, c + 3, v & 1);
-            v >>= 1;
-            core.setbit(r, c + 4, v & 1);
-           }
-        return r;
-    }
-
-    function _map(f, l) {
-        var result = new Array(l.length);
-        for (var i = 0; i < l.length; i++) {
-            result[i] = f(l[i]);
-        }
-        return result;
-    }
-
-    function _chr(n) {
-        return String.fromCharCode(n);
-    }
-
-    function _ord(c) {
-        return c.charCodeAt(0);
-    }
-
-    function _bytes2string(bytes) {
-        return _map(_chr, bytes).join('');
-    }
-
-    function _string2bytes(s) {
-        return _map(_ord, s);
-    }
-
-
-    // Expose some functions to the outside through this name space.
-
-    /**
-     * Encodes an array of unsigned 8-bit integers to a hex string.
-     *
-     * @function
-     * @param vector {array}
-     *     Array containing the byte values.
-     * @returns {string}
-     *     String containing vector in a hexadecimal representation.
-     */
-    ns.hexEncode = _hexencode;
-
-
-    /**
-     * Decodes a hex string to an array of unsigned 8-bit integers.
-     *
-     * @function
-     * @param vector {string}
-     *     String containing vector in a hexadecimal representation.
-     * @returns {array}
-     *     Array containing the byte values.
-     */
-    ns.hexDecode = _hexdecode;
-
-
-    /**
-     * Encodes an array of unsigned 8-bit integers using base32 encoding.
-     *
-     * @function
-     * @param vector {array}
-     *     Array containing the byte values.
-     * @returns {string}
-     *     String containing vector in a hexadecimal representation.
-     */
-    ns.base32encode = _base32encode;
-
-
-    /**
-     * Decodes a base32 encoded string to an array of unsigned 8-bit integers.
-     *
-     * @function
-     * @param vector {string}
-     *     String containing vector in a hexadecimal representation.
-     * @returns {array}
-     *     Array containing the byte values.
-     */
-    ns.base32decode = _base32decode;
-
-
-    /**
-     * Converts an unsigned 8-bit integer array representation to a byte string.
-     *
-     * @function
-     * @param vector {array}
-     *     Array containing the byte values.
-     * @returns {string}
-     *     Byte string representation of vector.
-     */
-    ns.bytes2string = _bytes2string;
-
-
-    /**
-     * Converts a byte string representation to an array of unsigned
-     * 8-bit integers.
-     *
-     * @function
-     * @param vector {array}
-     *     Array containing the byte values.
-     * @returns {string}
-     *     Byte string representation of vector.
-     */
-    ns.string2bytes = _string2bytes;
-
-module.exports = ns;
-
-},{"./core":206}],211:[function(require,module,exports){
+},{"stream":undefined}],210:[function(require,module,exports){
 (function(){
 
     // Copyright (c) 2005  Tom Wu
@@ -27901,19 +27562,18 @@ module.exports = ns;
 	// An array of bytes the size of the pool will be passed to init()
 	var rng_psize = 256;
 
-    if (typeof exports !== 'undefined') {
-        exports = module.exports = {
-			BigInteger: BigInteger,
-			SecureRandom: SecureRandom,
-		};
-    } else {
-        this.BigInteger = BigInteger;
-        this.SecureRandom = SecureRandom;
-    }
+  BigInteger.SecureRandom = SecureRandom;
+  BigInteger.BigInteger = BigInteger;
+  if (typeof exports !== 'undefined') {
+    exports = module.exports = BigInteger;
+  } else {
+    this.BigInteger = BigInteger;
+    this.SecureRandom = SecureRandom;
+  }
 
 }).call(this);
 
-},{}],212:[function(require,module,exports){
+},{}],211:[function(require,module,exports){
 /**
  * JSONSchema Validator - Validates JavaScript objects using JSON Schemas
  *	(http://www.json.com/json-schema-proposal/)
@@ -28188,7 +27848,7 @@ exports.mustBeValid = function(result){
 return exports;
 }));
 
-},{}],213:[function(require,module,exports){
+},{}],212:[function(require,module,exports){
 exports = module.exports = stringify
 exports.getSerialize = serializer
 
@@ -28217,7 +27877,7 @@ function serializer(replacer, cycleReplacer) {
   }
 }
 
-},{}],214:[function(require,module,exports){
+},{}],213:[function(require,module,exports){
 var hasExcape = /~/
 var escapeMatcher = /~[01]/g
 function escapeReplacer (m) {
@@ -28312,12 +27972,12 @@ exports.get = get
 exports.set = set
 exports.compile = compile
 
-},{}],215:[function(require,module,exports){
+},{}],214:[function(require,module,exports){
 /*
  * lib/jsprim.js: utilities for primitive JavaScript types
  */
 
-var mod_assert = require('assert');
+var mod_assert = require('assert-plus');
 var mod_util = require('util');
 
 var mod_extsprintf = require('extsprintf');
@@ -28343,6 +28003,8 @@ exports.mergeObjects = mergeObjects;
 
 exports.startsWith = startsWith;
 exports.endsWith = endsWith;
+
+exports.parseInteger = parseInteger;
 
 exports.iso8601 = iso8601;
 exports.rfc1123 = rfc1123;
@@ -28594,6 +28256,251 @@ function parseDateTime(str)
 	}
 }
 
+
+/*
+ * Number.*_SAFE_INTEGER isn't present before node v0.12, so we hardcode
+ * the ES6 definitions here, while allowing for them to someday be higher.
+ */
+var MAX_SAFE_INTEGER = Number.MAX_SAFE_INTEGER || 9007199254740991;
+var MIN_SAFE_INTEGER = Number.MIN_SAFE_INTEGER || -9007199254740991;
+
+
+/*
+ * Default options for parseInteger().
+ */
+var PI_DEFAULTS = {
+	base: 10,
+	allowSign: true,
+	allowPrefix: false,
+	allowTrailing: false,
+	allowImprecise: false,
+	trimWhitespace: false,
+	leadingZeroIsOctal: false
+};
+
+var CP_0 = 0x30;
+var CP_9 = 0x39;
+
+var CP_A = 0x41;
+var CP_B = 0x42;
+var CP_O = 0x4f;
+var CP_T = 0x54;
+var CP_X = 0x58;
+var CP_Z = 0x5a;
+
+var CP_a = 0x61;
+var CP_b = 0x62;
+var CP_o = 0x6f;
+var CP_t = 0x74;
+var CP_x = 0x78;
+var CP_z = 0x7a;
+
+var PI_CONV_DEC = 0x30;
+var PI_CONV_UC = 0x37;
+var PI_CONV_LC = 0x57;
+
+
+/*
+ * A stricter version of parseInt() that provides options for changing what
+ * is an acceptable string (for example, disallowing trailing characters).
+ */
+function parseInteger(str, uopts)
+{
+	mod_assert.string(str, 'str');
+	mod_assert.optionalObject(uopts, 'options');
+
+	var baseOverride = false;
+	var options = PI_DEFAULTS;
+
+	if (uopts) {
+		baseOverride = hasKey(uopts, 'base');
+		options = mergeObjects(options, uopts);
+		mod_assert.number(options.base, 'options.base');
+		mod_assert.ok(options.base >= 2, 'options.base >= 2');
+		mod_assert.ok(options.base <= 36, 'options.base <= 36');
+		mod_assert.bool(options.allowSign, 'options.allowSign');
+		mod_assert.bool(options.allowPrefix, 'options.allowPrefix');
+		mod_assert.bool(options.allowTrailing,
+		    'options.allowTrailing');
+		mod_assert.bool(options.allowImprecise,
+		    'options.allowImprecise');
+		mod_assert.bool(options.trimWhitespace,
+		    'options.trimWhitespace');
+		mod_assert.bool(options.leadingZeroIsOctal,
+		    'options.leadingZeroIsOctal');
+
+		if (options.leadingZeroIsOctal) {
+			mod_assert.ok(!baseOverride,
+			    '"base" and "leadingZeroIsOctal" are ' +
+			    'mutually exclusive');
+		}
+	}
+
+	var c;
+	var pbase = -1;
+	var base = options.base;
+	var start;
+	var mult = 1;
+	var value = 0;
+	var idx = 0;
+	var len = str.length;
+
+	/* Trim any whitespace on the left side. */
+	if (options.trimWhitespace) {
+		while (idx < len && isSpace(str.charCodeAt(idx))) {
+			++idx;
+		}
+	}
+
+	/* Check the number for a leading sign. */
+	if (options.allowSign) {
+		if (str[idx] === '-') {
+			idx += 1;
+			mult = -1;
+		} else if (str[idx] === '+') {
+			idx += 1;
+		}
+	}
+
+	/* Parse the base-indicating prefix if there is one. */
+	if (str[idx] === '0') {
+		if (options.allowPrefix) {
+			pbase = prefixToBase(str.charCodeAt(idx + 1));
+			if (pbase !== -1 && (!baseOverride || pbase === base)) {
+				base = pbase;
+				idx += 2;
+			}
+		}
+
+		if (pbase === -1 && options.leadingZeroIsOctal) {
+			base = 8;
+		}
+	}
+
+	/* Parse the actual digits. */
+	for (start = idx; idx < len; ++idx) {
+		c = translateDigit(str.charCodeAt(idx));
+		if (c !== -1 && c < base) {
+			value *= base;
+			value += c;
+		} else {
+			break;
+		}
+	}
+
+	/* If we didn't parse any digits, we have an invalid number. */
+	if (start === idx) {
+		return (new Error('invalid number: ' + JSON.stringify(str)));
+	}
+
+	/* Trim any whitespace on the right side. */
+	if (options.trimWhitespace) {
+		while (idx < len && isSpace(str.charCodeAt(idx))) {
+			++idx;
+		}
+	}
+
+	/* Check for trailing characters. */
+	if (idx < len && !options.allowTrailing) {
+		return (new Error('trailing characters after number: ' +
+		    JSON.stringify(str.slice(idx))));
+	}
+
+	/* If our value is 0, we return now, to avoid returning -0. */
+	if (value === 0) {
+		return (0);
+	}
+
+	/* Calculate our final value. */
+	var result = value * mult;
+
+	/*
+	 * If the string represents a value that cannot be precisely represented
+	 * by JavaScript, then we want to check that:
+	 *
+	 * - We never increased the value past MAX_SAFE_INTEGER
+	 * - We don't make the result negative and below MIN_SAFE_INTEGER
+	 *
+	 * Because we only ever increment the value during parsing, there's no
+	 * chance of moving past MAX_SAFE_INTEGER and then dropping below it
+	 * again, losing precision in the process. This means that we only need
+	 * to do our checks here, at the end.
+	 */
+	if (!options.allowImprecise &&
+	    (value > MAX_SAFE_INTEGER || result < MIN_SAFE_INTEGER)) {
+		return (new Error('number is outside of the supported range: ' +
+		    JSON.stringify(str.slice(start, idx))));
+	}
+
+	return (result);
+}
+
+
+/*
+ * Interpret a character code as a base-36 digit.
+ */
+function translateDigit(d)
+{
+	if (d >= CP_0 && d <= CP_9) {
+		/* '0' to '9' -> 0 to 9 */
+		return (d - PI_CONV_DEC);
+	} else if (d >= CP_A && d <= CP_Z) {
+		/* 'A' - 'Z' -> 10 to 35 */
+		return (d - PI_CONV_UC);
+	} else if (d >= CP_a && d <= CP_z) {
+		/* 'a' - 'z' -> 10 to 35 */
+		return (d - PI_CONV_LC);
+	} else {
+		/* Invalid character code */
+		return (-1);
+	}
+}
+
+
+/*
+ * Test if a value matches the ECMAScript definition of trimmable whitespace.
+ */
+function isSpace(c)
+{
+	return (c === 0x20) ||
+	    (c >= 0x0009 && c <= 0x000d) ||
+	    (c === 0x00a0) ||
+	    (c === 0x1680) ||
+	    (c === 0x180e) ||
+	    (c >= 0x2000 && c <= 0x200a) ||
+	    (c === 0x2028) ||
+	    (c === 0x2029) ||
+	    (c === 0x202f) ||
+	    (c === 0x205f) ||
+	    (c === 0x3000) ||
+	    (c === 0xfeff);
+}
+
+
+/*
+ * Determine which base a character indicates (e.g., 'x' indicates hex).
+ */
+function prefixToBase(c)
+{
+	if (c === CP_b || c === CP_B) {
+		/* 0b/0B (binary) */
+		return (2);
+	} else if (c === CP_o || c === CP_O) {
+		/* 0o/0O (octal) */
+		return (8);
+	} else if (c === CP_t || c === CP_T) {
+		/* 0t/0T (decimal) */
+		return (10);
+	} else if (c === CP_x || c === CP_X) {
+		/* 0x/0X (hexadecimal) */
+		return (16);
+	} else {
+		/* Not a meaningful character */
+		return (-1);
+	}
+}
+
+
 function validateJsonObjectJS(schema, input)
 {
 	var report = mod_jsonschema.validate(input, schema);
@@ -28802,7 +28709,220 @@ function mergeObjects(provided, overrides, defaults)
 	return (rv);
 }
 
-},{"assert":undefined,"extsprintf":159,"json-schema":212,"util":undefined,"verror":291}],216:[function(require,module,exports){
+},{"assert-plus":215,"extsprintf":163,"json-schema":211,"util":undefined,"verror":289}],215:[function(require,module,exports){
+// Copyright (c) 2012, Mark Cavage. All rights reserved.
+// Copyright 2015 Joyent, Inc.
+
+var assert = require('assert');
+var Stream = require('stream').Stream;
+var util = require('util');
+
+
+///--- Globals
+
+/* JSSTYLED */
+var UUID_REGEXP = /^[a-fA-F0-9]{8}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{12}$/;
+
+
+///--- Internal
+
+function _capitalize(str) {
+    return (str.charAt(0).toUpperCase() + str.slice(1));
+}
+
+function _toss(name, expected, oper, arg, actual) {
+    throw new assert.AssertionError({
+        message: util.format('%s (%s) is required', name, expected),
+        actual: (actual === undefined) ? typeof (arg) : actual(arg),
+        expected: expected,
+        operator: oper || '===',
+        stackStartFunction: _toss.caller
+    });
+}
+
+function _getClass(arg) {
+    return (Object.prototype.toString.call(arg).slice(8, -1));
+}
+
+function noop() {
+    // Why even bother with asserts?
+}
+
+
+///--- Exports
+
+var types = {
+    bool: {
+        check: function (arg) { return typeof (arg) === 'boolean'; }
+    },
+    func: {
+        check: function (arg) { return typeof (arg) === 'function'; }
+    },
+    string: {
+        check: function (arg) { return typeof (arg) === 'string'; }
+    },
+    object: {
+        check: function (arg) {
+            return typeof (arg) === 'object' && arg !== null;
+        }
+    },
+    number: {
+        check: function (arg) {
+            return typeof (arg) === 'number' && !isNaN(arg);
+        }
+    },
+    finite: {
+        check: function (arg) {
+            return typeof (arg) === 'number' && !isNaN(arg) && isFinite(arg);
+        }
+    },
+    buffer: {
+        check: function (arg) { return Buffer.isBuffer(arg); },
+        operator: 'Buffer.isBuffer'
+    },
+    array: {
+        check: function (arg) { return Array.isArray(arg); },
+        operator: 'Array.isArray'
+    },
+    stream: {
+        check: function (arg) { return arg instanceof Stream; },
+        operator: 'instanceof',
+        actual: _getClass
+    },
+    date: {
+        check: function (arg) { return arg instanceof Date; },
+        operator: 'instanceof',
+        actual: _getClass
+    },
+    regexp: {
+        check: function (arg) { return arg instanceof RegExp; },
+        operator: 'instanceof',
+        actual: _getClass
+    },
+    uuid: {
+        check: function (arg) {
+            return typeof (arg) === 'string' && UUID_REGEXP.test(arg);
+        },
+        operator: 'isUUID'
+    }
+};
+
+function _setExports(ndebug) {
+    var keys = Object.keys(types);
+    var out;
+
+    /* re-export standard assert */
+    if (process.env.NODE_NDEBUG) {
+        out = noop;
+    } else {
+        out = function (arg, msg) {
+            if (!arg) {
+                _toss(msg, 'true', arg);
+            }
+        };
+    }
+
+    /* standard checks */
+    keys.forEach(function (k) {
+        if (ndebug) {
+            out[k] = noop;
+            return;
+        }
+        var type = types[k];
+        out[k] = function (arg, msg) {
+            if (!type.check(arg)) {
+                _toss(msg, k, type.operator, arg, type.actual);
+            }
+        };
+    });
+
+    /* optional checks */
+    keys.forEach(function (k) {
+        var name = 'optional' + _capitalize(k);
+        if (ndebug) {
+            out[name] = noop;
+            return;
+        }
+        var type = types[k];
+        out[name] = function (arg, msg) {
+            if (arg === undefined || arg === null) {
+                return;
+            }
+            if (!type.check(arg)) {
+                _toss(msg, k, type.operator, arg, type.actual);
+            }
+        };
+    });
+
+    /* arrayOf checks */
+    keys.forEach(function (k) {
+        var name = 'arrayOf' + _capitalize(k);
+        if (ndebug) {
+            out[name] = noop;
+            return;
+        }
+        var type = types[k];
+        var expected = '[' + k + ']';
+        out[name] = function (arg, msg) {
+            if (!Array.isArray(arg)) {
+                _toss(msg, expected, type.operator, arg, type.actual);
+            }
+            var i;
+            for (i = 0; i < arg.length; i++) {
+                if (!type.check(arg[i])) {
+                    _toss(msg, expected, type.operator, arg, type.actual);
+                }
+            }
+        };
+    });
+
+    /* optionalArrayOf checks */
+    keys.forEach(function (k) {
+        var name = 'optionalArrayOf' + _capitalize(k);
+        if (ndebug) {
+            out[name] = noop;
+            return;
+        }
+        var type = types[k];
+        var expected = '[' + k + ']';
+        out[name] = function (arg, msg) {
+            if (arg === undefined || arg === null) {
+                return;
+            }
+            if (!Array.isArray(arg)) {
+                _toss(msg, expected, type.operator, arg, type.actual);
+            }
+            var i;
+            for (i = 0; i < arg.length; i++) {
+                if (!type.check(arg[i])) {
+                    _toss(msg, expected, type.operator, arg, type.actual);
+                }
+            }
+        };
+    });
+
+    /* re-export built-in assertions */
+    Object.keys(assert).forEach(function (k) {
+        if (k === 'AssertionError') {
+            out[k] = assert[k];
+            return;
+        }
+        if (ndebug) {
+            out[k] = noop;
+            return;
+        }
+        out[k] = assert[k];
+    });
+
+    /* export ourselves (for unit tests _only_) */
+    out._setExports = _setExports;
+
+    return out;
+}
+
+module.exports = _setExports(process.env.NODE_NDEBUG);
+
+},{"assert":undefined,"stream":undefined,"util":undefined}],216:[function(require,module,exports){
 /**
  * @license
  * Lodash <https://lodash.com/>
@@ -28817,7 +28937,7 @@ function mergeObjects(provided, overrides, defaults)
   var undefined;
 
   /** Used as the semantic version number. */
-  var VERSION = '4.17.4';
+  var VERSION = '4.17.5';
 
   /** Used as the size to enable large array optimizations. */
   var LARGE_ARRAY_SIZE = 200;
@@ -28948,7 +29068,6 @@ function mergeObjects(provided, overrides, defaults)
   /** Used to match property names within property paths. */
   var reIsDeepProp = /\.|\[(?:[^[\]]*|(["'])(?:(?!\1)[^\\]|\\.)*?\1)\]/,
       reIsPlainProp = /^\w*$/,
-      reLeadingDot = /^\./,
       rePropName = /[^.[\]]+|\[(?:(-?\d+(?:\.\d+)?)|(["'])((?:(?!\2)[^\\]|\\.)*?)\2)\]|(?=(?:\.|\[\])(?:\.|\[\]|$))/g;
 
   /**
@@ -29048,8 +29167,8 @@ function mergeObjects(provided, overrides, defaults)
       reOptMod = rsModifier + '?',
       rsOptVar = '[' + rsVarRange + ']?',
       rsOptJoin = '(?:' + rsZWJ + '(?:' + [rsNonAstral, rsRegional, rsSurrPair].join('|') + ')' + rsOptVar + reOptMod + ')*',
-      rsOrdLower = '\\d*(?:(?:1st|2nd|3rd|(?![123])\\dth)\\b)',
-      rsOrdUpper = '\\d*(?:(?:1ST|2ND|3RD|(?![123])\\dTH)\\b)',
+      rsOrdLower = '\\d*(?:1st|2nd|3rd|(?![123])\\dth)(?=\\b|[A-Z_])',
+      rsOrdUpper = '\\d*(?:1ST|2ND|3RD|(?![123])\\dTH)(?=\\b|[a-z_])',
       rsSeq = rsOptVar + reOptMod + rsOptJoin,
       rsEmoji = '(?:' + [rsDingbat, rsRegional, rsSurrPair].join('|') + ')' + rsSeq,
       rsSymbol = '(?:' + [rsNonAstral + rsCombo + '?', rsCombo, rsRegional, rsSurrPair, rsAstral].join('|') + ')';
@@ -29255,34 +29374,6 @@ function mergeObjects(provided, overrides, defaults)
       nodeIsTypedArray = nodeUtil && nodeUtil.isTypedArray;
 
   /*--------------------------------------------------------------------------*/
-
-  /**
-   * Adds the key-value `pair` to `map`.
-   *
-   * @private
-   * @param {Object} map The map to modify.
-   * @param {Array} pair The key-value pair to add.
-   * @returns {Object} Returns `map`.
-   */
-  function addMapEntry(map, pair) {
-    // Don't return `map.set` because it's not chainable in IE 11.
-    map.set(pair[0], pair[1]);
-    return map;
-  }
-
-  /**
-   * Adds `value` to `set`.
-   *
-   * @private
-   * @param {Object} set The set to modify.
-   * @param {*} value The value to add.
-   * @returns {Object} Returns `set`.
-   */
-  function addSetEntry(set, value) {
-    // Don't return `set.add` because it's not chainable in IE 11.
-    set.add(value);
-    return set;
-  }
 
   /**
    * A faster alternative to `Function#apply`, this function invokes `func`
@@ -30048,6 +30139,20 @@ function mergeObjects(provided, overrides, defaults)
       }
     }
     return result;
+  }
+
+  /**
+   * Gets the value at `key`, unless `key` is "__proto__".
+   *
+   * @private
+   * @param {Object} object The object to query.
+   * @param {string} key The key of the property to get.
+   * @returns {*} Returns the property value.
+   */
+  function safeGet(object, key) {
+    return key == '__proto__'
+      ? undefined
+      : object[key];
   }
 
   /**
@@ -31482,7 +31587,7 @@ function mergeObjects(provided, overrides, defaults)
           if (!cloneableTags[tag]) {
             return object ? value : {};
           }
-          result = initCloneByTag(value, tag, baseClone, isDeep);
+          result = initCloneByTag(value, tag, isDeep);
         }
       }
       // Check for circular references and return its corresponding clone.
@@ -31492,6 +31597,22 @@ function mergeObjects(provided, overrides, defaults)
         return stacked;
       }
       stack.set(value, result);
+
+      if (isSet(value)) {
+        value.forEach(function(subValue) {
+          result.add(baseClone(subValue, bitmask, customizer, subValue, value, stack));
+        });
+
+        return result;
+      }
+
+      if (isMap(value)) {
+        value.forEach(function(subValue, key) {
+          result.set(key, baseClone(subValue, bitmask, customizer, key, value, stack));
+        });
+
+        return result;
+      }
 
       var keysFunc = isFull
         ? (isFlat ? getAllKeysIn : getAllKeys)
@@ -32420,7 +32541,7 @@ function mergeObjects(provided, overrides, defaults)
         }
         else {
           var newValue = customizer
-            ? customizer(object[key], srcValue, (key + ''), object, source, stack)
+            ? customizer(safeGet(object, key), srcValue, (key + ''), object, source, stack)
             : undefined;
 
           if (newValue === undefined) {
@@ -32447,8 +32568,8 @@ function mergeObjects(provided, overrides, defaults)
      *  counterparts.
      */
     function baseMergeDeep(object, source, key, srcIndex, mergeFunc, customizer, stack) {
-      var objValue = object[key],
-          srcValue = source[key],
+      var objValue = safeGet(object, key),
+          srcValue = safeGet(source, key),
           stacked = stack.get(srcValue);
 
       if (stacked) {
@@ -33357,20 +33478,6 @@ function mergeObjects(provided, overrides, defaults)
     }
 
     /**
-     * Creates a clone of `map`.
-     *
-     * @private
-     * @param {Object} map The map to clone.
-     * @param {Function} cloneFunc The function to clone values.
-     * @param {boolean} [isDeep] Specify a deep clone.
-     * @returns {Object} Returns the cloned map.
-     */
-    function cloneMap(map, isDeep, cloneFunc) {
-      var array = isDeep ? cloneFunc(mapToArray(map), CLONE_DEEP_FLAG) : mapToArray(map);
-      return arrayReduce(array, addMapEntry, new map.constructor);
-    }
-
-    /**
      * Creates a clone of `regexp`.
      *
      * @private
@@ -33381,20 +33488,6 @@ function mergeObjects(provided, overrides, defaults)
       var result = new regexp.constructor(regexp.source, reFlags.exec(regexp));
       result.lastIndex = regexp.lastIndex;
       return result;
-    }
-
-    /**
-     * Creates a clone of `set`.
-     *
-     * @private
-     * @param {Object} set The set to clone.
-     * @param {Function} cloneFunc The function to clone values.
-     * @param {boolean} [isDeep] Specify a deep clone.
-     * @returns {Object} Returns the cloned set.
-     */
-    function cloneSet(set, isDeep, cloneFunc) {
-      var array = isDeep ? cloneFunc(setToArray(set), CLONE_DEEP_FLAG) : setToArray(set);
-      return arrayReduce(array, addSetEntry, new set.constructor);
     }
 
     /**
@@ -34991,7 +35084,7 @@ function mergeObjects(provided, overrides, defaults)
      */
     function initCloneArray(array) {
       var length = array.length,
-          result = array.constructor(length);
+          result = new array.constructor(length);
 
       // Add properties assigned by `RegExp#exec`.
       if (length && typeof array[0] == 'string' && hasOwnProperty.call(array, 'index')) {
@@ -35018,16 +35111,15 @@ function mergeObjects(provided, overrides, defaults)
      * Initializes an object clone based on its `toStringTag`.
      *
      * **Note:** This function only supports cloning values with tags of
-     * `Boolean`, `Date`, `Error`, `Number`, `RegExp`, or `String`.
+     * `Boolean`, `Date`, `Error`, `Map`, `Number`, `RegExp`, `Set`, or `String`.
      *
      * @private
      * @param {Object} object The object to clone.
      * @param {string} tag The `toStringTag` of the object to clone.
-     * @param {Function} cloneFunc The function to clone values.
      * @param {boolean} [isDeep] Specify a deep clone.
      * @returns {Object} Returns the initialized clone.
      */
-    function initCloneByTag(object, tag, cloneFunc, isDeep) {
+    function initCloneByTag(object, tag, isDeep) {
       var Ctor = object.constructor;
       switch (tag) {
         case arrayBufferTag:
@@ -35046,7 +35138,7 @@ function mergeObjects(provided, overrides, defaults)
           return cloneTypedArray(object, isDeep);
 
         case mapTag:
-          return cloneMap(object, isDeep, cloneFunc);
+          return new Ctor;
 
         case numberTag:
         case stringTag:
@@ -35056,7 +35148,7 @@ function mergeObjects(provided, overrides, defaults)
           return cloneRegExp(object);
 
         case setTag:
-          return cloneSet(object, isDeep, cloneFunc);
+          return new Ctor;
 
         case symbolTag:
           return cloneSymbol(object);
@@ -35103,10 +35195,13 @@ function mergeObjects(provided, overrides, defaults)
      * @returns {boolean} Returns `true` if `value` is a valid index, else `false`.
      */
     function isIndex(value, length) {
+      var type = typeof value;
       length = length == null ? MAX_SAFE_INTEGER : length;
+
       return !!length &&
-        (typeof value == 'number' || reIsUint.test(value)) &&
-        (value > -1 && value % 1 == 0 && value < length);
+        (type == 'number' ||
+          (type != 'symbol' && reIsUint.test(value))) &&
+            (value > -1 && value % 1 == 0 && value < length);
     }
 
     /**
@@ -35556,11 +35651,11 @@ function mergeObjects(provided, overrides, defaults)
      */
     var stringToPath = memoizeCapped(function(string) {
       var result = [];
-      if (reLeadingDot.test(string)) {
+      if (string.charCodeAt(0) === 46 /* . */) {
         result.push('');
       }
-      string.replace(rePropName, function(match, number, quote, string) {
-        result.push(quote ? string.replace(reEscapeChar, '$1') : (number || match));
+      string.replace(rePropName, function(match, number, quote, subString) {
+        result.push(quote ? subString.replace(reEscapeChar, '$1') : (number || match));
       });
       return result;
     });
@@ -39168,9 +39263,11 @@ function mergeObjects(provided, overrides, defaults)
       function remainingWait(time) {
         var timeSinceLastCall = time - lastCallTime,
             timeSinceLastInvoke = time - lastInvokeTime,
-            result = wait - timeSinceLastCall;
+            timeWaiting = wait - timeSinceLastCall;
 
-        return maxing ? nativeMin(result, maxWait - timeSinceLastInvoke) : result;
+        return maxing
+          ? nativeMin(timeWaiting, maxWait - timeSinceLastInvoke)
+          : timeWaiting;
       }
 
       function shouldInvoke(time) {
@@ -41602,9 +41699,35 @@ function mergeObjects(provided, overrides, defaults)
      * _.defaults({ 'a': 1 }, { 'b': 2 }, { 'a': 3 });
      * // => { 'a': 1, 'b': 2 }
      */
-    var defaults = baseRest(function(args) {
-      args.push(undefined, customDefaultsAssignIn);
-      return apply(assignInWith, undefined, args);
+    var defaults = baseRest(function(object, sources) {
+      object = Object(object);
+
+      var index = -1;
+      var length = sources.length;
+      var guard = length > 2 ? sources[2] : undefined;
+
+      if (guard && isIterateeCall(sources[0], sources[1], guard)) {
+        length = 1;
+      }
+
+      while (++index < length) {
+        var source = sources[index];
+        var props = keysIn(source);
+        var propsIndex = -1;
+        var propsLength = props.length;
+
+        while (++propsIndex < propsLength) {
+          var key = props[propsIndex];
+          var value = object[key];
+
+          if (value === undefined ||
+              (eq(value, objectProto[key]) && !hasOwnProperty.call(object, key))) {
+            object[key] = source[key];
+          }
+        }
+      }
+
+      return object;
     });
 
     /**
@@ -42001,6 +42124,11 @@ function mergeObjects(provided, overrides, defaults)
      * // => { '1': 'c', '2': 'b' }
      */
     var invert = createInverter(function(result, value, key) {
+      if (value != null &&
+          typeof value.toString != 'function') {
+        value = nativeObjectToString.call(value);
+      }
+
       result[value] = key;
     }, constant(identity));
 
@@ -42031,6 +42159,11 @@ function mergeObjects(provided, overrides, defaults)
      * // => { 'group1': ['a', 'c'], 'group2': ['b'] }
      */
     var invertBy = createInverter(function(result, value, key) {
+      if (value != null &&
+          typeof value.toString != 'function') {
+        value = nativeObjectToString.call(value);
+      }
+
       if (hasOwnProperty.call(result, value)) {
         result[value].push(key);
       } else {
@@ -46019,6 +46152,9 @@ module.exports={
   "application/cbor": {
     "source": "iana"
   },
+  "application/cccex": {
+    "source": "iana"
+  },
   "application/ccmp+xml": {
     "source": "iana"
   },
@@ -46203,7 +46339,13 @@ module.exports={
   "application/emergencycalldata.comment+xml": {
     "source": "iana"
   },
+  "application/emergencycalldata.control+xml": {
+    "source": "iana"
+  },
   "application/emergencycalldata.deviceinfo+xml": {
+    "source": "iana"
+  },
+  "application/emergencycalldata.ecall.msd": {
     "source": "iana"
   },
   "application/emergencycalldata.providerinfo+xml": {
@@ -46213,6 +46355,9 @@ module.exports={
     "source": "iana"
   },
   "application/emergencycalldata.subscriberinfo+xml": {
+    "source": "iana"
+  },
+  "application/emergencycalldata.veds+xml": {
     "source": "iana"
   },
   "application/emma+xml": {
@@ -46248,6 +46393,12 @@ module.exports={
   "application/fdt+xml": {
     "source": "iana"
   },
+  "application/fhir+xml": {
+    "source": "iana"
+  },
+  "application/fido.trusted-apps+json": {
+    "compressible": true
+  },
   "application/fits": {
     "source": "iana"
   },
@@ -46263,10 +46414,6 @@ module.exports={
     "compressible": false,
     "extensions": ["woff"]
   },
-  "application/font-woff2": {
-    "compressible": false,
-    "extensions": ["woff2"]
-  },
   "application/framework-attributes+xml": {
     "source": "iana"
   },
@@ -46274,6 +46421,12 @@ module.exports={
     "source": "iana",
     "compressible": true,
     "extensions": ["geojson"]
+  },
+  "application/geo+json-seq": {
+    "source": "iana"
+  },
+  "application/geoxacml+xml": {
+    "source": "iana"
   },
   "application/gml+xml": {
     "source": "iana",
@@ -46289,13 +46442,17 @@ module.exports={
   },
   "application/gzip": {
     "source": "iana",
-    "compressible": false
+    "compressible": false,
+    "extensions": ["gz"]
   },
   "application/h224": {
     "source": "iana"
   },
   "application/held+xml": {
     "source": "iana"
+  },
+  "application/hjson": {
+    "extensions": ["hjson"]
   },
   "application/http": {
     "source": "iana"
@@ -46373,7 +46530,11 @@ module.exports={
     "source": "iana",
     "charset": "UTF-8",
     "compressible": true,
-    "extensions": ["js"]
+    "extensions": ["js","mjs"]
+  },
+  "application/jf2feed+json": {
+    "source": "iana",
+    "compressible": true
   },
   "application/jose": {
     "source": "iana"
@@ -46559,6 +46720,9 @@ module.exports={
   "application/mikey": {
     "source": "iana"
   },
+  "application/mmt-usd+xml": {
+    "source": "iana"
+  },
   "application/mods+xml": {
     "source": "iana",
     "extensions": ["mods"]
@@ -46617,6 +46781,12 @@ module.exports={
     "source": "iana",
     "extensions": ["mxf"]
   },
+  "application/n-quads": {
+    "source": "iana"
+  },
+  "application/n-triples": {
+    "source": "iana"
+  },
   "application/nasdata": {
     "source": "iana"
   },
@@ -46630,6 +46800,9 @@ module.exports={
     "source": "iana"
   },
   "application/nlsml+xml": {
+    "source": "iana"
+  },
+  "application/node": {
     "source": "iana"
   },
   "application/nss": {
@@ -46678,6 +46851,9 @@ module.exports={
     "source": "iana"
   },
   "application/parityfec": {
+    "source": "iana"
+  },
+  "application/passport": {
     "source": "iana"
   },
   "application/patch-ops-error+xml": {
@@ -46732,6 +46908,9 @@ module.exports={
   "application/pkcs8": {
     "source": "iana",
     "extensions": ["p8"]
+  },
+  "application/pkcs8-encrypted": {
+    "source": "iana"
   },
   "application/pkix-attr-cert": {
     "source": "iana",
@@ -46808,6 +46987,10 @@ module.exports={
   "application/qsig": {
     "source": "iana"
   },
+  "application/raml+yaml": {
+    "compressible": true,
+    "extensions": ["raml"]
+  },
   "application/raptorfec": {
     "source": "iana"
   },
@@ -46856,6 +47039,15 @@ module.exports={
     "source": "iana",
     "extensions": ["rs"]
   },
+  "application/route-apd+xml": {
+    "source": "iana"
+  },
+  "application/route-s-tsid+xml": {
+    "source": "iana"
+  },
+  "application/route-usd+xml": {
+    "source": "iana"
+  },
   "application/rpki-ghostbusters": {
     "source": "iana",
     "extensions": ["gbr"]
@@ -46863,6 +47055,9 @@ module.exports={
   "application/rpki-manifest": {
     "source": "iana",
     "extensions": ["mft"]
+  },
+  "application/rpki-publication": {
+    "source": "iana"
   },
   "application/rpki-roa": {
     "source": "iana",
@@ -47081,6 +47276,9 @@ module.exports={
     "source": "iana",
     "extensions": ["tsd"]
   },
+  "application/tnauthlist": {
+    "source": "iana"
+  },
   "application/trig": {
     "source": "iana"
   },
@@ -47118,16 +47316,43 @@ module.exports={
   "application/vividence.scriptfile": {
     "source": "apache"
   },
+  "application/vnd.1000minds.decision-model+xml": {
+    "source": "iana"
+  },
   "application/vnd.3gpp-prose+xml": {
     "source": "iana"
   },
   "application/vnd.3gpp-prose-pc3ch+xml": {
     "source": "iana"
   },
+  "application/vnd.3gpp-v2x-local-service-information": {
+    "source": "iana"
+  },
   "application/vnd.3gpp.access-transfer-events+xml": {
     "source": "iana"
   },
   "application/vnd.3gpp.bsf+xml": {
+    "source": "iana"
+  },
+  "application/vnd.3gpp.gmop+xml": {
+    "source": "iana"
+  },
+  "application/vnd.3gpp.mcptt-affiliation-command+xml": {
+    "source": "iana"
+  },
+  "application/vnd.3gpp.mcptt-floor-request+xml": {
+    "source": "iana"
+  },
+  "application/vnd.3gpp.mcptt-info+xml": {
+    "source": "iana"
+  },
+  "application/vnd.3gpp.mcptt-location-info+xml": {
+    "source": "iana"
+  },
+  "application/vnd.3gpp.mcptt-mbms-usage-info+xml": {
+    "source": "iana"
+  },
+  "application/vnd.3gpp.mcptt-signed+xml": {
     "source": "iana"
   },
   "application/vnd.3gpp.mid-call+xml": {
@@ -47240,6 +47465,10 @@ module.exports={
     "source": "iana",
     "extensions": ["azs"]
   },
+  "application/vnd.amadeus+json": {
+    "source": "iana",
+    "compressible": true
+  },
   "application/vnd.amazon.ebook": {
     "source": "apache",
     "extensions": ["azw"]
@@ -47291,6 +47520,10 @@ module.exports={
     "source": "iana",
     "compressible": true
   },
+  "application/vnd.apothekende.reservation+json": {
+    "source": "iana",
+    "compressible": true
+  },
   "application/vnd.apple.installer+xml": {
     "source": "iana",
     "extensions": ["mpkg"]
@@ -47324,6 +47557,10 @@ module.exports={
   "application/vnd.autopackage": {
     "source": "iana"
   },
+  "application/vnd.avalon+json": {
+    "source": "iana",
+    "compressible": true
+  },
   "application/vnd.avistar+xml": {
     "source": "iana"
   },
@@ -47333,11 +47570,24 @@ module.exports={
   "application/vnd.balsamiq.bmpr": {
     "source": "iana"
   },
+  "application/vnd.bbf.usp.msg": {
+    "source": "iana"
+  },
+  "application/vnd.bbf.usp.msg+json": {
+    "source": "iana",
+    "compressible": true
+  },
   "application/vnd.bekitzur-stech+json": {
     "source": "iana",
     "compressible": true
   },
+  "application/vnd.bint.med-content": {
+    "source": "iana"
+  },
   "application/vnd.biopax.rdf+xml": {
+    "source": "iana"
+  },
+  "application/vnd.blink-idb-value-wrapper": {
     "source": "iana"
   },
   "application/vnd.blueice.multipass": {
@@ -47366,6 +47616,10 @@ module.exports={
   },
   "application/vnd.canon-lips": {
     "source": "iana"
+  },
+  "application/vnd.capasystems-pg+json": {
+    "source": "iana",
+    "compressible": true
   },
   "application/vnd.cendio.thinlinc.clientconf": {
     "source": "iana"
@@ -47417,6 +47671,24 @@ module.exports={
   "application/vnd.coffeescript": {
     "source": "iana"
   },
+  "application/vnd.collabio.xodocuments.document": {
+    "source": "iana"
+  },
+  "application/vnd.collabio.xodocuments.document-template": {
+    "source": "iana"
+  },
+  "application/vnd.collabio.xodocuments.presentation": {
+    "source": "iana"
+  },
+  "application/vnd.collabio.xodocuments.presentation-template": {
+    "source": "iana"
+  },
+  "application/vnd.collabio.xodocuments.spreadsheet": {
+    "source": "iana"
+  },
+  "application/vnd.collabio.xodocuments.spreadsheet-template": {
+    "source": "iana"
+  },
   "application/vnd.collection+json": {
     "source": "iana",
     "compressible": true
@@ -47430,6 +47702,9 @@ module.exports={
     "compressible": true
   },
   "application/vnd.comicbook+zip": {
+    "source": "iana"
+  },
+  "application/vnd.comicbook-rar": {
     "source": "iana"
   },
   "application/vnd.commerce-battelle": {
@@ -47526,6 +47801,10 @@ module.exports={
   "application/vnd.data-vision.rdz": {
     "source": "iana",
     "extensions": ["rdz"]
+  },
+  "application/vnd.datapackage+json": {
+    "source": "iana",
+    "compressible": true
   },
   "application/vnd.dataresource+json": {
     "source": "iana",
@@ -47687,6 +47966,9 @@ module.exports={
   "application/vnd.ecdis-update": {
     "source": "iana"
   },
+  "application/vnd.ecip.rlp": {
+    "source": "iana"
+  },
   "application/vnd.ecowin.chart": {
     "source": "iana",
     "extensions": ["mag"]
@@ -47704,6 +47986,12 @@ module.exports={
     "source": "iana"
   },
   "application/vnd.ecowin.seriesupdate": {
+    "source": "iana"
+  },
+  "application/vnd.efi.img": {
+    "source": "iana"
+  },
+  "application/vnd.efi.iso": {
     "source": "iana"
   },
   "application/vnd.emclient.accessrequest+xml": {
@@ -47816,6 +48104,15 @@ module.exports={
     "source": "iana"
   },
   "application/vnd.eudora.data": {
+    "source": "iana"
+  },
+  "application/vnd.evolv.ecig.profile": {
+    "source": "iana"
+  },
+  "application/vnd.evolv.ecig.settings": {
+    "source": "iana"
+  },
+  "application/vnd.evolv.ecig.theme": {
     "source": "iana"
   },
   "application/vnd.ezpix-album": {
@@ -48113,6 +48410,10 @@ module.exports={
     "source": "iana",
     "extensions": ["sfd-hdstx"]
   },
+  "application/vnd.hyper-item+json": {
+    "source": "iana",
+    "compressible": true
+  },
   "application/vnd.hyperdrive+json": {
     "source": "iana",
     "compressible": true
@@ -48152,6 +48453,12 @@ module.exports={
   "application/vnd.igloader": {
     "source": "iana",
     "extensions": ["igl"]
+  },
+  "application/vnd.imagemeter.folder+zip": {
+    "source": "iana"
+  },
+  "application/vnd.imagemeter.image+zip": {
+    "source": "iana"
   },
   "application/vnd.immervision-ivp": {
     "source": "iana",
@@ -48371,6 +48678,10 @@ module.exports={
     "source": "iana",
     "extensions": ["sse"]
   },
+  "application/vnd.las.las+json": {
+    "source": "iana",
+    "compressible": true
+  },
   "application/vnd.las.las+xml": {
     "source": "iana",
     "extensions": ["lasxml"]
@@ -48476,6 +48787,9 @@ module.exports={
     "extensions": ["igx"]
   },
   "application/vnd.microsoft.portable-executable": {
+    "source": "iana"
+  },
+  "application/vnd.microsoft.windows.thumbnail-cache": {
     "source": "iana"
   },
   "application/vnd.miele+json": {
@@ -48622,6 +48936,10 @@ module.exports={
   "application/vnd.ms-opentype": {
     "source": "apache",
     "compressible": true
+  },
+  "application/vnd.ms-outlook": {
+    "compressible": false,
+    "extensions": ["msg"]
   },
   "application/vnd.ms-package.obfuscated-opentype": {
     "source": "apache"
@@ -48950,6 +49268,9 @@ module.exports={
   "application/vnd.obn": {
     "source": "iana"
   },
+  "application/vnd.ocf+cbor": {
+    "source": "iana"
+  },
   "application/vnd.oftn.l10n+json": {
     "source": "iana",
     "compressible": true
@@ -49119,6 +49440,21 @@ module.exports={
   "application/vnd.onepager": {
     "source": "iana"
   },
+  "application/vnd.onepagertamp": {
+    "source": "iana"
+  },
+  "application/vnd.onepagertamx": {
+    "source": "iana"
+  },
+  "application/vnd.onepagertat": {
+    "source": "iana"
+  },
+  "application/vnd.onepagertatp": {
+    "source": "iana"
+  },
+  "application/vnd.onepagertatx": {
+    "source": "iana"
+  },
   "application/vnd.openblox.game+xml": {
     "source": "iana"
   },
@@ -49163,9 +49499,6 @@ module.exports={
     "source": "iana"
   },
   "application/vnd.openxmlformats-officedocument.extended-properties+xml": {
-    "source": "iana"
-  },
-  "application/vnd.openxmlformats-officedocument.presentationml-template": {
     "source": "iana"
   },
   "application/vnd.openxmlformats-officedocument.presentationml.commentauthors+xml": {
@@ -49224,16 +49557,13 @@ module.exports={
     "source": "iana"
   },
   "application/vnd.openxmlformats-officedocument.presentationml.template": {
-    "source": "apache",
+    "source": "iana",
     "extensions": ["potx"]
   },
   "application/vnd.openxmlformats-officedocument.presentationml.template.main+xml": {
     "source": "iana"
   },
   "application/vnd.openxmlformats-officedocument.presentationml.viewprops+xml": {
-    "source": "iana"
-  },
-  "application/vnd.openxmlformats-officedocument.spreadsheetml-template": {
     "source": "iana"
   },
   "application/vnd.openxmlformats-officedocument.spreadsheetml.calcchain+xml": {
@@ -49296,7 +49626,7 @@ module.exports={
     "source": "iana"
   },
   "application/vnd.openxmlformats-officedocument.spreadsheetml.template": {
-    "source": "apache",
+    "source": "iana",
     "extensions": ["xltx"]
   },
   "application/vnd.openxmlformats-officedocument.spreadsheetml.template.main+xml": {
@@ -49318,9 +49648,6 @@ module.exports={
     "source": "iana"
   },
   "application/vnd.openxmlformats-officedocument.vmldrawing": {
-    "source": "iana"
-  },
-  "application/vnd.openxmlformats-officedocument.wordprocessingml-template": {
     "source": "iana"
   },
   "application/vnd.openxmlformats-officedocument.wordprocessingml.comments+xml": {
@@ -49359,7 +49686,7 @@ module.exports={
     "source": "iana"
   },
   "application/vnd.openxmlformats-officedocument.wordprocessingml.template": {
-    "source": "apache",
+    "source": "iana",
     "extensions": ["dotx"]
   },
   "application/vnd.openxmlformats-officedocument.wordprocessingml.template.main+xml": {
@@ -49424,6 +49751,9 @@ module.exports={
   },
   "application/vnd.paos.xml": {
     "source": "apache"
+  },
+  "application/vnd.patentdive": {
+    "source": "iana"
   },
   "application/vnd.pawaafile": {
     "source": "iana",
@@ -49584,6 +49914,10 @@ module.exports={
   "application/vnd.renlearn.rlprint": {
     "source": "iana"
   },
+  "application/vnd.restful+json": {
+    "source": "iana",
+    "compressible": true
+  },
   "application/vnd.rig.cryptonote": {
     "source": "iana",
     "extensions": ["cryptonote"]
@@ -49691,6 +50025,9 @@ module.exports={
     "source": "iana",
     "extensions": ["ipk"]
   },
+  "application/vnd.sigrok.session": {
+    "source": "iana"
+  },
   "application/vnd.simtech-mindmapper": {
     "source": "iana",
     "extensions": ["twd","twds"]
@@ -49727,6 +50064,9 @@ module.exports={
   "application/vnd.spotfire.sfs": {
     "source": "iana",
     "extensions": ["sfs"]
+  },
+  "application/vnd.sqlite3": {
+    "source": "iana"
   },
   "application/vnd.sss-cod": {
     "source": "iana"
@@ -49773,7 +50113,9 @@ module.exports={
     "source": "iana"
   },
   "application/vnd.sun.wadl+xml": {
-    "source": "iana"
+    "source": "iana",
+    "compressible": true,
+    "extensions": ["wadl"]
   },
   "application/vnd.sun.xml.calc": {
     "source": "apache",
@@ -50151,6 +50493,9 @@ module.exports={
     "source": "iana",
     "extensions": ["cmp"]
   },
+  "application/vnd.youtube.yt": {
+    "source": "iana"
+  },
   "application/vnd.zul": {
     "source": "iana",
     "extensions": ["zir","zirz"]
@@ -50163,11 +50508,23 @@ module.exports={
     "source": "iana",
     "extensions": ["vxml"]
   },
+  "application/voucher-cms+json": {
+    "source": "iana",
+    "compressible": true
+  },
   "application/vq-rtcpxr": {
     "source": "iana"
   },
+  "application/wasm": {
+    "compressible": true,
+    "extensions": ["wasm"]
+  },
   "application/watcherinfo+xml": {
     "source": "iana"
+  },
+  "application/webpush-options+json": {
+    "source": "iana",
+    "compressible": true
   },
   "application/whoispp-query": {
     "source": "iana"
@@ -50216,6 +50573,10 @@ module.exports={
   "application/x-apple-diskimage": {
     "source": "apache",
     "extensions": ["dmg"]
+  },
+  "application/x-arj": {
+    "compressible": false,
+    "extensions": ["arj"]
   },
   "application/x-authorware-bin": {
     "source": "apache",
@@ -50362,11 +50723,6 @@ module.exports={
     "source": "apache",
     "extensions": ["psf"]
   },
-  "application/x-font-otf": {
-    "source": "apache",
-    "compressible": true,
-    "extensions": ["otf"]
-  },
   "application/x-font-pcf": {
     "source": "apache",
     "extensions": ["pcf"]
@@ -50380,11 +50736,6 @@ module.exports={
   },
   "application/x-font-sunos-news": {
     "source": "apache"
-  },
-  "application/x-font-ttf": {
-    "source": "apache",
-    "compressible": true,
-    "extensions": ["ttf","ttc"]
   },
   "application/x-font-type1": {
     "source": "apache",
@@ -50679,6 +51030,38 @@ module.exports={
   "application/x-ustar": {
     "source": "apache",
     "extensions": ["ustar"]
+  },
+  "application/x-virtualbox-hdd": {
+    "compressible": true,
+    "extensions": ["hdd"]
+  },
+  "application/x-virtualbox-ova": {
+    "compressible": true,
+    "extensions": ["ova"]
+  },
+  "application/x-virtualbox-ovf": {
+    "compressible": true,
+    "extensions": ["ovf"]
+  },
+  "application/x-virtualbox-vbox": {
+    "compressible": true,
+    "extensions": ["vbox"]
+  },
+  "application/x-virtualbox-vbox-extpack": {
+    "compressible": false,
+    "extensions": ["vbox-extpack"]
+  },
+  "application/x-virtualbox-vdi": {
+    "compressible": true,
+    "extensions": ["vdi"]
+  },
+  "application/x-virtualbox-vhd": {
+    "compressible": true,
+    "extensions": ["vhd"]
+  },
+  "application/x-virtualbox-vmdk": {
+    "compressible": true,
+    "extensions": ["vmdk"]
   },
   "application/x-wais-source": {
     "source": "apache",
@@ -51047,6 +51430,18 @@ module.exports={
   "audio/lpc": {
     "source": "iana"
   },
+  "audio/melp": {
+    "source": "iana"
+  },
+  "audio/melp1200": {
+    "source": "iana"
+  },
+  "audio/melp2400": {
+    "source": "iana"
+  },
+  "audio/melp600": {
+    "source": "iana"
+  },
   "audio/midi": {
     "source": "apache",
     "extensions": ["mid","midi","kar","rmi"]
@@ -51286,6 +51681,9 @@ module.exports={
   "audio/vnd.octel.sbc": {
     "source": "iana"
   },
+  "audio/vnd.presonus.multitrack": {
+    "source": "iana"
+  },
   "audio/vnd.qcelp": {
     "source": "iana"
   },
@@ -51416,9 +51814,36 @@ module.exports={
     "source": "apache",
     "extensions": ["xyz"]
   },
-  "font/opentype": {
+  "font/collection": {
+    "source": "iana",
+    "extensions": ["ttc"]
+  },
+  "font/otf": {
+    "source": "iana",
     "compressible": true,
     "extensions": ["otf"]
+  },
+  "font/sfnt": {
+    "source": "iana"
+  },
+  "font/ttf": {
+    "source": "iana",
+    "extensions": ["ttf"]
+  },
+  "font/woff": {
+    "source": "iana",
+    "extensions": ["woff"]
+  },
+  "font/woff2": {
+    "source": "iana",
+    "extensions": ["woff2"]
+  },
+  "image/aces": {
+    "source": "iana"
+  },
+  "image/apng": {
+    "compressible": false,
+    "extensions": ["apng"]
   },
   "image/bmp": {
     "source": "iana",
@@ -51455,7 +51880,9 @@ module.exports={
     "source": "iana"
   },
   "image/jp2": {
-    "source": "iana"
+    "source": "iana",
+    "compressible": false,
+    "extensions": ["jp2","jpg2"]
   },
   "image/jpeg": {
     "source": "iana",
@@ -51463,10 +51890,14 @@ module.exports={
     "extensions": ["jpeg","jpg","jpe"]
   },
   "image/jpm": {
-    "source": "iana"
+    "source": "iana",
+    "compressible": false,
+    "extensions": ["jpm"]
   },
   "image/jpx": {
-    "source": "iana"
+    "source": "iana",
+    "compressible": false,
+    "extensions": ["jpx","jpf"]
   },
   "image/ktx": {
     "source": "iana",
@@ -51715,7 +52146,10 @@ module.exports={
     "source": "iana"
   },
   "message/disposition-notification": {
-    "source": "iana"
+    "source": "iana",
+    "extensions": [
+      "disposition-notification"
+    ]
   },
   "message/external-body": {
     "source": "iana"
@@ -51724,16 +52158,20 @@ module.exports={
     "source": "iana"
   },
   "message/global": {
-    "source": "iana"
+    "source": "iana",
+    "extensions": ["u8msg"]
   },
   "message/global-delivery-status": {
-    "source": "iana"
+    "source": "iana",
+    "extensions": ["u8dsn"]
   },
   "message/global-disposition-notification": {
-    "source": "iana"
+    "source": "iana",
+    "extensions": ["u8mdn"]
   },
   "message/global-headers": {
-    "source": "iana"
+    "source": "iana",
+    "extensions": ["u8hdr"]
   },
   "message/http": {
     "source": "iana",
@@ -51771,11 +52209,21 @@ module.exports={
     "source": "iana"
   },
   "message/vnd.wfa.wsc": {
+    "source": "iana",
+    "extensions": ["wsc"]
+  },
+  "model/3mf": {
     "source": "iana"
   },
   "model/gltf+json": {
     "source": "iana",
-    "compressible": true
+    "compressible": true,
+    "extensions": ["gltf"]
+  },
+  "model/gltf-binary": {
+    "source": "iana",
+    "compressible": true,
+    "extensions": ["glb"]
   },
   "model/iges": {
     "source": "iana",
@@ -51892,6 +52340,9 @@ module.exports={
     "source": "iana",
     "compressible": false
   },
+  "multipart/multilingual": {
+    "source": "iana"
+  },
   "multipart/parallel": {
     "source": "iana"
   },
@@ -51905,6 +52356,9 @@ module.exports={
   "multipart/signed": {
     "source": "iana",
     "compressible": false
+  },
+  "multipart/vnd.bint.med-plus": {
+    "source": "iana"
   },
   "multipart/voice-message": {
     "source": "iana"
@@ -51935,6 +52389,7 @@ module.exports={
   },
   "text/css": {
     "source": "iana",
+    "charset": "UTF-8",
     "compressible": true,
     "extensions": ["css"]
   },
@@ -51967,9 +52422,6 @@ module.exports={
   "text/grammar-ref-list": {
     "source": "iana"
   },
-  "text/hjson": {
-    "extensions": ["hjson"]
-  },
   "text/html": {
     "source": "iana",
     "compressible": true,
@@ -51993,7 +52445,9 @@ module.exports={
     "extensions": ["less"]
   },
   "text/markdown": {
-    "source": "iana"
+    "source": "iana",
+    "compressible": true,
+    "extensions": ["markdown","md"]
   },
   "text/mathml": {
     "source": "nginx",
@@ -52063,8 +52517,14 @@ module.exports={
     "source": "iana",
     "extensions": ["sgml","sgm"]
   },
+  "text/shex": {
+    "extensions": ["shex"]
+  },
   "text/slim": {
     "extensions": ["slim","slm"]
+  },
+  "text/strings": {
+    "source": "iana"
   },
   "text/stylus": {
     "extensions": ["stylus","styl"]
@@ -52240,7 +52700,7 @@ module.exports={
   },
   "text/x-markdown": {
     "compressible": true,
-    "extensions": ["markdown","md","mkd"]
+    "extensions": ["mkd"]
   },
   "text/x-nfo": {
     "source": "apache",
@@ -52249,6 +52709,10 @@ module.exports={
   "text/x-opml": {
     "source": "apache",
     "extensions": ["opml"]
+  },
+  "text/x-org": {
+    "compressible": true,
+    "extensions": ["org"]
   },
   "text/x-pascal": {
     "source": "apache",
@@ -52300,266 +52764,272 @@ module.exports={
     "extensions": ["yaml","yml"]
   },
   "video/1d-interleaved-parityfec": {
-    "source": "apache"
+    "source": "iana"
   },
   "video/3gpp": {
-    "source": "apache",
+    "source": "iana",
     "extensions": ["3gp","3gpp"]
   },
   "video/3gpp-tt": {
-    "source": "apache"
+    "source": "iana"
   },
   "video/3gpp2": {
-    "source": "apache",
+    "source": "iana",
     "extensions": ["3g2"]
   },
   "video/bmpeg": {
-    "source": "apache"
+    "source": "iana"
   },
   "video/bt656": {
-    "source": "apache"
+    "source": "iana"
   },
   "video/celb": {
-    "source": "apache"
+    "source": "iana"
   },
   "video/dv": {
-    "source": "apache"
+    "source": "iana"
   },
   "video/encaprtp": {
-    "source": "apache"
+    "source": "iana"
   },
   "video/h261": {
-    "source": "apache",
+    "source": "iana",
     "extensions": ["h261"]
   },
   "video/h263": {
-    "source": "apache",
+    "source": "iana",
     "extensions": ["h263"]
   },
   "video/h263-1998": {
-    "source": "apache"
+    "source": "iana"
   },
   "video/h263-2000": {
-    "source": "apache"
+    "source": "iana"
   },
   "video/h264": {
-    "source": "apache",
+    "source": "iana",
     "extensions": ["h264"]
   },
   "video/h264-rcdo": {
-    "source": "apache"
+    "source": "iana"
   },
   "video/h264-svc": {
-    "source": "apache"
+    "source": "iana"
   },
   "video/h265": {
-    "source": "apache"
+    "source": "iana"
   },
   "video/iso.segment": {
-    "source": "apache"
+    "source": "iana"
   },
   "video/jpeg": {
-    "source": "apache",
+    "source": "iana",
     "extensions": ["jpgv"]
   },
   "video/jpeg2000": {
-    "source": "apache"
+    "source": "iana"
   },
   "video/jpm": {
     "source": "apache",
     "extensions": ["jpm","jpgm"]
   },
   "video/mj2": {
-    "source": "apache",
+    "source": "iana",
     "extensions": ["mj2","mjp2"]
   },
   "video/mp1s": {
-    "source": "apache"
+    "source": "iana"
   },
   "video/mp2p": {
-    "source": "apache"
+    "source": "iana"
   },
   "video/mp2t": {
-    "source": "apache",
+    "source": "iana",
     "extensions": ["ts"]
   },
   "video/mp4": {
-    "source": "apache",
+    "source": "iana",
     "compressible": false,
     "extensions": ["mp4","mp4v","mpg4"]
   },
   "video/mp4v-es": {
-    "source": "apache"
+    "source": "iana"
   },
   "video/mpeg": {
-    "source": "apache",
+    "source": "iana",
     "compressible": false,
     "extensions": ["mpeg","mpg","mpe","m1v","m2v"]
   },
   "video/mpeg4-generic": {
-    "source": "apache"
+    "source": "iana"
   },
   "video/mpv": {
-    "source": "apache"
+    "source": "iana"
   },
   "video/nv": {
-    "source": "apache"
+    "source": "iana"
   },
   "video/ogg": {
-    "source": "apache",
+    "source": "iana",
     "compressible": false,
     "extensions": ["ogv"]
   },
   "video/parityfec": {
-    "source": "apache"
+    "source": "iana"
   },
   "video/pointer": {
-    "source": "apache"
+    "source": "iana"
   },
   "video/quicktime": {
-    "source": "apache",
+    "source": "iana",
     "compressible": false,
     "extensions": ["qt","mov"]
   },
   "video/raptorfec": {
-    "source": "apache"
+    "source": "iana"
   },
   "video/raw": {
-    "source": "apache"
+    "source": "iana"
   },
   "video/rtp-enc-aescm128": {
-    "source": "apache"
+    "source": "iana"
   },
   "video/rtploopback": {
-    "source": "apache"
+    "source": "iana"
   },
   "video/rtx": {
-    "source": "apache"
+    "source": "iana"
+  },
+  "video/smpte291": {
+    "source": "iana"
   },
   "video/smpte292m": {
-    "source": "apache"
+    "source": "iana"
   },
   "video/ulpfec": {
-    "source": "apache"
+    "source": "iana"
   },
   "video/vc1": {
-    "source": "apache"
+    "source": "iana"
   },
   "video/vnd.cctv": {
-    "source": "apache"
+    "source": "iana"
   },
   "video/vnd.dece.hd": {
-    "source": "apache",
+    "source": "iana",
     "extensions": ["uvh","uvvh"]
   },
   "video/vnd.dece.mobile": {
-    "source": "apache",
+    "source": "iana",
     "extensions": ["uvm","uvvm"]
   },
   "video/vnd.dece.mp4": {
-    "source": "apache"
+    "source": "iana"
   },
   "video/vnd.dece.pd": {
-    "source": "apache",
+    "source": "iana",
     "extensions": ["uvp","uvvp"]
   },
   "video/vnd.dece.sd": {
-    "source": "apache",
+    "source": "iana",
     "extensions": ["uvs","uvvs"]
   },
   "video/vnd.dece.video": {
-    "source": "apache",
+    "source": "iana",
     "extensions": ["uvv","uvvv"]
   },
   "video/vnd.directv.mpeg": {
-    "source": "apache"
+    "source": "iana"
   },
   "video/vnd.directv.mpeg-tts": {
-    "source": "apache"
+    "source": "iana"
   },
   "video/vnd.dlna.mpeg-tts": {
-    "source": "apache"
+    "source": "iana"
   },
   "video/vnd.dvb.file": {
-    "source": "apache",
+    "source": "iana",
     "extensions": ["dvb"]
   },
   "video/vnd.fvt": {
-    "source": "apache",
+    "source": "iana",
     "extensions": ["fvt"]
   },
   "video/vnd.hns.video": {
-    "source": "apache"
+    "source": "iana"
   },
   "video/vnd.iptvforum.1dparityfec-1010": {
-    "source": "apache"
+    "source": "iana"
   },
   "video/vnd.iptvforum.1dparityfec-2005": {
-    "source": "apache"
+    "source": "iana"
   },
   "video/vnd.iptvforum.2dparityfec-1010": {
-    "source": "apache"
+    "source": "iana"
   },
   "video/vnd.iptvforum.2dparityfec-2005": {
-    "source": "apache"
+    "source": "iana"
   },
   "video/vnd.iptvforum.ttsavc": {
-    "source": "apache"
+    "source": "iana"
   },
   "video/vnd.iptvforum.ttsmpeg2": {
-    "source": "apache"
+    "source": "iana"
   },
   "video/vnd.motorola.video": {
-    "source": "apache"
+    "source": "iana"
   },
   "video/vnd.motorola.videop": {
-    "source": "apache"
+    "source": "iana"
   },
   "video/vnd.mpegurl": {
-    "source": "apache",
+    "source": "iana",
     "extensions": ["mxu","m4u"]
   },
   "video/vnd.ms-playready.media.pyv": {
-    "source": "apache",
+    "source": "iana",
     "extensions": ["pyv"]
   },
   "video/vnd.nokia.interleaved-multimedia": {
-    "source": "apache"
+    "source": "iana"
+  },
+  "video/vnd.nokia.mp4vr": {
+    "source": "iana"
   },
   "video/vnd.nokia.videovoip": {
-    "source": "apache"
+    "source": "iana"
   },
   "video/vnd.objectvideo": {
-    "source": "apache"
+    "source": "iana"
   },
   "video/vnd.radgamettools.bink": {
-    "source": "apache"
+    "source": "iana"
   },
   "video/vnd.radgamettools.smacker": {
-    "source": "apache"
+    "source": "iana"
   },
   "video/vnd.sealed.mpeg1": {
-    "source": "apache"
+    "source": "iana"
   },
   "video/vnd.sealed.mpeg4": {
-    "source": "apache"
+    "source": "iana"
   },
   "video/vnd.sealed.swf": {
-    "source": "apache"
+    "source": "iana"
   },
   "video/vnd.sealedmedia.softseal.mov": {
-    "source": "apache"
+    "source": "iana"
   },
   "video/vnd.uvvu.mp4": {
-    "source": "apache",
+    "source": "iana",
     "extensions": ["uvu","uvvu"]
   },
   "video/vnd.vivo": {
-    "source": "apache",
+    "source": "iana",
     "extensions": ["viv"]
   },
   "video/vp8": {
-    "source": "apache"
+    "source": "iana"
   },
   "video/webm": {
     "source": "apache",
@@ -52677,8 +53147,8 @@ var extname = require('path').extname
  * @private
  */
 
-var extractTypeRegExp = /^\s*([^;\s]*)(?:;|\s|$)/
-var textTypeRegExp = /^text\//i
+var EXTRACT_TYPE_REGEXP = /^\s*([^;\s]*)(?:;|\s|$)/
+var TEXT_TYPE_REGEXP = /^text\//i
 
 /**
  * Module exports.
@@ -52709,7 +53179,7 @@ function charset (type) {
   }
 
   // TODO: use media-typer
-  var match = extractTypeRegExp.exec(type)
+  var match = EXTRACT_TYPE_REGEXP.exec(type)
   var mime = match && db[match[1].toLowerCase()]
 
   if (mime && mime.charset) {
@@ -52717,7 +53187,7 @@ function charset (type) {
   }
 
   // default text/* to utf-8
-  if (match && textTypeRegExp.test(match[1])) {
+  if (match && TEXT_TYPE_REGEXP.test(match[1])) {
     return 'UTF-8'
   }
 
@@ -52767,7 +53237,7 @@ function extension (type) {
   }
 
   // TODO: use media-typer
-  var match = extractTypeRegExp.exec(type)
+  var match = EXTRACT_TYPE_REGEXP.exec(type)
 
   // get extensions
   var exts = match && exports.extensions[match[1].toLowerCase()]
@@ -52832,7 +53302,7 @@ function populateMaps (extensions, types) {
         var to = preference.indexOf(mime.source)
 
         if (types[extension] !== 'application/octet-stream' &&
-          from > to || (from === to && types[extension].substr(0, 12) === 'application/')) {
+          (from > to || (from === to && types[extension].substr(0, 12) === 'application/'))) {
           // skip the remapping
           continue
         }
@@ -52849,11 +53319,11 @@ function populateMaps (extensions, types) {
  * Helpers.
  */
 
-var s = 1000
-var m = s * 60
-var h = m * 60
-var d = h * 24
-var y = d * 365.25
+var s = 1000;
+var m = s * 60;
+var h = m * 60;
+var d = h * 24;
+var y = d * 365.25;
 
 /**
  * Parse or format the given `val`.
@@ -52863,24 +53333,25 @@ var y = d * 365.25
  *  - `long` verbose formatting [false]
  *
  * @param {String|Number} val
- * @param {Object} options
+ * @param {Object} [options]
  * @throws {Error} throw an error if val is not a non-empty string or a number
  * @return {String|Number}
  * @api public
  */
 
-module.exports = function (val, options) {
-  options = options || {}
-  var type = typeof val
+module.exports = function(val, options) {
+  options = options || {};
+  var type = typeof val;
   if (type === 'string' && val.length > 0) {
-    return parse(val)
+    return parse(val);
   } else if (type === 'number' && isNaN(val) === false) {
-    return options.long ?
-			fmtLong(val) :
-			fmtShort(val)
+    return options.long ? fmtLong(val) : fmtShort(val);
   }
-  throw new Error('val is not a non-empty string or a valid number. val=' + JSON.stringify(val))
-}
+  throw new Error(
+    'val is not a non-empty string or a valid number. val=' +
+      JSON.stringify(val)
+  );
+};
 
 /**
  * Parse the given `str` and return milliseconds.
@@ -52891,53 +53362,55 @@ module.exports = function (val, options) {
  */
 
 function parse(str) {
-  str = String(str)
-  if (str.length > 10000) {
-    return
+  str = String(str);
+  if (str.length > 100) {
+    return;
   }
-  var match = /^((?:\d+)?\.?\d+) *(milliseconds?|msecs?|ms|seconds?|secs?|s|minutes?|mins?|m|hours?|hrs?|h|days?|d|years?|yrs?|y)?$/i.exec(str)
+  var match = /^((?:\d+)?\.?\d+) *(milliseconds?|msecs?|ms|seconds?|secs?|s|minutes?|mins?|m|hours?|hrs?|h|days?|d|years?|yrs?|y)?$/i.exec(
+    str
+  );
   if (!match) {
-    return
+    return;
   }
-  var n = parseFloat(match[1])
-  var type = (match[2] || 'ms').toLowerCase()
+  var n = parseFloat(match[1]);
+  var type = (match[2] || 'ms').toLowerCase();
   switch (type) {
     case 'years':
     case 'year':
     case 'yrs':
     case 'yr':
     case 'y':
-      return n * y
+      return n * y;
     case 'days':
     case 'day':
     case 'd':
-      return n * d
+      return n * d;
     case 'hours':
     case 'hour':
     case 'hrs':
     case 'hr':
     case 'h':
-      return n * h
+      return n * h;
     case 'minutes':
     case 'minute':
     case 'mins':
     case 'min':
     case 'm':
-      return n * m
+      return n * m;
     case 'seconds':
     case 'second':
     case 'secs':
     case 'sec':
     case 's':
-      return n * s
+      return n * s;
     case 'milliseconds':
     case 'millisecond':
     case 'msecs':
     case 'msec':
     case 'ms':
-      return n
+      return n;
     default:
-      return undefined
+      return undefined;
   }
 }
 
@@ -52951,18 +53424,18 @@ function parse(str) {
 
 function fmtShort(ms) {
   if (ms >= d) {
-    return Math.round(ms / d) + 'd'
+    return Math.round(ms / d) + 'd';
   }
   if (ms >= h) {
-    return Math.round(ms / h) + 'h'
+    return Math.round(ms / h) + 'h';
   }
   if (ms >= m) {
-    return Math.round(ms / m) + 'm'
+    return Math.round(ms / m) + 'm';
   }
   if (ms >= s) {
-    return Math.round(ms / s) + 's'
+    return Math.round(ms / s) + 's';
   }
-  return ms + 'ms'
+  return ms + 'ms';
 }
 
 /**
@@ -52978,7 +53451,7 @@ function fmtLong(ms) {
     plural(ms, h, 'hour') ||
     plural(ms, m, 'minute') ||
     plural(ms, s, 'second') ||
-    ms + ' ms'
+    ms + ' ms';
 }
 
 /**
@@ -52987,15 +53460,289 @@ function fmtLong(ms) {
 
 function plural(ms, n, name) {
   if (ms < n) {
-    return
+    return;
   }
   if (ms < n * 1.5) {
-    return Math.floor(ms / n) + ' ' + name
+    return Math.floor(ms / n) + ' ' + name;
   }
-  return Math.ceil(ms / n) + ' ' + name + 's'
+  return Math.ceil(ms / n) + ' ' + name + 's';
 }
 
 },{}],221:[function(require,module,exports){
+//     uuid.js
+//
+//     Copyright (c) 2010-2012 Robert Kieffer
+//     MIT License - http://opensource.org/licenses/mit-license.php
+
+/*global window, require, define */
+(function(_window) {
+  'use strict';
+
+  // Unique ID creation requires a high quality random # generator.  We feature
+  // detect to determine the best RNG source, normalizing to a function that
+  // returns 128-bits of randomness, since that's what's usually required
+  var _rng, _mathRNG, _nodeRNG, _whatwgRNG, _previousRoot;
+
+  function setupBrowser() {
+    // Allow for MSIE11 msCrypto
+    var _crypto = _window.crypto || _window.msCrypto;
+
+    if (!_rng && _crypto && _crypto.getRandomValues) {
+      // WHATWG crypto-based RNG - http://wiki.whatwg.org/wiki/Crypto
+      //
+      // Moderately fast, high quality
+      try {
+        var _rnds8 = new Uint8Array(16);
+        _whatwgRNG = _rng = function whatwgRNG() {
+          _crypto.getRandomValues(_rnds8);
+          return _rnds8;
+        };
+        _rng();
+      } catch(e) {}
+    }
+
+    if (!_rng) {
+      // Math.random()-based (RNG)
+      //
+      // If all else fails, use Math.random().  It's fast, but is of unspecified
+      // quality.
+      var  _rnds = new Array(16);
+      _mathRNG = _rng = function() {
+        for (var i = 0, r; i < 16; i++) {
+          if ((i & 0x03) === 0) { r = Math.random() * 0x100000000; }
+          _rnds[i] = r >>> ((i & 0x03) << 3) & 0xff;
+        }
+
+        return _rnds;
+      };
+      if ('undefined' !== typeof console && console.warn) {
+        console.warn("[SECURITY] node-uuid: crypto not usable, falling back to insecure Math.random()");
+      }
+    }
+  }
+
+  function setupNode() {
+    // Node.js crypto-based RNG - http://nodejs.org/docs/v0.6.2/api/crypto.html
+    //
+    // Moderately fast, high quality
+    if ('function' === typeof require) {
+      try {
+        var _rb = require('crypto').randomBytes;
+        _nodeRNG = _rng = _rb && function() {return _rb(16);};
+        _rng();
+      } catch(e) {}
+    }
+  }
+
+  if (_window) {
+    setupBrowser();
+  } else {
+    setupNode();
+  }
+
+  // Buffer class to use
+  var BufferClass = ('function' === typeof Buffer) ? Buffer : Array;
+
+  // Maps for number <-> hex string conversion
+  var _byteToHex = [];
+  var _hexToByte = {};
+  for (var i = 0; i < 256; i++) {
+    _byteToHex[i] = (i + 0x100).toString(16).substr(1);
+    _hexToByte[_byteToHex[i]] = i;
+  }
+
+  // **`parse()` - Parse a UUID into it's component bytes**
+  function parse(s, buf, offset) {
+    var i = (buf && offset) || 0, ii = 0;
+
+    buf = buf || [];
+    s.toLowerCase().replace(/[0-9a-f]{2}/g, function(oct) {
+      if (ii < 16) { // Don't overflow!
+        buf[i + ii++] = _hexToByte[oct];
+      }
+    });
+
+    // Zero out remaining bytes if string was short
+    while (ii < 16) {
+      buf[i + ii++] = 0;
+    }
+
+    return buf;
+  }
+
+  // **`unparse()` - Convert UUID byte array (ala parse()) into a string**
+  function unparse(buf, offset) {
+    var i = offset || 0, bth = _byteToHex;
+    return  bth[buf[i++]] + bth[buf[i++]] +
+            bth[buf[i++]] + bth[buf[i++]] + '-' +
+            bth[buf[i++]] + bth[buf[i++]] + '-' +
+            bth[buf[i++]] + bth[buf[i++]] + '-' +
+            bth[buf[i++]] + bth[buf[i++]] + '-' +
+            bth[buf[i++]] + bth[buf[i++]] +
+            bth[buf[i++]] + bth[buf[i++]] +
+            bth[buf[i++]] + bth[buf[i++]];
+  }
+
+  // **`v1()` - Generate time-based UUID**
+  //
+  // Inspired by https://github.com/LiosK/UUID.js
+  // and http://docs.python.org/library/uuid.html
+
+  // random #'s we need to init node and clockseq
+  var _seedBytes = _rng();
+
+  // Per 4.5, create and 48-bit node id, (47 random bits + multicast bit = 1)
+  var _nodeId = [
+    _seedBytes[0] | 0x01,
+    _seedBytes[1], _seedBytes[2], _seedBytes[3], _seedBytes[4], _seedBytes[5]
+  ];
+
+  // Per 4.2.2, randomize (14 bit) clockseq
+  var _clockseq = (_seedBytes[6] << 8 | _seedBytes[7]) & 0x3fff;
+
+  // Previous uuid creation time
+  var _lastMSecs = 0, _lastNSecs = 0;
+
+  // See https://github.com/broofa/node-uuid for API details
+  function v1(options, buf, offset) {
+    var i = buf && offset || 0;
+    var b = buf || [];
+
+    options = options || {};
+
+    var clockseq = (options.clockseq != null) ? options.clockseq : _clockseq;
+
+    // UUID timestamps are 100 nano-second units since the Gregorian epoch,
+    // (1582-10-15 00:00).  JSNumbers aren't precise enough for this, so
+    // time is handled internally as 'msecs' (integer milliseconds) and 'nsecs'
+    // (100-nanoseconds offset from msecs) since unix epoch, 1970-01-01 00:00.
+    var msecs = (options.msecs != null) ? options.msecs : new Date().getTime();
+
+    // Per 4.2.1.2, use count of uuid's generated during the current clock
+    // cycle to simulate higher resolution clock
+    var nsecs = (options.nsecs != null) ? options.nsecs : _lastNSecs + 1;
+
+    // Time since last uuid creation (in msecs)
+    var dt = (msecs - _lastMSecs) + (nsecs - _lastNSecs)/10000;
+
+    // Per 4.2.1.2, Bump clockseq on clock regression
+    if (dt < 0 && options.clockseq == null) {
+      clockseq = clockseq + 1 & 0x3fff;
+    }
+
+    // Reset nsecs if clock regresses (new clockseq) or we've moved onto a new
+    // time interval
+    if ((dt < 0 || msecs > _lastMSecs) && options.nsecs == null) {
+      nsecs = 0;
+    }
+
+    // Per 4.2.1.2 Throw error if too many uuids are requested
+    if (nsecs >= 10000) {
+      throw new Error('uuid.v1(): Can\'t create more than 10M uuids/sec');
+    }
+
+    _lastMSecs = msecs;
+    _lastNSecs = nsecs;
+    _clockseq = clockseq;
+
+    // Per 4.1.4 - Convert from unix epoch to Gregorian epoch
+    msecs += 12219292800000;
+
+    // `time_low`
+    var tl = ((msecs & 0xfffffff) * 10000 + nsecs) % 0x100000000;
+    b[i++] = tl >>> 24 & 0xff;
+    b[i++] = tl >>> 16 & 0xff;
+    b[i++] = tl >>> 8 & 0xff;
+    b[i++] = tl & 0xff;
+
+    // `time_mid`
+    var tmh = (msecs / 0x100000000 * 10000) & 0xfffffff;
+    b[i++] = tmh >>> 8 & 0xff;
+    b[i++] = tmh & 0xff;
+
+    // `time_high_and_version`
+    b[i++] = tmh >>> 24 & 0xf | 0x10; // include version
+    b[i++] = tmh >>> 16 & 0xff;
+
+    // `clock_seq_hi_and_reserved` (Per 4.2.2 - include variant)
+    b[i++] = clockseq >>> 8 | 0x80;
+
+    // `clock_seq_low`
+    b[i++] = clockseq & 0xff;
+
+    // `node`
+    var node = options.node || _nodeId;
+    for (var n = 0; n < 6; n++) {
+      b[i + n] = node[n];
+    }
+
+    return buf ? buf : unparse(b);
+  }
+
+  // **`v4()` - Generate random UUID**
+
+  // See https://github.com/broofa/node-uuid for API details
+  function v4(options, buf, offset) {
+    // Deprecated - 'format' argument, as supported in v1.2
+    var i = buf && offset || 0;
+
+    if (typeof(options) === 'string') {
+      buf = (options === 'binary') ? new BufferClass(16) : null;
+      options = null;
+    }
+    options = options || {};
+
+    var rnds = options.random || (options.rng || _rng)();
+
+    // Per 4.4, set bits for version and `clock_seq_hi_and_reserved`
+    rnds[6] = (rnds[6] & 0x0f) | 0x40;
+    rnds[8] = (rnds[8] & 0x3f) | 0x80;
+
+    // Copy bytes to buffer, if provided
+    if (buf) {
+      for (var ii = 0; ii < 16; ii++) {
+        buf[i + ii] = rnds[ii];
+      }
+    }
+
+    return buf || unparse(rnds);
+  }
+
+  // Export public API
+  var uuid = v4;
+  uuid.v1 = v1;
+  uuid.v4 = v4;
+  uuid.parse = parse;
+  uuid.unparse = unparse;
+  uuid.BufferClass = BufferClass;
+  uuid._rng = _rng;
+  uuid._mathRNG = _mathRNG;
+  uuid._nodeRNG = _nodeRNG;
+  uuid._whatwgRNG = _whatwgRNG;
+
+  if (('undefined' !== typeof module) && module.exports) {
+    // Publish as node.js module
+    module.exports = uuid;
+  } else if (typeof define === 'function' && define.amd) {
+    // Publish as AMD module
+    define(function() {return uuid;});
+
+
+  } else {
+    // Publish as global (in browsers)
+    _previousRoot = _window.uuid;
+
+    // **`noConflict()` - (browser only) to reset global 'uuid' var**
+    uuid.noConflict = function() {
+      _window.uuid = _previousRoot;
+      return uuid;
+    };
+
+    _window.uuid = uuid;
+  }
+})('undefined' !== typeof window ? window : null);
+
+},{"crypto":undefined}],222:[function(require,module,exports){
 var crypto = require('crypto')
   , qs = require('querystring')
   ;
@@ -53133,7 +53880,7 @@ exports.rfc3986 = rfc3986
 exports.generateBase = generateBase
 
 
-},{"crypto":undefined,"querystring":undefined}],222:[function(require,module,exports){
+},{"crypto":undefined,"querystring":undefined}],223:[function(require,module,exports){
 /*!
  * Copyright(c) 2011 Einar Otto Stangvik <einaros@gmail.com>
  * MIT Licensed
@@ -53221,12 +53968,12 @@ function Options(defaults) {
 
 module.exports = Options;
 
-},{"fs":undefined}],223:[function(require,module,exports){
+},{"fs":undefined}],224:[function(require,module,exports){
 'use strict';
 
 module.exports = typeof Promise === 'function' ? Promise : require('pinkie');
 
-},{"pinkie":224}],224:[function(require,module,exports){
+},{"pinkie":225}],225:[function(require,module,exports){
 'use strict';
 
 var PENDING = 'pending';
@@ -53520,7 +54267,7 @@ Promise.reject = function (reason) {
 
 module.exports = Promise;
 
-},{}],225:[function(require,module,exports){
+},{}],226:[function(require,module,exports){
 'use strict';
 
 var replace = String.prototype.replace;
@@ -53540,7 +54287,7 @@ module.exports = {
     RFC3986: 'RFC3986'
 };
 
-},{}],226:[function(require,module,exports){
+},{}],227:[function(require,module,exports){
 'use strict';
 
 var stringify = require('./stringify');
@@ -53553,7 +54300,7 @@ module.exports = {
     stringify: stringify
 };
 
-},{"./formats":225,"./parse":227,"./stringify":228}],227:[function(require,module,exports){
+},{"./formats":226,"./parse":228,"./stringify":229}],228:[function(require,module,exports){
 'use strict';
 
 var utils = require('./utils');
@@ -53572,7 +54319,7 @@ var defaults = {
     strictNullHandling: false
 };
 
-var parseValues = function parseValues(str, options) {
+var parseValues = function parseQueryStringValues(str, options) {
     var obj = {};
     var parts = str.split(options.delimiter, options.parameterLimit === Infinity ? undefined : options.parameterLimit);
 
@@ -53598,7 +54345,7 @@ var parseValues = function parseValues(str, options) {
     return obj;
 };
 
-var parseObject = function parseObject(chain, val, options) {
+var parseObject = function parseObjectRecursive(chain, val, options) {
     if (!chain.length) {
         return val;
     }
@@ -53611,7 +54358,7 @@ var parseObject = function parseObject(chain, val, options) {
         obj = obj.concat(parseObject(chain, val, options));
     } else {
         obj = options.plainObjects ? Object.create(null) : {};
-        var cleanRoot = root[0] === '[' && root[root.length - 1] === ']' ? root.slice(1, root.length - 1) : root;
+        var cleanRoot = root.charAt(0) === '[' && root.charAt(root.length - 1) === ']' ? root.slice(1, -1) : root;
         var index = parseInt(cleanRoot, 10);
         if (
             !isNaN(index) &&
@@ -53630,36 +54377,37 @@ var parseObject = function parseObject(chain, val, options) {
     return obj;
 };
 
-var parseKeys = function parseKeys(givenKey, val, options) {
+var parseKeys = function parseQueryStringKeys(givenKey, val, options) {
     if (!givenKey) {
         return;
     }
 
     // Transform dot notation to bracket notation
-    var key = options.allowDots ? givenKey.replace(/\.([^\.\[]+)/g, '[$1]') : givenKey;
+    var key = options.allowDots ? givenKey.replace(/\.([^.[]+)/g, '[$1]') : givenKey;
 
     // The regex chunks
 
-    var parent = /^([^\[\]]*)/;
-    var child = /(\[[^\[\]]*\])/g;
+    var brackets = /(\[[^[\]]*])/;
+    var child = /(\[[^[\]]*])/g;
 
     // Get the parent
 
-    var segment = parent.exec(key);
+    var segment = brackets.exec(key);
+    var parent = segment ? key.slice(0, segment.index) : key;
 
     // Stash the parent if it exists
 
     var keys = [];
-    if (segment[1]) {
+    if (parent) {
         // If we aren't using plain objects, optionally prefix keys
         // that would overwrite object prototype properties
-        if (!options.plainObjects && has.call(Object.prototype, segment[1])) {
+        if (!options.plainObjects && has.call(Object.prototype, parent)) {
             if (!options.allowPrototypes) {
                 return;
             }
         }
 
-        keys.push(segment[1]);
+        keys.push(parent);
     }
 
     // Loop through children appending to the array until we hit depth
@@ -53667,9 +54415,9 @@ var parseKeys = function parseKeys(givenKey, val, options) {
     var i = 0;
     while ((segment = child.exec(key)) !== null && i < options.depth) {
         i += 1;
-        if (!options.plainObjects && has.call(Object.prototype, segment[1].replace(/\[|\]/g, ''))) {
+        if (!options.plainObjects && has.call(Object.prototype, segment[1].slice(1, -1))) {
             if (!options.allowPrototypes) {
-                continue;
+                return;
             }
         }
         keys.push(segment[1]);
@@ -53721,20 +54469,20 @@ module.exports = function (str, opts) {
     return utils.compact(obj);
 };
 
-},{"./utils":229}],228:[function(require,module,exports){
+},{"./utils":230}],229:[function(require,module,exports){
 'use strict';
 
 var utils = require('./utils');
 var formats = require('./formats');
 
 var arrayPrefixGenerators = {
-    brackets: function brackets(prefix) {
+    brackets: function brackets(prefix) { // eslint-disable-line func-name-matching
         return prefix + '[]';
     },
-    indices: function indices(prefix, key) {
+    indices: function indices(prefix, key) { // eslint-disable-line func-name-matching
         return prefix + '[' + key + ']';
     },
-    repeat: function repeat(prefix) {
+    repeat: function repeat(prefix) { // eslint-disable-line func-name-matching
         return prefix;
     }
 };
@@ -53745,14 +54493,26 @@ var defaults = {
     delimiter: '&',
     encode: true,
     encoder: utils.encode,
-    serializeDate: function serializeDate(date) {
+    serializeDate: function serializeDate(date) { // eslint-disable-line func-name-matching
         return toISO.call(date);
     },
     skipNulls: false,
     strictNullHandling: false
 };
 
-var stringify = function stringify(object, prefix, generateArrayPrefix, strictNullHandling, skipNulls, encoder, filter, sort, allowDots, serializeDate, formatter) {
+var stringify = function stringify( // eslint-disable-line func-name-matching
+    object,
+    prefix,
+    generateArrayPrefix,
+    strictNullHandling,
+    skipNulls,
+    encoder,
+    filter,
+    sort,
+    allowDots,
+    serializeDate,
+    formatter
+) {
     var obj = object;
     if (typeof filter === 'function') {
         obj = filter(prefix, obj);
@@ -53831,6 +54591,11 @@ var stringify = function stringify(object, prefix, generateArrayPrefix, strictNu
 module.exports = function (object, opts) {
     var obj = object;
     var options = opts || {};
+
+    if (options.encoder !== null && options.encoder !== undefined && typeof options.encoder !== 'function') {
+        throw new TypeError('Encoder has to be a function.');
+    }
+
     var delimiter = typeof options.delimiter === 'undefined' ? defaults.delimiter : options.delimiter;
     var strictNullHandling = typeof options.strictNullHandling === 'boolean' ? options.strictNullHandling : defaults.strictNullHandling;
     var skipNulls = typeof options.skipNulls === 'boolean' ? options.skipNulls : defaults.skipNulls;
@@ -53847,10 +54612,6 @@ module.exports = function (object, opts) {
     var formatter = formats.formatters[options.format];
     var objKeys;
     var filter;
-
-    if (options.encoder !== null && options.encoder !== undefined && typeof options.encoder !== 'function') {
-        throw new TypeError('Encoder has to be a function.');
-    }
 
     if (typeof options.filter === 'function') {
         filter = options.filter;
@@ -53910,7 +54671,7 @@ module.exports = function (object, opts) {
     return keys.join(delimiter);
 };
 
-},{"./formats":225,"./utils":229}],229:[function(require,module,exports){
+},{"./formats":226,"./utils":230}],230:[function(require,module,exports){
 'use strict';
 
 var has = Object.prototype.hasOwnProperty;
@@ -53944,7 +54705,9 @@ exports.merge = function (target, source, options) {
         if (Array.isArray(target)) {
             target.push(source);
         } else if (typeof target === 'object') {
-            target[source] = true;
+            if (options.plainObjects || options.allowPrototypes || !has.call(Object.prototype, source)) {
+                target[source] = true;
+            }
         } else {
             return [target, source];
         }
@@ -54039,7 +54802,7 @@ exports.encode = function (str) {
 
         i += 1;
         c = 0x10000 + (((c & 0x3FF) << 10) | (string.charCodeAt(i) & 0x3FF));
-        out += hexTable[0xF0 | (c >> 18)] + hexTable[0x80 | ((c >> 12) & 0x3F)] + hexTable[0x80 | ((c >> 6) & 0x3F)] + hexTable[0x80 | (c & 0x3F)];
+        out += hexTable[0xF0 | (c >> 18)] + hexTable[0x80 | ((c >> 12) & 0x3F)] + hexTable[0x80 | ((c >> 6) & 0x3F)] + hexTable[0x80 | (c & 0x3F)]; // eslint-disable-line max-len
     }
 
     return out;
@@ -54092,7 +54855,7 @@ exports.isBuffer = function (obj) {
     return !!(obj.constructor && obj.constructor.isBuffer && obj.constructor.isBuffer(obj));
 };
 
-},{}],230:[function(require,module,exports){
+},{}],231:[function(require,module,exports){
 // Copyright 2010-2012 Mikeal Rogers
 //
 //    Licensed under the Apache License, Version 2.0 (the "License");
@@ -54250,11 +55013,11 @@ Object.defineProperty(request, 'debug', {
   }
 })
 
-},{"./lib/cookies":232,"./lib/helpers":235,"./request":241,"extend":158}],231:[function(require,module,exports){
+},{"./lib/cookies":233,"./lib/helpers":236,"./request":242,"extend":162}],232:[function(require,module,exports){
 'use strict'
 
 var caseless = require('caseless')
-  , uuid = require('uuid')
+  , uuid = require('node-uuid')
   , helpers = require('./helpers')
 
 var md5 = helpers.md5
@@ -54420,7 +55183,7 @@ Auth.prototype.onResponse = function (response) {
 
 exports.Auth = Auth
 
-},{"./helpers":235,"caseless":135,"uuid":286}],232:[function(require,module,exports){
+},{"./helpers":236,"caseless":137,"node-uuid":221}],233:[function(require,module,exports){
 'use strict'
 
 var tough = require('tough-cookie')
@@ -54461,7 +55224,7 @@ exports.jar = function(store) {
   return new RequestJar(store)
 }
 
-},{"tough-cookie":273}],233:[function(require,module,exports){
+},{"tough-cookie":275}],234:[function(require,module,exports){
 'use strict'
 
 function formatHostname(hostname) {
@@ -54542,7 +55305,7 @@ function getProxyFromURI(uri) {
 
 module.exports = getProxyFromURI
 
-},{}],234:[function(require,module,exports){
+},{}],235:[function(require,module,exports){
 'use strict'
 
 var fs = require('fs')
@@ -54759,7 +55522,7 @@ Har.prototype.options = function (options) {
 
 exports.Har = Har
 
-},{"extend":158,"fs":undefined,"har-validator":166,"querystring":undefined}],235:[function(require,module,exports){
+},{"extend":162,"fs":undefined,"har-validator":170,"querystring":undefined}],236:[function(require,module,exports){
 'use strict'
 
 var jsonSafeStringify = require('json-stringify-safe')
@@ -54826,10 +55589,10 @@ exports.copy                  = copy
 exports.version               = version
 exports.defer                 = defer
 
-},{"crypto":undefined,"json-stringify-safe":213}],236:[function(require,module,exports){
+},{"crypto":undefined,"json-stringify-safe":212}],237:[function(require,module,exports){
 'use strict'
 
-var uuid = require('uuid')
+var uuid = require('node-uuid')
   , CombinedStream = require('combined-stream')
   , isstream = require('isstream')
 
@@ -54940,13 +55703,13 @@ Multipart.prototype.onRequest = function (options) {
 
 exports.Multipart = Multipart
 
-},{"combined-stream":146,"isstream":204,"uuid":286}],237:[function(require,module,exports){
+},{"combined-stream":148,"isstream":209,"node-uuid":221}],238:[function(require,module,exports){
 'use strict'
 
 var url = require('url')
   , qs = require('qs')
   , caseless = require('caseless')
-  , uuid = require('uuid')
+  , uuid = require('node-uuid')
   , oauth = require('oauth-sign')
   , crypto = require('crypto')
 
@@ -55089,7 +55852,7 @@ OAuth.prototype.onRequest = function (_oauth) {
 
 exports.OAuth = OAuth
 
-},{"caseless":135,"crypto":undefined,"oauth-sign":221,"qs":226,"url":undefined,"uuid":286}],238:[function(require,module,exports){
+},{"caseless":137,"crypto":undefined,"node-uuid":221,"oauth-sign":222,"qs":227,"url":undefined}],239:[function(require,module,exports){
 'use strict'
 
 var qs = require('qs')
@@ -55142,7 +55905,7 @@ Querystring.prototype.unescape = querystring.unescape
 
 exports.Querystring = Querystring
 
-},{"qs":226,"querystring":undefined}],239:[function(require,module,exports){
+},{"qs":227,"querystring":undefined}],240:[function(require,module,exports){
 'use strict'
 
 var url = require('url')
@@ -55153,7 +55916,6 @@ function Redirect (request) {
   this.followRedirect = true
   this.followRedirects = true
   this.followAllRedirects = false
-  this.followOriginalHttpMethod = false
   this.allowRedirect = function () {return true}
   this.maxRedirects = 10
   this.redirects = []
@@ -55181,9 +55943,6 @@ Redirect.prototype.onRequest = function (options) {
   }
   if (options.removeRefererHeader !== undefined) {
     self.removeRefererHeader = options.removeRefererHeader
-  }
-  if (options.followOriginalHttpMethod !== undefined) {
-    self.followOriginalHttpMethod = options.followOriginalHttpMethod
   }
 }
 
@@ -55264,7 +56023,7 @@ Redirect.prototype.onResponse = function (response) {
   )
   if (self.followAllRedirects && request.method !== 'HEAD'
     && response.statusCode !== 401 && response.statusCode !== 307) {
-    request.method = self.followOriginalHttpMethod ? request.method : 'GET'
+    request.method = 'GET'
   }
   // request.method = 'GET' // Force all redirects to use GET || commented out fixes #215
   delete request.src
@@ -55301,7 +56060,7 @@ Redirect.prototype.onResponse = function (response) {
 
 exports.Redirect = Redirect
 
-},{"url":undefined}],240:[function(require,module,exports){
+},{"url":undefined}],241:[function(require,module,exports){
 'use strict'
 
 var url = require('url')
@@ -55479,7 +56238,7 @@ Tunnel.defaultProxyHeaderWhiteList = defaultProxyHeaderWhiteList
 Tunnel.defaultProxyHeaderExclusiveList = defaultProxyHeaderExclusiveList
 exports.Tunnel = Tunnel
 
-},{"tunnel-agent":280,"url":undefined}],241:[function(require,module,exports){
+},{"tunnel-agent":282,"url":undefined}],242:[function(require,module,exports){
 'use strict'
 
 var http = require('http')
@@ -56248,59 +57007,38 @@ Request.prototype.start = function () {
     self.emit('drain')
   })
   self.req.on('socket', function(socket) {
-    var setReqTimeout = function() {
-      // This timeout sets the amount of time to wait *between* bytes sent
-      // from the server once connected.
-      //
-      // In particular, it's useful for erroring if the server fails to send
-      // data halfway through streaming a response.
-      self.req.setTimeout(timeout, function () {
-        if (self.req) {
-          self.abort()
-          var e = new Error('ESOCKETTIMEDOUT')
-          e.code = 'ESOCKETTIMEDOUT'
-          e.connect = false
-          self.emit('error', e)
-        }
-      })
-    }
-    // `._connecting` was the old property which was made public in node v6.1.0
-    var isConnecting = socket._connecting || socket.connecting
     if (timeout !== undefined) {
-      // Only start the connection timer if we're actually connecting a new
-      // socket, otherwise if we're already connected (because this is a
-      // keep-alive connection) do not bother. This is important since we won't
-      // get a 'connect' event for an already connected socket.
-      if (isConnecting) {
-        var onReqSockConnect = function() {
-          socket.removeListener('connect', onReqSockConnect)
-          clearTimeout(self.timeoutTimer)
-          self.timeoutTimer = null
-          setReqTimeout()
-        }
-
-        socket.on('connect', onReqSockConnect)
-
-        self.req.on('error', function(err) {
-          socket.removeListener('connect', onReqSockConnect)
+      socket.once('connect', function() {
+        clearTimeout(self.timeoutTimer)
+        self.timeoutTimer = null
+        // Set an additional timeout on the socket, via the `setsockopt` syscall.
+        // This timeout sets the amount of time to wait *between* bytes sent
+        // from the server once connected.
+        //
+        // In particular, it's useful for erroring if the server fails to send
+        // data halfway through streaming a response.
+        self.req.setTimeout(timeout, function () {
+          if (self.req) {
+            self.abort()
+            var e = new Error('ESOCKETTIMEDOUT')
+            e.code = 'ESOCKETTIMEDOUT'
+            e.connect = false
+            self.emit('error', e)
+          }
         })
+      })
 
-        // Set a timeout in memory - this block will throw if the server takes more
-        // than `timeout` to write the HTTP status and headers (corresponding to
-        // the on('response') event on the client). NB: this measures wall-clock
-        // time, not the time between bytes sent by the server.
-        self.timeoutTimer = setTimeout(function () {
-          socket.removeListener('connect', onReqSockConnect)
-          self.abort()
-          var e = new Error('ETIMEDOUT')
-          e.code = 'ETIMEDOUT'
-          e.connect = true
-          self.emit('error', e)
-        }, timeout)
-      } else {
-        // We're already connected
-        setReqTimeout()
-      }
+      // Set a timeout in memory - this block will throw if the server takes more
+      // than `timeout` to write the HTTP status and headers (corresponding to
+      // the on('response') event on the client). NB: this measures wall-clock
+      // time, not the time between bytes sent by the server.
+      self.timeoutTimer = setTimeout(function () {
+        self.abort()
+        var e = new Error('ETIMEDOUT')
+        e.code = 'ETIMEDOUT'
+        e.connect = true
+        self.emit('error', e)
+      }, timeout)
     }
     self.emit('socket', socket)
   })
@@ -56774,14 +57512,10 @@ Request.prototype.aws = function (opts, now) {
     }
     var signRes = aws4.sign(options, {
       accessKeyId: opts.key,
-      secretAccessKey: opts.secret,
-      sessionToken: opts.session
+      secretAccessKey: opts.secret
     })
     self.setHeader('authorization', signRes.headers.Authorization)
     self.setHeader('x-amz-date', signRes.headers['X-Amz-Date'])
-    if (signRes.headers['X-Amz-Security-Token']) {
-      self.setHeader('x-amz-security-token', signRes.headers['X-Amz-Security-Token'])
-    }
   }
   else {
     // default: use aws-sign2
@@ -56956,9 +57690,9 @@ Request.defaultProxyHeaderExclusiveList =
 Request.prototype.toJSON = requestToJSON
 module.exports = Request
 
-},{"./lib/auth":231,"./lib/cookies":232,"./lib/getProxyFromURI":233,"./lib/har":234,"./lib/helpers":235,"./lib/multipart":236,"./lib/oauth":237,"./lib/querystring":238,"./lib/redirect":239,"./lib/tunnel":240,"aws-sign2":91,"aws4":92,"caseless":135,"extend":158,"forever-agent":160,"form-data":161,"hawk":186,"http":undefined,"http-signature":192,"https":undefined,"is-typedarray":203,"isstream":204,"mime-types":219,"stream":undefined,"stringstream":272,"url":undefined,"util":undefined,"zlib":undefined}],242:[function(require,module,exports){
+},{"./lib/auth":232,"./lib/cookies":233,"./lib/getProxyFromURI":234,"./lib/har":235,"./lib/helpers":236,"./lib/multipart":237,"./lib/oauth":238,"./lib/querystring":239,"./lib/redirect":240,"./lib/tunnel":241,"aws-sign2":93,"aws4":94,"caseless":137,"extend":162,"forever-agent":164,"form-data":165,"hawk":190,"http":undefined,"http-signature":196,"https":undefined,"is-typedarray":208,"isstream":209,"mime-types":219,"stream":undefined,"stringstream":274,"url":undefined,"util":undefined,"zlib":undefined}],243:[function(require,module,exports){
 module.exports = require('./lib/retry');
-},{"./lib/retry":243}],243:[function(require,module,exports){
+},{"./lib/retry":244}],244:[function(require,module,exports){
 var RetryOperation = require('./retry_operation');
 
 exports.operation = function(options) {
@@ -57055,7 +57789,7 @@ exports.wrap = function(obj, options, methods) {
   }
 };
 
-},{"./retry_operation":244}],244:[function(require,module,exports){
+},{"./retry_operation":245}],245:[function(require,module,exports){
 function RetryOperation(timeouts, options) {
   // Compatibility for the old (timeouts, retryForever) signature
   if (typeof options === 'boolean') {
@@ -57191,9 +57925,9 @@ RetryOperation.prototype.mainError = function() {
   return mainError;
 };
 
-},{}],245:[function(require,module,exports){
+},{}],246:[function(require,module,exports){
 module.exports = require('./lib');
-},{"./lib":246}],246:[function(require,module,exports){
+},{"./lib":247}],247:[function(require,module,exports){
 // Load modules
 
 var Dgram = require('dgram');
@@ -57607,7 +58341,7 @@ internals.ignore = function () {
 
 };
 
-},{"dgram":undefined,"dns":undefined,"hoek":191}],247:[function(require,module,exports){
+},{"dgram":undefined,"dns":undefined,"hoek":195}],248:[function(require,module,exports){
 // Copyright 2015 Joyent, Inc.
 
 var algInfo = {
@@ -57624,9 +58358,8 @@ var algInfo = {
 		sizePart: 'Q'
 	},
 	'ed25519': {
-		parts: ['R'],
-		normalize: false,
-		sizePart: 'R'
+		parts: ['A'],
+		sizePart: 'A'
 	}
 };
 algInfo['curve25519'] = algInfo['ed25519'];
@@ -57642,8 +58375,7 @@ var algPrivInfo = {
 		parts: ['curve', 'Q', 'd']
 	},
 	'ed25519': {
-		parts: ['R', 'r'],
-		normalize: false
+		parts: ['A', 'k']
 	}
 };
 algPrivInfo['curve25519'] = algPrivInfo['ed25519'];
@@ -57777,7 +58509,7 @@ module.exports = {
 	curves: curves
 };
 
-},{}],248:[function(require,module,exports){
+},{}],249:[function(require,module,exports){
 // Copyright 2016 Joyent, Inc.
 
 module.exports = Certificate;
@@ -57819,6 +58551,8 @@ function Certificate(opts) {
 	assert.date(opts.validFrom, 'options.validFrom');
 	assert.date(opts.validUntil, 'optons.validUntil');
 
+	assert.optionalArrayOfString(opts.purposes, 'options.purposes');
+
 	this._hashCache = {};
 
 	this.subjects = opts.subjects;
@@ -57829,6 +58563,7 @@ function Certificate(opts) {
 	this.serial = opts.serial;
 	this.validFrom = opts.validFrom;
 	this.validUntil = opts.validUntil;
+	this.purposes = opts.purposes;
 }
 
 Certificate.formats = formats;
@@ -57888,6 +58623,10 @@ Certificate.prototype.isSignedBy = function (issuerCert) {
 
 	if (!this.issuer.equals(issuerCert.subjects[0]))
 		return (false);
+	if (this.issuer.purposes && this.issuer.purposes.length > 0 &&
+	    this.issuer.purposes.indexOf('ca') === -1) {
+		return (false);
+	}
 
 	return (this.isSignedByKey(issuerCert.subjectKey));
 };
@@ -57960,6 +58699,47 @@ Certificate.createSelfSigned = function (subjectOrSubjects, key, options) {
 	if (serial === undefined)
 		serial = new Buffer('0000000000000001', 'hex');
 
+	var purposes = options.purposes;
+	if (purposes === undefined)
+		purposes = [];
+
+	if (purposes.indexOf('signature') === -1)
+		purposes.push('signature');
+
+	/* Self-signed certs are always CAs. */
+	if (purposes.indexOf('ca') === -1)
+		purposes.push('ca');
+	if (purposes.indexOf('crl') === -1)
+		purposes.push('crl');
+
+	/*
+	 * If we weren't explicitly given any other purposes, do the sensible
+	 * thing and add some basic ones depending on the subject type.
+	 */
+	if (purposes.length <= 3) {
+		var hostSubjects = subjects.filter(function (subject) {
+			return (subject.type === 'host');
+		});
+		var userSubjects = subjects.filter(function (subject) {
+			return (subject.type === 'user');
+		});
+		if (hostSubjects.length > 0) {
+			if (purposes.indexOf('serverAuth') === -1)
+				purposes.push('serverAuth');
+		}
+		if (userSubjects.length > 0) {
+			if (purposes.indexOf('clientAuth') === -1)
+				purposes.push('clientAuth');
+		}
+		if (userSubjects.length > 0 || hostSubjects.length > 0) {
+			if (purposes.indexOf('keyAgreement') === -1)
+				purposes.push('keyAgreement');
+			if (key.type === 'rsa' &&
+			    purposes.indexOf('encryption') === -1)
+				purposes.push('encryption');
+		}
+	}
+
 	var cert = new Certificate({
 		subjects: subjects,
 		issuer: subjects[0],
@@ -57968,7 +58748,8 @@ Certificate.createSelfSigned = function (subjectOrSubjects, key, options) {
 		signatures: {},
 		serial: serial,
 		validFrom: validFrom,
-		validUntil: validUntil
+		validUntil: validUntil,
+		purposes: purposes
 	});
 	cert.signWith(key);
 
@@ -58016,6 +58797,42 @@ Certificate.create =
 	if (serial === undefined)
 		serial = new Buffer('0000000000000001', 'hex');
 
+	var purposes = options.purposes;
+	if (purposes === undefined)
+		purposes = [];
+
+	if (purposes.indexOf('signature') === -1)
+		purposes.push('signature');
+
+	if (options.ca === true) {
+		if (purposes.indexOf('ca') === -1)
+			purposes.push('ca');
+		if (purposes.indexOf('crl') === -1)
+			purposes.push('crl');
+	}
+
+	var hostSubjects = subjects.filter(function (subject) {
+		return (subject.type === 'host');
+	});
+	var userSubjects = subjects.filter(function (subject) {
+		return (subject.type === 'user');
+	});
+	if (hostSubjects.length > 0) {
+		if (purposes.indexOf('serverAuth') === -1)
+			purposes.push('serverAuth');
+	}
+	if (userSubjects.length > 0) {
+		if (purposes.indexOf('clientAuth') === -1)
+			purposes.push('clientAuth');
+	}
+	if (userSubjects.length > 0 || hostSubjects.length > 0) {
+		if (purposes.indexOf('keyAgreement') === -1)
+			purposes.push('keyAgreement');
+		if (key.type === 'rsa' &&
+		    purposes.indexOf('encryption') === -1)
+			purposes.push('encryption');
+	}
+
 	var cert = new Certificate({
 		subjects: subjects,
 		issuer: issuer,
@@ -58024,7 +58841,8 @@ Certificate.create =
 		signatures: {},
 		serial: serial,
 		validFrom: validFrom,
-		validUntil: validUntil
+		validUntil: validUntil,
+		purposes: purposes
 	});
 	cert.signWith(issuerKey);
 
@@ -58070,16 +58888,20 @@ Certificate._oldVersionDetect = function (obj) {
 	return ([1, 0]);
 };
 
-},{"./algs":247,"./errors":251,"./fingerprint":252,"./formats/openssh-cert":254,"./formats/x509":262,"./formats/x509-pem":261,"./identity":263,"./key":265,"./private-key":266,"./signature":267,"./utils":269,"assert-plus":270,"crypto":undefined,"util":undefined}],249:[function(require,module,exports){
-// Copyright 2015 Joyent, Inc.
+},{"./algs":248,"./errors":252,"./fingerprint":253,"./formats/openssh-cert":256,"./formats/x509":264,"./formats/x509-pem":263,"./identity":265,"./key":267,"./private-key":268,"./signature":269,"./utils":271,"assert-plus":272,"crypto":undefined,"util":undefined}],250:[function(require,module,exports){
+// Copyright 2017 Joyent, Inc.
 
-module.exports = DiffieHellman;
+module.exports = {
+	DiffieHellman: DiffieHellman,
+	generateECDSA: generateECDSA,
+	generateED25519: generateED25519
+};
 
 var assert = require('assert-plus');
 var crypto = require('crypto');
 var algs = require('./algs');
 var utils = require('./utils');
-var ed;
+var nacl;
 
 var Key = require('./key');
 var PrivateKey = require('./private-key');
@@ -58144,14 +58966,12 @@ function DiffieHellman(key) {
 		this._dh.setPublicKey(key.part.Q.data);
 
 	} else if (key.type === 'curve25519') {
-		if (ed === undefined)
-			ed = require('jodid25519');
+		if (nacl === undefined)
+			nacl = require('tweetnacl');
 
 		if (this._isPriv) {
-			this._priv = key.part.r.data;
-			if (this._priv[0] === 0x00)
-				this._priv = this._priv.slice(1);
-			this._priv = this._priv.slice(0, 32);
+			utils.assertCompatible(key, PrivateKey, [1, 5], 'key');
+			this._priv = key.part.k.data;
 		}
 
 	} else {
@@ -58215,7 +59035,10 @@ DiffieHellman.prototype.setKey = function (pk) {
 		}
 
 	} else if (pk.type === 'curve25519') {
-		this._priv = pk.part.r.data;
+		var k = pk.part.k;
+		if (!pk.part.k)
+			k = pk.part.r;
+		this._priv = k.data;
 		if (this._priv[0] === 0x00)
 			this._priv = this._priv.slice(1);
 		this._priv = this._priv.slice(0, 32);
@@ -58247,15 +59070,17 @@ DiffieHellman.prototype.computeSecret = function (otherpk) {
 		}
 
 	} else if (this._algo === 'curve25519') {
-		pub = otherpk.part.R.data;
-		if (pub[0] === 0x00)
+		pub = otherpk.part.A.data;
+		while (pub[0] === 0x00 && pub.length > 32)
 			pub = pub.slice(1);
+		var priv = this._priv;
+		assert.strictEqual(pub.length, 32);
+		assert.strictEqual(priv.length, 32);
 
-		var secret = ed.dh.computeKey(
-		    this._priv.toString('binary'),
-		    pub.toString('binary'));
+		var secret = nacl.box.before(new Uint8Array(pub),
+		    new Uint8Array(priv));
 
-		return (new Buffer(secret, 'binary'));
+		return (new Buffer(secret));
 	}
 
 	throw (new Error('Invalid algorithm: ' + this._algo));
@@ -58323,13 +59148,15 @@ DiffieHellman.prototype.generateKey = function () {
 		}
 
 	} else if (this._algo === 'curve25519') {
-		priv = ed.dh.generateKey();
-		pub = ed.dh.publicKey(priv);
-		this._priv = priv = new Buffer(priv, 'binary');
-		pub = new Buffer(pub, 'binary');
+		var pair = nacl.box.keyPair();
+		priv = new Buffer(pair.secretKey);
+		pub = new Buffer(pair.publicKey);
+		priv = Buffer.concat([priv, pub]);
+		assert.strictEqual(priv.length, 64);
+		assert.strictEqual(pub.length, 32);
 
-		parts.push({name: 'R', data: pub});
-		parts.push({name: 'r', data: Buffer.concat([priv, pub])});
+		parts.push({name: 'A', data: pub});
+		parts.push({name: 'k', data: priv});
 		this._key = new PrivateKey({
 			type: 'curve25519',
 			parts: parts
@@ -58383,7 +59210,100 @@ ECPrivate.prototype.deriveSharedSecret = function (pubKey) {
 	return (new Buffer(S.getX().toBigInteger().toByteArray()));
 };
 
-},{"./algs":247,"./key":265,"./private-key":266,"./utils":269,"assert-plus":270,"crypto":undefined,"ecc-jsbn":154,"ecc-jsbn/lib/ec":155,"jodid25519":205,"jsbn":211}],250:[function(require,module,exports){
+function generateED25519() {
+	if (nacl === undefined)
+		nacl = require('tweetnacl');
+
+	var pair = nacl.sign.keyPair();
+	var priv = new Buffer(pair.secretKey);
+	var pub = new Buffer(pair.publicKey);
+	assert.strictEqual(priv.length, 64);
+	assert.strictEqual(pub.length, 32);
+
+	var parts = [];
+	parts.push({name: 'A', data: pub});
+	parts.push({name: 'k', data: priv.slice(0, 32)});
+	var key = new PrivateKey({
+		type: 'ed25519',
+		parts: parts
+	});
+	return (key);
+}
+
+/* Generates a new ECDSA private key on a given curve. */
+function generateECDSA(curve) {
+	var parts = [];
+	var key;
+
+	if (CRYPTO_HAVE_ECDH) {
+		/*
+		 * Node crypto doesn't expose key generation directly, but the
+		 * ECDH instances can generate keys. It turns out this just
+		 * calls into the OpenSSL generic key generator, and we can
+		 * read its output happily without doing an actual DH. So we
+		 * use that here.
+		 */
+		var osCurve = {
+			'nistp256': 'prime256v1',
+			'nistp384': 'secp384r1',
+			'nistp521': 'secp521r1'
+		}[curve];
+
+		var dh = crypto.createECDH(osCurve);
+		dh.generateKeys();
+
+		parts.push({name: 'curve',
+		    data: new Buffer(curve)});
+		parts.push({name: 'Q', data: dh.getPublicKey()});
+		parts.push({name: 'd', data: dh.getPrivateKey()});
+
+		key = new PrivateKey({
+			type: 'ecdsa',
+			curve: curve,
+			parts: parts
+		});
+		return (key);
+	} else {
+		if (ecdh === undefined)
+			ecdh = require('ecc-jsbn');
+		if (ec === undefined)
+			ec = require('ecc-jsbn/lib/ec');
+		if (jsbn === undefined)
+			jsbn = require('jsbn').BigInteger;
+
+		var ecParams = new X9ECParameters(curve);
+
+		/* This algorithm taken from FIPS PUB 186-4 (section B.4.1) */
+		var n = ecParams.getN();
+		/*
+		 * The crypto.randomBytes() function can only give us whole
+		 * bytes, so taking a nod from X9.62, we round up.
+		 */
+		var cByteLen = Math.ceil((n.bitLength() + 64) / 8);
+		var c = new jsbn(crypto.randomBytes(cByteLen));
+
+		var n1 = n.subtract(jsbn.ONE);
+		var priv = c.mod(n1).add(jsbn.ONE);
+		var pub = ecParams.getG().multiply(priv);
+
+		priv = new Buffer(priv.toByteArray());
+		pub = new Buffer(ecParams.getCurve().
+		    encodePointHex(pub), 'hex');
+
+		parts.push({name: 'curve', data: new Buffer(curve)});
+		parts.push({name: 'Q', data: pub});
+		parts.push({name: 'd', data: priv});
+
+		key = new PrivateKey({
+			type: 'ecdsa',
+			curve: curve,
+			parts: parts
+		});
+		return (key);
+	}
+}
+
+},{"./algs":248,"./key":267,"./private-key":268,"./utils":271,"assert-plus":272,"crypto":undefined,"ecc-jsbn":158,"ecc-jsbn/lib/ec":159,"jsbn":210,"tweetnacl":283}],251:[function(require,module,exports){
 // Copyright 2015 Joyent, Inc.
 
 module.exports = {
@@ -58442,7 +59362,7 @@ Verifier.prototype.verify = function (signature, fmt) {
 	return (nacl.sign.detached.verify(
 	    new Uint8Array(Buffer.concat(this.chunks)),
 	    new Uint8Array(sig),
-	    new Uint8Array(this.key.part.R.data)));
+	    new Uint8Array(this.key.part.A.data)));
 };
 
 function Signer(key, hashAlgo) {
@@ -58474,14 +59394,15 @@ Signer.prototype.update = function (chunk) {
 Signer.prototype.sign = function () {
 	var sig = nacl.sign.detached(
 	    new Uint8Array(Buffer.concat(this.chunks)),
-	    new Uint8Array(this.key.part.r.data));
+	    new Uint8Array(Buffer.concat([
+		this.key.part.k.data, this.key.part.A.data])));
 	var sigBuf = new Buffer(sig);
 	var sigObj = Signature.parse(sigBuf, 'ed25519', 'raw');
 	sigObj.hashAlgorithm = 'sha512';
 	return (sigObj);
 };
 
-},{"./signature":267,"assert-plus":270,"stream":undefined,"tweetnacl":281,"util":undefined}],251:[function(require,module,exports){
+},{"./signature":269,"assert-plus":272,"stream":undefined,"tweetnacl":283,"util":undefined}],252:[function(require,module,exports){
 // Copyright 2015 Joyent, Inc.
 
 var assert = require('assert-plus');
@@ -58567,7 +59488,7 @@ module.exports = {
 	CertificateParseError: CertificateParseError
 };
 
-},{"assert-plus":270,"util":undefined}],252:[function(require,module,exports){
+},{"assert-plus":272,"util":undefined}],253:[function(require,module,exports){
 // Copyright 2015 Joyent, Inc.
 
 module.exports = Fingerprint;
@@ -58730,7 +59651,7 @@ Fingerprint._oldVersionDetect = function (obj) {
 	return ([1, 0]);
 };
 
-},{"./algs":247,"./certificate":248,"./errors":251,"./key":265,"./utils":269,"assert-plus":270,"crypto":undefined}],253:[function(require,module,exports){
+},{"./algs":248,"./certificate":249,"./errors":252,"./key":267,"./utils":271,"assert-plus":272,"crypto":undefined}],254:[function(require,module,exports){
 // Copyright 2015 Joyent, Inc.
 
 module.exports = {
@@ -58746,6 +59667,9 @@ var PrivateKey = require('../private-key');
 var pem = require('./pem');
 var ssh = require('./ssh');
 var rfc4253 = require('./rfc4253');
+var dnssec = require('./dnssec');
+
+var DNSSEC_PRIVKEY_HEADER_PREFIX = 'Private-key-format: v1';
 
 function read(buf, options) {
 	if (typeof (buf) === 'string') {
@@ -58755,6 +59679,8 @@ function read(buf, options) {
 			return (ssh.read(buf, options));
 		if (buf.match(/^\s*ecdsa-/))
 			return (ssh.read(buf, options));
+		if (findDNSSECHeader(buf))
+			return (dnssec.read(buf, options));
 		buf = new Buffer(buf, 'binary');
 	} else {
 		assert.buffer(buf);
@@ -58762,6 +59688,8 @@ function read(buf, options) {
 			return (pem.read(buf, options));
 		if (findSSHHeader(buf))
 			return (ssh.read(buf, options));
+		if (findDNSSECHeader(buf))
+			return (dnssec.read(buf, options));
 	}
 	if (buf.readUInt32BE(0) < buf.length)
 		return (rfc4253.read(buf, options));
@@ -58801,17 +59729,332 @@ function findPEMHeader(buf) {
 	return (true);
 }
 
+function findDNSSECHeader(buf) {
+	// private case first
+	if (buf.length <= DNSSEC_PRIVKEY_HEADER_PREFIX.length)
+		return (false);
+	var headerCheck = buf.slice(0, DNSSEC_PRIVKEY_HEADER_PREFIX.length);
+	if (headerCheck.toString('ascii') === DNSSEC_PRIVKEY_HEADER_PREFIX)
+		return (true);
+
+	// public-key RFC3110 ?
+	// 'domain.com. IN KEY ...' or 'domain.com. IN DNSKEY ...'
+	// skip any comment-lines
+	if (typeof (buf) !== 'string') {
+		buf = buf.toString('ascii');
+	}
+	var lines = buf.split('\n');
+	var line = 0;
+	/* JSSTYLED */
+	while (lines[line].match(/^\;/))
+		line++;
+	if (lines[line].toString('ascii').match(/\. IN KEY /))
+		return (true);
+	if (lines[line].toString('ascii').match(/\. IN DNSKEY /))
+		return (true);
+	return (false);
+}
+
 function write(key, options) {
 	throw (new Error('"auto" format cannot be used for writing'));
 }
 
-},{"../key":265,"../private-key":266,"../utils":269,"./pem":255,"./rfc4253":258,"./ssh":260,"assert-plus":270}],254:[function(require,module,exports){
-// Copyright 2016 Joyent, Inc.
+},{"../key":267,"../private-key":268,"../utils":271,"./dnssec":255,"./pem":257,"./rfc4253":260,"./ssh":262,"assert-plus":272}],255:[function(require,module,exports){
+// Copyright 2017 Joyent, Inc.
+
+module.exports = {
+	read: read,
+	write: write
+};
+
+var assert = require('assert-plus');
+var Key = require('../key');
+var PrivateKey = require('../private-key');
+var utils = require('../utils');
+var SSHBuffer = require('../ssh-buffer');
+var Dhe = require('../dhe');
+
+var supportedAlgos = {
+	'rsa-sha1' : 5,
+	'rsa-sha256' : 8,
+	'rsa-sha512' : 10,
+	'ecdsa-p256-sha256' : 13,
+	'ecdsa-p384-sha384' : 14
+	/*
+	 * ed25519 is hypothetically supported with id 15
+	 * but the common tools available don't appear to be
+	 * capable of generating/using ed25519 keys
+	 */
+};
+
+var supportedAlgosById = {};
+Object.keys(supportedAlgos).forEach(function (k) {
+	supportedAlgosById[supportedAlgos[k]] = k.toUpperCase();
+});
+
+function read(buf, options) {
+	if (typeof (buf) !== 'string') {
+		assert.buffer(buf, 'buf');
+		buf = buf.toString('ascii');
+	}
+	var lines = buf.split('\n');
+	if (lines[0].match(/^Private-key-format\: v1/)) {
+		var algElems = lines[1].split(' ');
+		var algoNum = parseInt(algElems[1], 10);
+		var algoName = algElems[2];
+		if (!supportedAlgosById[algoNum])
+			throw (new Error('Unsupported algorithm: ' + algoName));
+		return (readDNSSECPrivateKey(algoNum, lines.slice(2)));
+	}
+
+	// skip any comment-lines
+	var line = 0;
+	/* JSSTYLED */
+	while (lines[line].match(/^\;/))
+		line++;
+	// we should now have *one single* line left with our KEY on it.
+	if ((lines[line].match(/\. IN KEY /) ||
+	    lines[line].match(/\. IN DNSKEY /)) && lines[line+1].length === 0) {
+		return (readRFC3110(lines[line]));
+	}
+	throw (new Error('Cannot parse dnssec key'));
+}
+
+function readRFC3110(keyString) {
+	var elems = keyString.split(' ');
+	//unused var flags = parseInt(elems[3], 10);
+	//unused var protocol = parseInt(elems[4], 10);
+	var algorithm = parseInt(elems[5], 10);
+	if (!supportedAlgosById[algorithm])
+		throw (new Error('Unsupported algorithm: ' + algorithm));
+	var base64key = elems.slice(6, elems.length).join();
+	var keyBuffer = new Buffer(base64key, 'base64');
+	if (supportedAlgosById[algorithm].match(/^RSA-/)) {
+		// join the rest of the body into a single base64-blob
+		var publicExponentLen = keyBuffer.readUInt8(0);
+		if (publicExponentLen != 3 && publicExponentLen != 1)
+			throw (new Error('Cannot parse dnssec key: ' +
+			    'unsupported exponent length'));
+
+		var publicExponent = keyBuffer.slice(1, publicExponentLen+1);
+		publicExponent = utils.mpNormalize(publicExponent);
+		var modulus = keyBuffer.slice(1+publicExponentLen);
+		modulus = utils.mpNormalize(modulus);
+		// now, make the key
+		var rsaKey = {
+			type: 'rsa',
+			parts: []
+		};
+		rsaKey.parts.push({ name: 'e', data: publicExponent});
+		rsaKey.parts.push({ name: 'n', data: modulus});
+		return (new Key(rsaKey));
+	}
+	if (supportedAlgosById[algorithm] === 'ECDSA-P384-SHA384' ||
+	    supportedAlgosById[algorithm] === 'ECDSA-P256-SHA256') {
+		var curve = 'nistp384';
+		var size = 384;
+		if (supportedAlgosById[algorithm].match(/^ECDSA-P256-SHA256/)) {
+			curve = 'nistp256';
+			size = 256;
+		}
+
+		var ecdsaKey = {
+			type: 'ecdsa',
+			curve: curve,
+			size: size,
+			parts: [
+				{name: 'curve', data: new Buffer(curve) },
+				{name: 'Q', data: utils.ecNormalize(keyBuffer) }
+			]
+		};
+		return (new Key(ecdsaKey));
+	}
+	throw (new Error('Unsupported algorithm: ' +
+	    supportedAlgosById[algorithm]));
+}
+
+function elementToBuf(e) {
+	return (new Buffer(e.split(' ')[1], 'base64'));
+}
+
+function readDNSSECRSAPrivateKey(elements) {
+	var rsaParams = {};
+	elements.forEach(function (element) {
+		if (element.split(' ')[0] === 'Modulus:')
+			rsaParams['n'] = elementToBuf(element);
+		else if (element.split(' ')[0] === 'PublicExponent:')
+			rsaParams['e'] = elementToBuf(element);
+		else if (element.split(' ')[0] === 'PrivateExponent:')
+			rsaParams['d'] = elementToBuf(element);
+		else if (element.split(' ')[0] === 'Prime1:')
+			rsaParams['p'] = elementToBuf(element);
+		else if (element.split(' ')[0] === 'Prime2:')
+			rsaParams['q'] = elementToBuf(element);
+		else if (element.split(' ')[0] === 'Exponent1:')
+			rsaParams['dmodp'] = elementToBuf(element);
+		else if (element.split(' ')[0] === 'Exponent2:')
+			rsaParams['dmodq'] = elementToBuf(element);
+		else if (element.split(' ')[0] === 'Coefficient:')
+			rsaParams['iqmp'] = elementToBuf(element);
+	});
+	// now, make the key
+	var key = {
+		type: 'rsa',
+		parts: [
+			{ name: 'e', data: utils.mpNormalize(rsaParams['e'])},
+			{ name: 'n', data: utils.mpNormalize(rsaParams['n'])},
+			{ name: 'd', data: utils.mpNormalize(rsaParams['d'])},
+			{ name: 'p', data: utils.mpNormalize(rsaParams['p'])},
+			{ name: 'q', data: utils.mpNormalize(rsaParams['q'])},
+			{ name: 'dmodp',
+			    data: utils.mpNormalize(rsaParams['dmodp'])},
+			{ name: 'dmodq',
+			    data: utils.mpNormalize(rsaParams['dmodq'])},
+			{ name: 'iqmp',
+			    data: utils.mpNormalize(rsaParams['iqmp'])}
+		]
+	};
+	return (new PrivateKey(key));
+}
+
+function readDNSSECPrivateKey(alg, elements) {
+	if (supportedAlgosById[alg].match(/^RSA-/)) {
+		return (readDNSSECRSAPrivateKey(elements));
+	}
+	if (supportedAlgosById[alg] === 'ECDSA-P384-SHA384' ||
+	    supportedAlgosById[alg] === 'ECDSA-P256-SHA256') {
+		var d = new Buffer(elements[0].split(' ')[1], 'base64');
+		var curve = 'nistp384';
+		var size = 384;
+		if (supportedAlgosById[alg] === 'ECDSA-P256-SHA256') {
+			curve = 'nistp256';
+			size = 256;
+		}
+		// DNSSEC generates the public-key on the fly (go calculate it)
+		var publicKey = utils.publicFromPrivateECDSA(curve, d);
+		var Q = publicKey.part['Q'].data;
+		var ecdsaKey = {
+			type: 'ecdsa',
+			curve: curve,
+			size: size,
+			parts: [
+				{name: 'curve', data: new Buffer(curve) },
+				{name: 'd', data: d },
+				{name: 'Q', data: Q }
+			]
+		};
+		return (new PrivateKey(ecdsaKey));
+	}
+	throw (new Error('Unsupported algorithm: ' + supportedAlgosById[alg]));
+}
+
+function dnssecTimestamp(date) {
+	var year = date.getFullYear() + ''; //stringify
+	var month = (date.getMonth() + 1);
+	var timestampStr = year + month + date.getUTCDate();
+	timestampStr += '' + date.getUTCHours() + date.getUTCMinutes();
+	timestampStr += date.getUTCSeconds();
+	return (timestampStr);
+}
+
+function rsaAlgFromOptions(opts) {
+	if (!opts || !opts.hashAlgo || opts.hashAlgo === 'sha1')
+		return ('5 (RSASHA1)');
+	else if (opts.hashAlgo === 'sha256')
+		return ('8 (RSASHA256)');
+	else if (opts.hashAlgo === 'sha512')
+		return ('10 (RSASHA512)');
+	else
+		throw (new Error('Unknown or unsupported hash: ' +
+		    opts.hashAlgo));
+}
+
+function writeRSA(key, options) {
+	// if we're missing parts, add them.
+	if (!key.part.dmodp || !key.part.dmodq) {
+		utils.addRSAMissing(key);
+	}
+
+	var out = '';
+	out += 'Private-key-format: v1.3\n';
+	out += 'Algorithm: ' + rsaAlgFromOptions(options) + '\n';
+	var n = utils.mpDenormalize(key.part['n'].data);
+	out += 'Modulus: ' + n.toString('base64') + '\n';
+	var e = utils.mpDenormalize(key.part['e'].data);
+	out += 'PublicExponent: ' + e.toString('base64') + '\n';
+	var d = utils.mpDenormalize(key.part['d'].data);
+	out += 'PrivateExponent: ' + d.toString('base64') + '\n';
+	var p = utils.mpDenormalize(key.part['p'].data);
+	out += 'Prime1: ' + p.toString('base64') + '\n';
+	var q = utils.mpDenormalize(key.part['q'].data);
+	out += 'Prime2: ' + q.toString('base64') + '\n';
+	var dmodp = utils.mpDenormalize(key.part['dmodp'].data);
+	out += 'Exponent1: ' + dmodp.toString('base64') + '\n';
+	var dmodq = utils.mpDenormalize(key.part['dmodq'].data);
+	out += 'Exponent2: ' + dmodq.toString('base64') + '\n';
+	var iqmp = utils.mpDenormalize(key.part['iqmp'].data);
+	out += 'Coefficient: ' + iqmp.toString('base64') + '\n';
+	// Assume that we're valid as-of now
+	var timestamp = new Date();
+	out += 'Created: ' + dnssecTimestamp(timestamp) + '\n';
+	out += 'Publish: ' + dnssecTimestamp(timestamp) + '\n';
+	out += 'Activate: ' + dnssecTimestamp(timestamp) + '\n';
+	return (new Buffer(out, 'ascii'));
+}
+
+function writeECDSA(key, options) {
+	var out = '';
+	out += 'Private-key-format: v1.3\n';
+
+	if (key.curve === 'nistp256') {
+		out += 'Algorithm: 13 (ECDSAP256SHA256)\n';
+	} else if (key.curve === 'nistp384') {
+		out += 'Algorithm: 14 (ECDSAP384SHA384)\n';
+	} else {
+		throw (new Error('Unsupported curve'));
+	}
+	var base64Key = key.part['d'].data.toString('base64');
+	out += 'PrivateKey: ' + base64Key + '\n';
+
+	// Assume that we're valid as-of now
+	var timestamp = new Date();
+	out += 'Created: ' + dnssecTimestamp(timestamp) + '\n';
+	out += 'Publish: ' + dnssecTimestamp(timestamp) + '\n';
+	out += 'Activate: ' + dnssecTimestamp(timestamp) + '\n';
+
+	return (new Buffer(out, 'ascii'));
+}
+
+function write(key, options) {
+	if (PrivateKey.isPrivateKey(key)) {
+		if (key.type === 'rsa') {
+			return (writeRSA(key, options));
+		} else if (key.type === 'ecdsa') {
+			return (writeECDSA(key, options));
+		} else {
+			throw (new Error('Unsupported algorithm: ' + key.type));
+		}
+	} else if (Key.isKey(key)) {
+		/*
+		 * RFC3110 requires a keyname, and a keytype, which we
+		 * don't really have a mechanism for specifying such
+		 * additional metadata.
+		 */
+		throw (new Error('Format "dnssec" only supports ' +
+		    'writing private keys'));
+	} else {
+		throw (new Error('key is not a Key or PrivateKey'));
+	}
+}
+
+},{"../dhe":250,"../key":267,"../private-key":268,"../ssh-buffer":270,"../utils":271,"assert-plus":272}],256:[function(require,module,exports){
+// Copyright 2017 Joyent, Inc.
 
 module.exports = {
 	read: read,
 	verify: verify,
 	sign: sign,
+	signAsync: signAsync,
 	write: write,
 
 	/* Internal private API */
@@ -58996,6 +60239,38 @@ function sign(cert, key) {
 	return (true);
 }
 
+function signAsync(cert, signer, done) {
+	if (cert.signatures.openssh === undefined)
+		cert.signatures.openssh = {};
+	try {
+		var blob = toBuffer(cert, true);
+	} catch (e) {
+		delete (cert.signatures.openssh);
+		done(e);
+		return;
+	}
+	var sig = cert.signatures.openssh;
+
+	signer(blob, function (err, signature) {
+		if (err) {
+			done(err);
+			return;
+		}
+		try {
+			/*
+			 * This will throw if the signature isn't of a
+			 * type/algo that can be used for SSH.
+			 */
+			signature.toBuffer('ssh');
+		} catch (e) {
+			done(e);
+			return;
+		}
+		sig.signature = signature;
+		done();
+	});
+}
+
 function write(cert, options) {
 	if (options === undefined)
 		options = {};
@@ -59096,7 +60371,7 @@ function getCertType(key) {
 	throw (new Error('Unsupported key type ' + key.type));
 }
 
-},{"../algs":247,"../certificate":248,"../identity":263,"../key":265,"../private-key":266,"../signature":267,"../ssh-buffer":268,"../utils":269,"./rfc4253":258,"assert-plus":270,"crypto":undefined}],255:[function(require,module,exports){
+},{"../algs":248,"../certificate":249,"../identity":265,"../key":267,"../private-key":268,"../signature":269,"../ssh-buffer":270,"../utils":271,"./rfc4253":260,"assert-plus":272,"crypto":undefined}],257:[function(require,module,exports){
 // Copyright 2015 Joyent, Inc.
 
 module.exports = {
@@ -59133,11 +60408,11 @@ function read(buf, options, forceType) {
 	var lines = buf.trim().split('\n');
 
 	var m = lines[0].match(/*JSSTYLED*/
-	    /[-]+[ ]*BEGIN ([A-Z0-9]+ )?(PUBLIC|PRIVATE) KEY[ ]*[-]+/);
+	    /[-]+[ ]*BEGIN ([A-Z0-9][A-Za-z0-9]+ )?(PUBLIC|PRIVATE) KEY[ ]*[-]+/);
 	assert.ok(m, 'invalid PEM header');
 
 	var m2 = lines[lines.length - 1].match(/*JSSTYLED*/
-	    /[-]+[ ]*END ([A-Z0-9]+ )?(PUBLIC|PRIVATE) KEY[ ]*[-]+/);
+	    /[-]+[ ]*END ([A-Z0-9][A-Za-z0-9]+ )?(PUBLIC|PRIVATE) KEY[ ]*[-]+/);
 	assert.ok(m2, 'invalid PEM footer');
 
 	/* Begin and end banners must match key type */
@@ -59234,7 +60509,12 @@ function read(buf, options, forceType) {
 function write(key, options, type) {
 	assert.object(key);
 
-	var alg = {'ecdsa': 'EC', 'rsa': 'RSA', 'dsa': 'DSA'}[key.type];
+	var alg = {
+	    'ecdsa': 'EC',
+	    'rsa': 'RSA',
+	    'dsa': 'DSA',
+	    'ed25519': 'EdDSA'
+	}[key.type];
 	var header;
 
 	var der = new asn1.BerWriter();
@@ -59284,7 +60564,7 @@ function write(key, options, type) {
 	return (buf.slice(0, o));
 }
 
-},{"../algs":247,"../errors":251,"../key":265,"../private-key":266,"../utils":269,"./pkcs1":256,"./pkcs8":257,"./rfc4253":258,"./ssh-private":259,"asn1":78,"assert-plus":270,"crypto":undefined}],256:[function(require,module,exports){
+},{"../algs":248,"../errors":252,"../key":267,"../private-key":268,"../utils":271,"./pkcs1":258,"./pkcs8":259,"./rfc4253":260,"./ssh-private":261,"asn1":80,"assert-plus":272,"crypto":undefined}],258:[function(require,module,exports){
 // Copyright 2015 Joyent, Inc.
 
 module.exports = {
@@ -59342,6 +60622,11 @@ function readPkcs1(alg, type, der) {
 		else if (type === 'public')
 			return (readPkcs1ECDSAPublic(der));
 		throw (new Error('Unknown key type: ' + type));
+	case 'EDDSA':
+	case 'EdDSA':
+		if (type === 'private')
+			return (readPkcs1EdDSAPrivate(der));
+		throw (new Error(type + ' keys not supported with EdDSA'));
 	default:
 		throw (new Error('Unknown key algo: ' + alg));
 	}
@@ -59415,6 +60700,31 @@ function readPkcs1DSAPrivate(der) {
 			{ name: 'g', data: g },
 			{ name: 'y', data: y },
 			{ name: 'x', data: x }
+		]
+	};
+
+	return (new PrivateKey(key));
+}
+
+function readPkcs1EdDSAPrivate(der) {
+	var version = readMPInt(der, 'version');
+	assert.strictEqual(version.readUInt8(0), 1);
+
+	// private key
+	var k = der.readString(asn1.Ber.OctetString, true);
+
+	der.readSequence(0xa0);
+	var oid = der.readOID();
+	assert.strictEqual(oid, '1.3.101.112', 'the ed25519 curve identifier');
+
+	der.readSequence(0xa1);
+	var A = utils.readBitString(der);
+
+	var key = {
+		type: 'ed25519',
+		parts: [
+			{ name: 'A', data: utils.zeroPadToLength(A, 32) },
+			{ name: 'k', data: k }
 		]
 	};
 
@@ -59523,6 +60833,12 @@ function writePkcs1(der, key) {
 		else
 			writePkcs1ECDSAPublic(der, key);
 		break;
+	case 'ed25519':
+		if (PrivateKey.isPrivateKey(key))
+			writePkcs1EdDSAPrivate(der, key);
+		else
+			writePkcs1EdDSAPublic(der, key);
+		break;
 	default:
 		throw (new Error('Unknown key algo: ' + key.type));
 	}
@@ -59606,7 +60922,27 @@ function writePkcs1ECDSAPrivate(der, key) {
 	der.endSequence();
 }
 
-},{"../algs":247,"../key":265,"../private-key":266,"../utils":269,"./pem":255,"./pkcs8":257,"asn1":78,"assert-plus":270}],257:[function(require,module,exports){
+function writePkcs1EdDSAPrivate(der, key) {
+	var ver = new Buffer(1);
+	ver[0] = 1;
+	der.writeBuffer(ver, asn1.Ber.Integer);
+
+	der.writeBuffer(key.part.k.data, asn1.Ber.OctetString);
+
+	der.startSequence(0xa0);
+	der.writeOID('1.3.101.112');
+	der.endSequence();
+
+	der.startSequence(0xa1);
+	utils.writeBitString(der, key.part.A.data);
+	der.endSequence();
+}
+
+function writePkcs1EdDSAPublic(der, key) {
+	throw (new Error('Public keys are not supported for EdDSA PKCS#1'));
+}
+
+},{"../algs":248,"../key":267,"../private-key":268,"../utils":271,"./pem":257,"./pkcs8":259,"asn1":80,"assert-plus":272}],259:[function(require,module,exports){
 // Copyright 2015 Joyent, Inc.
 
 module.exports = {
@@ -59671,6 +61007,18 @@ function readPkcs8(alg, type, der) {
 			return (readPkcs8ECDSAPublic(der));
 		else
 			return (readPkcs8ECDSAPrivate(der));
+	case '1.3.101.112':
+		if (type === 'public') {
+			return (readPkcs8EdDSAPublic(der));
+		} else {
+			return (readPkcs8EdDSAPrivate(der));
+		}
+	case '1.3.101.110':
+		if (type === 'public') {
+			return (readPkcs8X25519Public(der));
+		} else {
+			return (readPkcs8X25519Private(der));
+		}
 	default:
 		throw (new Error('Unknown key type OID ' + oid));
 	}
@@ -59931,6 +61279,83 @@ function readPkcs8ECDSAPublic(der) {
 	return (new Key(key));
 }
 
+function readPkcs8EdDSAPublic(der) {
+	if (der.peek() === 0x00)
+		der.readByte();
+
+	var A = utils.readBitString(der);
+
+	var key = {
+		type: 'ed25519',
+		parts: [
+			{ name: 'A', data: utils.zeroPadToLength(A, 32) }
+		]
+	};
+
+	return (new Key(key));
+}
+
+function readPkcs8X25519Public(der) {
+	var A = utils.readBitString(der);
+
+	var key = {
+		type: 'curve25519',
+		parts: [
+			{ name: 'A', data: utils.zeroPadToLength(A, 32) }
+		]
+	};
+
+	return (new Key(key));
+}
+
+function readPkcs8EdDSAPrivate(der) {
+	if (der.peek() === 0x00)
+		der.readByte();
+
+	der.readSequence(asn1.Ber.OctetString);
+	var k = der.readString(asn1.Ber.OctetString, true);
+	k = utils.zeroPadToLength(k, 32);
+
+	var A;
+	if (der.peek() === asn1.Ber.BitString) {
+		A = utils.readBitString(der);
+		A = utils.zeroPadToLength(A, 32);
+	} else {
+		A = utils.calculateED25519Public(k);
+	}
+
+	var key = {
+		type: 'ed25519',
+		parts: [
+			{ name: 'A', data: utils.zeroPadToLength(A, 32) },
+			{ name: 'k', data: utils.zeroPadToLength(k, 32) }
+		]
+	};
+
+	return (new PrivateKey(key));
+}
+
+function readPkcs8X25519Private(der) {
+	if (der.peek() === 0x00)
+		der.readByte();
+
+	der.readSequence(asn1.Ber.OctetString);
+	var k = der.readString(asn1.Ber.OctetString, true);
+	k = utils.zeroPadToLength(k, 32);
+
+	var A = utils.calculateX25519Public(k);
+
+	var key = {
+		type: 'curve25519',
+		parts: [
+			{ name: 'A', data: utils.zeroPadToLength(A, 32) },
+			{ name: 'k', data: utils.zeroPadToLength(k, 32) }
+		]
+	};
+
+	return (new PrivateKey(key));
+}
+
 function writePkcs8(der, key) {
 	der.startSequence();
 
@@ -59962,6 +61387,13 @@ function writePkcs8(der, key) {
 			writePkcs8ECDSAPrivate(key, der);
 		else
 			writePkcs8ECDSAPublic(key, der);
+		break;
+	case 'ed25519':
+		der.writeOID('1.3.101.112');
+		if (PrivateKey.isPrivateKey(key))
+			throw (new Error('Ed25519 private keys in pkcs8 ' +
+			    'format are not supported'));
+		writePkcs8EdDSAPublic(key, der);
 		break;
 	default:
 		throw (new Error('Unsupported key type: ' + key.type));
@@ -60113,7 +61545,22 @@ function writePkcs8ECDSAPrivate(key, der) {
 	der.endSequence();
 }
 
-},{"../algs":247,"../key":265,"../private-key":266,"../utils":269,"./pem":255,"asn1":78,"assert-plus":270}],258:[function(require,module,exports){
+function writePkcs8EdDSAPublic(key, der) {
+	der.endSequence();
+
+	utils.writeBitString(der, key.part.A.data);
+}
+
+function writePkcs8EdDSAPrivate(key, der) {
+	der.endSequence();
+
+	var k = utils.mpNormalize(key.part.k.data, true);
+	der.startSequence(asn1.Ber.OctetString);
+	der.writeBuffer(k, asn1.Ber.OctetString);
+	der.endSequence();
+}
+
+},{"../algs":248,"../key":267,"../private-key":268,"../utils":271,"./pem":257,"asn1":80,"assert-plus":272}],260:[function(require,module,exports){
 // Copyright 2015 Joyent, Inc.
 
 module.exports = {
@@ -60213,12 +61660,25 @@ function read(partial, type, buf, options) {
 
 	var normalized = true;
 	for (var i = 0; i < algInfo.parts.length; ++i) {
-		parts[i].name = algInfo.parts[i];
-		if (parts[i].name !== 'curve' &&
-		    algInfo.normalize !== false) {
-			var p = parts[i];
-			var nd = utils.mpNormalize(p.data);
-			if (nd !== p.data) {
+		var p = parts[i];
+		p.name = algInfo.parts[i];
+		/*
+		 * OpenSSH stores ed25519 "private" keys as seed + public key
+		 * concat'd together (k followed by A). We want to keep them
+		 * separate for other formats that don't do this.
+		 */
+		if (key.type === 'ed25519' && p.name === 'k')
+			p.data = p.data.slice(0, 32);
+
+		if (p.name !== 'curve' && algInfo.normalize !== false) {
+			var nd;
+			if (key.type === 'ed25519') {
+				nd = utils.zeroPadToLength(p.data, 32);
+			} else {
+				nd = utils.mpNormalize(p.data);
+			}
+			if (nd.toString('binary') !==
+			    p.data.toString('binary')) {
 				p.data = nd;
 				normalized = false;
 			}
@@ -60253,15 +61713,21 @@ function write(key, options) {
 
 	for (i = 0; i < parts.length; ++i) {
 		var data = key.part[parts[i]].data;
-		if (algInfo.normalize !== false)
-			data = utils.mpNormalize(data);
+		if (algInfo.normalize !== false) {
+			if (key.type === 'ed25519')
+				data = utils.zeroPadToLength(data, 32);
+			else
+				data = utils.mpNormalize(data);
+		}
+		if (key.type === 'ed25519' && parts[i] === 'k')
+			data = Buffer.concat([data, key.part.A.data]);
 		buf.writeBuffer(data);
 	}
 
 	return (buf.toBuffer());
 }
 
-},{"../algs":247,"../key":265,"../private-key":266,"../ssh-buffer":268,"../utils":269,"assert-plus":270}],259:[function(require,module,exports){
+},{"../algs":248,"../key":267,"../private-key":268,"../ssh-buffer":270,"../utils":271,"assert-plus":272}],261:[function(require,module,exports){
 // Copyright 2015 Joyent, Inc.
 
 module.exports = {
@@ -60524,7 +61990,7 @@ function write(key, options) {
 	return (buf.slice(0, o));
 }
 
-},{"../algs":247,"../errors":251,"../key":265,"../private-key":266,"../ssh-buffer":268,"../utils":269,"./pem":255,"./rfc4253":258,"asn1":78,"assert-plus":270,"bcrypt-pbkdf":94,"crypto":undefined}],260:[function(require,module,exports){
+},{"../algs":248,"../errors":252,"../key":267,"../private-key":268,"../ssh-buffer":270,"../utils":271,"./pem":257,"./rfc4253":260,"asn1":80,"assert-plus":272,"bcrypt-pbkdf":96,"crypto":undefined}],262:[function(require,module,exports){
 // Copyright 2015 Joyent, Inc.
 
 module.exports = {
@@ -60541,9 +62007,9 @@ var PrivateKey = require('../private-key');
 var sshpriv = require('./ssh-private');
 
 /*JSSTYLED*/
-var SSHKEY_RE = /^([a-z0-9-]+)[ \t]+([a-zA-Z0-9+\/]+[=]*)([\n \t]+([^\n]+))?$/;
+var SSHKEY_RE = /^([a-z0-9-]+)[ \t]+([a-zA-Z0-9+\/]+[=]*)([ \t]+([^ \t][^\n]*[\n]*)?)?$/;
 /*JSSTYLED*/
-var SSHKEY_RE2 = /^([a-z0-9-]+)[ \t]+([a-zA-Z0-9+\/ \t\n]+[=]*)(.*)$/;
+var SSHKEY_RE2 = /^([a-z0-9-]+)[ \t\n]+([a-zA-Z0-9+\/][a-zA-Z0-9+\/ \t\n=]*)([^a-zA-Z0-9+\/ \t\n=].*)?$/;
 
 function read(buf, options) {
 	if (typeof (buf) !== 'string') {
@@ -60598,7 +62064,7 @@ function read(buf, options) {
 		 * chars from the beginning up to this point in the the string.
 		 * Then offset in this and try to make up for missing = chars.
 		 */
-		var data = m[2] + m[3];
+		var data = m[2] + (m[3] ? m[3] : '');
 		var realOffset = Math.ceil(ret.consumed / 3) * 4;
 		data = data.slice(0, realOffset - 2). /*JSSTYLED*/
 		    replace(/[^a-zA-Z0-9+\/=]/g, '') +
@@ -60640,7 +62106,7 @@ function write(key, options) {
 	return (new Buffer(parts.join(' ')));
 }
 
-},{"../key":265,"../private-key":266,"../utils":269,"./rfc4253":258,"./ssh-private":259,"assert-plus":270}],261:[function(require,module,exports){
+},{"../key":267,"../private-key":268,"../utils":271,"./rfc4253":260,"./ssh-private":261,"assert-plus":272}],263:[function(require,module,exports){
 // Copyright 2016 Joyent, Inc.
 
 var x509 = require('./x509');
@@ -60719,13 +62185,14 @@ function write(cert, options) {
 	return (buf.slice(0, o));
 }
 
-},{"../algs":247,"../certificate":248,"../identity":263,"../key":265,"../private-key":266,"../signature":267,"../utils":269,"./pem":255,"./x509":262,"asn1":78,"assert-plus":270}],262:[function(require,module,exports){
-// Copyright 2016 Joyent, Inc.
+},{"../algs":248,"../certificate":249,"../identity":265,"../key":267,"../private-key":268,"../signature":269,"../utils":271,"./pem":257,"./x509":264,"asn1":80,"assert-plus":272}],264:[function(require,module,exports){
+// Copyright 2017 Joyent, Inc.
 
 module.exports = {
 	read: read,
 	verify: verify,
 	sign: sign,
+	signAsync: signAsync,
 	write: write
 };
 
@@ -60791,7 +62258,8 @@ var SIGN_ALGS = {
 	'ecdsa-sha1': '1.2.840.10045.4.1',
 	'ecdsa-sha256': '1.2.840.10045.4.3.2',
 	'ecdsa-sha384': '1.2.840.10045.4.3.3',
-	'ecdsa-sha512': '1.2.840.10045.4.3.4'
+	'ecdsa-sha512': '1.2.840.10045.4.3.4',
+	'ed25519-sha512': '1.3.101.112'
 };
 Object.keys(SIGN_ALGS).forEach(function (k) {
 	SIGN_ALGS[SIGN_ALGS[k]] = k;
@@ -60801,7 +62269,10 @@ SIGN_ALGS['1.3.14.3.2.29'] = 'rsa-sha1';
 
 var EXTS = {
 	'issuerKeyId': '2.5.29.35',
-	'altName': '2.5.29.17'
+	'altName': '2.5.29.17',
+	'basicConstraints': '2.5.29.19',
+	'keyUsage': '2.5.29.15',
+	'extKeyUsage': '2.5.29.37'
 };
 
 function read(buf, options) {
@@ -60932,6 +62403,26 @@ var ALTNAME = {
 	OID: Context(8)
 };
 
+/* RFC5280, section 4.2.1.12 (KeyPurposeId) */
+var EXTPURPOSE = {
+	'serverAuth': '1.3.6.1.5.5.7.3.1',
+	'clientAuth': '1.3.6.1.5.5.7.3.2',
+	'codeSigning': '1.3.6.1.5.5.7.3.3',
+
+	/* See https://github.com/joyent/oid-docs/blob/master/root.md */
+	'joyentDocker': '1.3.6.1.4.1.38678.1.4.1',
+	'joyentCmon': '1.3.6.1.4.1.38678.1.4.2'
+};
+var EXTPURPOSE_REV = {};
+Object.keys(EXTPURPOSE).forEach(function (k) {
+	EXTPURPOSE_REV[EXTPURPOSE[k]] = k;
+});
+
+var KEYUSEBITS = [
+	'signature', 'identity', 'keyEncryption',
+	'encryption', 'keyAgreement', 'ca', 'crl'
+];
+
 function readExtension(cert, buf, der) {
 	der.readSequence();
 	var after = der.offset + der.length;
@@ -60945,6 +62436,81 @@ function readExtension(cert, buf, der) {
 		critical = der.readBoolean();
 
 	switch (extId) {
+	case (EXTS.basicConstraints):
+		der.readSequence(asn1.Ber.OctetString);
+		der.readSequence();
+		var bcEnd = der.offset + der.length;
+		var ca = false;
+		if (der.peek() === asn1.Ber.Boolean)
+			ca = der.readBoolean();
+		if (cert.purposes === undefined)
+			cert.purposes = [];
+		if (ca === true)
+			cert.purposes.push('ca');
+		var bc = { oid: extId, critical: critical };
+		if (der.offset < bcEnd && der.peek() === asn1.Ber.Integer)
+			bc.pathLen = der.readInt();
+		sig.extras.exts.push(bc);
+		break;
+	case (EXTS.extKeyUsage):
+		der.readSequence(asn1.Ber.OctetString);
+		der.readSequence();
+		if (cert.purposes === undefined)
+			cert.purposes = [];
+		var ekEnd = der.offset + der.length;
+		while (der.offset < ekEnd) {
+			var oid = der.readOID();
+			cert.purposes.push(EXTPURPOSE_REV[oid] || oid);
+		}
+		/*
+		 * This is a bit of a hack: in the case where we have a cert
+		 * that's only allowed to do serverAuth or clientAuth (and not
+		 * the other), we want to make sure all our Subjects are of
+		 * the right type. But we already parsed our Subjects and
+		 * decided if they were hosts or users earlier (since it appears
+		 * first in the cert).
+		 *
+		 * So we go through and mutate them into the right kind here if
+		 * it doesn't match. This might not be hugely beneficial, as it
+		 * seems that single-purpose certs are not often seen in the
+		 * wild.
+		 */
+		if (cert.purposes.indexOf('serverAuth') !== -1 &&
+		    cert.purposes.indexOf('clientAuth') === -1) {
+			cert.subjects.forEach(function (ide) {
+				if (ide.type !== 'host') {
+					ide.type = 'host';
+					ide.hostname = ide.uid ||
+					    ide.email ||
+					    ide.components[0].value;
+				}
+			});
+		} else if (cert.purposes.indexOf('clientAuth') !== -1 &&
+		    cert.purposes.indexOf('serverAuth') === -1) {
+			cert.subjects.forEach(function (ide) {
+				if (ide.type !== 'user') {
+					ide.type = 'user';
+					ide.uid = ide.hostname ||
+					    ide.email ||
+					    ide.components[0].value;
+				}
+			});
+		}
+		sig.extras.exts.push({ oid: extId, critical: critical });
+		break;
+	case (EXTS.keyUsage):
+		der.readSequence(asn1.Ber.OctetString);
+		var bits = der.readString(asn1.Ber.BitString, true);
+		var setBits = readBitField(bits, KEYUSEBITS);
+		setBits.forEach(function (bit) {
+			if (cert.purposes === undefined)
+				cert.purposes = [];
+			if (cert.purposes.indexOf(bit) === -1)
+				cert.purposes.push(bit);
+		});
+		sig.extras.exts.push({ oid: extId, critical: critical,
+		    bits: bits });
+		break;
 	case (EXTS.altName):
 		der.readSequence(asn1.Ber.OctetString);
 		der.readSequence();
@@ -61075,6 +62641,32 @@ function sign(cert, key) {
 	return (true);
 }
 
+function signAsync(cert, signer, done) {
+	if (cert.signatures.x509 === undefined)
+		cert.signatures.x509 = {};
+	var sig = cert.signatures.x509;
+
+	var der = new asn1.BerWriter();
+	writeTBSCert(cert, der);
+	var blob = der.buffer;
+	sig.cache = blob;
+
+	signer(blob, function (err, signature) {
+		if (err) {
+			done(err);
+			return;
+		}
+		sig.algo = signature.type + '-' + signature.hashAlgorithm;
+		if (SIGN_ALGS[sig.algo] === undefined) {
+			done(new Error('Invalid signing algorithm "' +
+			    sig.algo + '"'));
+			return;
+		}
+		sig.signature = signature;
+		done();
+	});
+}
+
 function write(cert, options) {
 	var sig = cert.signatures.x509;
 	assert.object(sig, 'x509 signature');
@@ -61119,6 +62711,8 @@ function writeTBSCert(cert, der) {
 
 	der.startSequence();
 	der.writeOID(SIGN_ALGS[sig.algo]);
+	if (sig.algo.match(/^rsa-/))
+		der.writeNull();
 	der.endSequence();
 
 	cert.issuer.toAsn1(der);
@@ -61143,13 +62737,27 @@ function writeTBSCert(cert, der) {
 	}
 
 	if (altNames.length > 0 || subject.type === 'host' ||
+	    (cert.purposes !== undefined && cert.purposes.length > 0) ||
 	    (sig.extras && sig.extras.exts)) {
 		der.startSequence(Local(3));
 		der.startSequence();
 
-		var exts = [
-			{ oid: EXTS.altName }
-		];
+		var exts = [];
+		if (cert.purposes !== undefined && cert.purposes.length > 0) {
+			exts.push({
+				oid: EXTS.basicConstraints,
+				critical: true
+			});
+			exts.push({
+				oid: EXTS.keyUsage,
+				critical: true
+			});
+			exts.push({
+				oid: EXTS.extKeyUsage,
+				critical: true
+			});
+		}
+		exts.push({ oid: EXTS.altName });
 		if (sig.extras && sig.extras.exts)
 			exts = sig.extras.exts;
 
@@ -61190,6 +62798,54 @@ function writeTBSCert(cert, der) {
 				}
 				der.endSequence();
 				der.endSequence();
+			} else if (exts[i].oid === EXTS.basicConstraints) {
+				der.startSequence(asn1.Ber.OctetString);
+				der.startSequence();
+				var ca = (cert.purposes.indexOf('ca') !== -1);
+				var pathLen = exts[i].pathLen;
+				der.writeBoolean(ca);
+				if (pathLen !== undefined)
+					der.writeInt(pathLen);
+				der.endSequence();
+				der.endSequence();
+			} else if (exts[i].oid === EXTS.extKeyUsage) {
+				der.startSequence(asn1.Ber.OctetString);
+				der.startSequence();
+				cert.purposes.forEach(function (purpose) {
+					if (purpose === 'ca')
+						return;
+					if (KEYUSEBITS.indexOf(purpose) !== -1)
+						return;
+					var oid = purpose;
+					if (EXTPURPOSE[purpose] !== undefined)
+						oid = EXTPURPOSE[purpose];
+					der.writeOID(oid);
+				});
+				der.endSequence();
+				der.endSequence();
+			} else if (exts[i].oid === EXTS.keyUsage) {
+				der.startSequence(asn1.Ber.OctetString);
+				/*
+				 * If we parsed this certificate from a byte
+				 * stream (i.e. we didn't generate it in sshpk)
+				 * then we'll have a ".bits" property on the
+				 * ext with the original raw byte contents.
+				 *
+				 * If we have this, use it here instead of
+				 * regenerating it. This guarantees we output
+				 * the same data we parsed, so signatures still
+				 * validate.
+				 */
+				if (exts[i].bits !== undefined) {
+					der.writeBuffer(exts[i].bits,
+					    asn1.Ber.BitString);
+				} else {
+					var bits = writeBitField(cert.purposes,
+					    KEYUSEBITS);
+					der.writeBuffer(bits,
+					    asn1.Ber.BitString);
+				}
+				der.endSequence();
 			} else {
 				der.writeBuffer(exts[i].data,
 				    asn1.Ber.OctetString);
@@ -61205,8 +62861,63 @@ function writeTBSCert(cert, der) {
 	der.endSequence();
 }
 
-},{"../algs":247,"../certificate":248,"../identity":263,"../key":265,"../private-key":266,"../signature":267,"../utils":269,"./pem":255,"./pkcs8":257,"asn1":78,"assert-plus":270}],263:[function(require,module,exports){
-// Copyright 2016 Joyent, Inc.
+/*
+ * Reads an ASN.1 BER bitfield out of the Buffer produced by doing
+ * `BerReader#readString(asn1.Ber.BitString)`. That function gives us the raw
+ * contents of the BitString tag, which is a count of unused bits followed by
+ * the bits as a right-padded byte string.
+ *
+ * `bits` is the Buffer, `bitIndex` should contain an array of string names
+ * for the bits in the string, ordered starting with bit #0 in the ASN.1 spec.
+ *
+ * Returns an array of Strings, the names of the bits that were set to 1.
+ */
+function readBitField(bits, bitIndex) {
+	var bitLen = 8 * (bits.length - 1) - bits[0];
+	var setBits = {};
+	for (var i = 0; i < bitLen; ++i) {
+		var byteN = 1 + Math.floor(i / 8);
+		var bit = 7 - (i % 8);
+		var mask = 1 << bit;
+		var bitVal = ((bits[byteN] & mask) !== 0);
+		var name = bitIndex[i];
+		if (bitVal && typeof (name) === 'string') {
+			setBits[name] = true;
+		}
+	}
+	return (Object.keys(setBits));
+}
+
+/*
+ * `setBits` is an array of strings, containing the names for each bit that
+ * sould be set to 1. `bitIndex` is same as in `readBitField()`.
+ *
+ * Returns a Buffer, ready to be written out with `BerWriter#writeString()`.
+ */
+function writeBitField(setBits, bitIndex) {
+	var bitLen = bitIndex.length;
+	var blen = Math.ceil(bitLen / 8);
+	var unused = blen * 8 - bitLen;
+	var bits = new Buffer(1 + blen);
+	bits.fill(0);
+	bits[0] = unused;
+	for (var i = 0; i < bitLen; ++i) {
+		var byteN = 1 + Math.floor(i / 8);
+		var bit = 7 - (i % 8);
+		var mask = 1 << bit;
+		var name = bitIndex[i];
+		if (name === undefined)
+			continue;
+		var bitVal = (setBits.indexOf(name) !== -1);
+		if (bitVal) {
+			bits[byteN] |= mask;
+		}
+	}
+	return (bits);
+}
+
+},{"../algs":248,"../certificate":249,"../identity":265,"../key":267,"../private-key":268,"../signature":269,"../utils":271,"./pem":257,"./pkcs8":259,"asn1":80,"assert-plus":272}],265:[function(require,module,exports){
+// Copyright 2017 Joyent, Inc.
 
 module.exports = Identity;
 
@@ -61344,14 +63055,25 @@ Identity.prototype.toAsn1 = function (der, tag) {
 		/*
 		 * If we fit in a PrintableString, use that. Otherwise use an
 		 * IA5String or UTF8String.
+		 *
+		 * If this identity was parsed from a DN, use the ASN.1 types
+		 * from the original representation (otherwise this might not
+		 * be a full match for the original in some validators).
 		 */
-		if (c.value.match(NOT_IA5)) {
+		if (c.asn1type === asn1.Ber.Utf8String ||
+		    c.value.match(NOT_IA5)) {
 			var v = new Buffer(c.value, 'utf8');
 			der.writeBuffer(v, asn1.Ber.Utf8String);
-		} else if (c.value.match(NOT_PRINTABLE)) {
+
+		} else if (c.asn1type === asn1.Ber.IA5String ||
+		    c.value.match(NOT_PRINTABLE)) {
 			der.writeString(c.value, asn1.Ber.IA5String);
+
 		} else {
-			der.writeString(c.value, asn1.Ber.PrintableString);
+			var type = asn1.Ber.PrintableString;
+			if (c.asn1type !== undefined)
+				type = c.asn1type;
+			der.writeString(c.value, type);
 		}
 		der.endSequence();
 		der.endSequence();
@@ -61461,7 +63183,7 @@ Identity.parseAsn1 = function (der, top) {
 		default:
 			throw (new Error('Unknown asn1 type ' + type));
 		}
-		components.push({ oid: oid, value: value });
+		components.push({ oid: oid, asn1type: type, value: value });
 		der._offset = after;
 	}
 	der._offset = end;
@@ -61484,7 +63206,7 @@ Identity._oldVersionDetect = function (obj) {
 	return ([1, 0]);
 };
 
-},{"./algs":247,"./errors":251,"./fingerprint":252,"./signature":267,"./utils":269,"asn1":78,"assert-plus":270,"crypto":undefined,"util":undefined}],264:[function(require,module,exports){
+},{"./algs":248,"./errors":252,"./fingerprint":253,"./signature":269,"./utils":271,"asn1":80,"assert-plus":272,"crypto":undefined,"util":undefined}],266:[function(require,module,exports){
 // Copyright 2015 Joyent, Inc.
 
 var Key = require('./key');
@@ -61505,6 +63227,7 @@ module.exports = {
 	parseSignature: Signature.parse,
 	PrivateKey: PrivateKey,
 	parsePrivateKey: PrivateKey.parse,
+	generatePrivateKey: PrivateKey.generate,
 	Certificate: Certificate,
 	parseCertificate: Certificate.parse,
 	createSelfSignedCertificate: Certificate.createSelfSigned,
@@ -61524,8 +63247,8 @@ module.exports = {
 	CertificateParseError: errs.CertificateParseError
 };
 
-},{"./certificate":248,"./errors":251,"./fingerprint":252,"./identity":263,"./key":265,"./private-key":266,"./signature":267}],265:[function(require,module,exports){
-// Copyright 2015 Joyent, Inc.
+},{"./certificate":249,"./errors":252,"./fingerprint":253,"./identity":265,"./key":267,"./private-key":268,"./signature":269}],267:[function(require,module,exports){
+// Copyright 2017 Joyent, Inc.
 
 module.exports = Key;
 
@@ -61534,7 +63257,7 @@ var algs = require('./algs');
 var crypto = require('crypto');
 var Fingerprint = require('./fingerprint');
 var Signature = require('./signature');
-var DiffieHellman = require('./dhe');
+var DiffieHellman = require('./dhe').DiffieHellman;
 var errs = require('./errors');
 var utils = require('./utils');
 var PrivateKey = require('./private-key');
@@ -61558,6 +63281,7 @@ formats['rfc4253'] = require('./formats/rfc4253');
 formats['ssh'] = require('./formats/ssh');
 formats['ssh-private'] = require('./formats/ssh-private');
 formats['openssh'] = formats['ssh-private'];
+formats['dnssec'] = require('./formats/dnssec');
 
 function Key(opts) {
 	assert.object(opts, 'options');
@@ -61591,7 +63315,7 @@ function Key(opts) {
 		var curve = this.part.curve.data.toString();
 		this.curve = curve;
 		sz = algs.curves[curve].size;
-	} else if (this.type === 'ed25519') {
+	} else if (this.type === 'ed25519' || this.type === 'curve25519') {
 		sz = 256;
 		this.curve = 'curve25519';
 	} else {
@@ -61632,7 +63356,6 @@ Key.prototype.hash = function (algo) {
 
 	if (this._hashCache[algo])
 		return (this._hashCache[algo]);
-
 	var hash = crypto.createHash(algo).
 	    update(this.toBuffer('rfc4253')).digest();
 	this._hashCache[algo] = hash;
@@ -61698,6 +63421,7 @@ Key.prototype.createVerify = function (hashAlgo) {
 	assert.ok(v, 'failed to create verifier');
 	var oldVerify = v.verify.bind(v);
 	var key = this.toBuffer('pkcs8');
+	var curve = this.curve;
 	var self = this;
 	v.verify = function (signature, fmt) {
 		if (Signature.isSignature(signature, [2, 0])) {
@@ -61705,6 +63429,9 @@ Key.prototype.createVerify = function (hashAlgo) {
 				return (false);
 			if (signature.hashAlgorithm &&
 			    signature.hashAlgorithm !== hashAlgo)
+				return (false);
+			if (signature.curve && self.type === 'ecdsa' &&
+			    signature.curve !== curve)
 				return (false);
 			return (oldVerify(key, signature.toBuffer('asn1')));
 
@@ -61779,8 +63506,9 @@ Key.isKey = function (obj, ver) {
  * [1,3] -- added defaultHashAlgorithm
  * [1,4] -- added ed support, createDH
  * [1,5] -- first explicitly tagged version
+ * [1,6] -- changed ed25519 part names
  */
-Key.prototype._sshpkApiVersion = [1, 5];
+Key.prototype._sshpkApiVersion = [1, 6];
 
 Key._oldVersionDetect = function (obj) {
 	assert.func(obj.toBuffer);
@@ -61796,8 +63524,8 @@ Key._oldVersionDetect = function (obj) {
 	return ([1, 0]);
 };
 
-},{"./algs":247,"./dhe":249,"./ed-compat":250,"./errors":251,"./fingerprint":252,"./formats/auto":253,"./formats/pem":255,"./formats/pkcs1":256,"./formats/pkcs8":257,"./formats/rfc4253":258,"./formats/ssh":260,"./formats/ssh-private":259,"./private-key":266,"./signature":267,"./utils":269,"assert-plus":270,"crypto":undefined}],266:[function(require,module,exports){
-// Copyright 2015 Joyent, Inc.
+},{"./algs":248,"./dhe":250,"./ed-compat":251,"./errors":252,"./fingerprint":253,"./formats/auto":254,"./formats/dnssec":255,"./formats/pem":257,"./formats/pkcs1":258,"./formats/pkcs8":259,"./formats/rfc4253":260,"./formats/ssh":262,"./formats/ssh-private":261,"./private-key":268,"./signature":269,"./utils":271,"assert-plus":272,"crypto":undefined}],268:[function(require,module,exports){
+// Copyright 2017 Joyent, Inc.
 
 module.exports = PrivateKey;
 
@@ -61809,8 +63537,11 @@ var Signature = require('./signature');
 var errs = require('./errors');
 var util = require('util');
 var utils = require('./utils');
+var dhe = require('./dhe');
+var generateECDSA = dhe.generateECDSA;
+var generateED25519 = dhe.generateED25519;
 var edCompat;
-var ed;
+var nacl;
 
 try {
 	edCompat = require('./ed-compat');
@@ -61833,6 +63564,7 @@ formats['rfc4253'] = require('./formats/rfc4253');
 formats['ssh-private'] = require('./formats/ssh-private');
 formats['openssh'] = formats['ssh-private'];
 formats['ssh'] = formats['ssh-private'];
+formats['dnssec'] = require('./formats/dnssec');
 
 function PrivateKey(opts) {
 	assert.object(opts, 'options');
@@ -61879,49 +63611,44 @@ PrivateKey.prototype.toPublic = function () {
 	return (this._pubCache);
 };
 
-PrivateKey.prototype.derive = function (newType, newSize) {
+PrivateKey.prototype.derive = function (newType) {
 	assert.string(newType, 'type');
-	assert.optionalNumber(newSize, 'size');
-	var priv, pub;
+	var priv, pub, pair;
 
 	if (this.type === 'ed25519' && newType === 'curve25519') {
-		if (ed === undefined)
-			ed = require('jodid25519');
+		if (nacl === undefined)
+			nacl = require('tweetnacl');
 
-		priv = this.part.r.data;
+		priv = this.part.k.data;
 		if (priv[0] === 0x00)
 			priv = priv.slice(1);
-		priv = priv.slice(0, 32);
 
-		pub = ed.dh.publicKey(priv);
-		priv = utils.mpNormalize(Buffer.concat([priv, pub]));
+		pair = nacl.box.keyPair.fromSecretKey(new Uint8Array(priv));
+		pub = new Buffer(pair.publicKey);
 
 		return (new PrivateKey({
 			type: 'curve25519',
 			parts: [
-				{ name: 'R', data: utils.mpNormalize(pub) },
-				{ name: 'r', data: priv }
+				{ name: 'A', data: utils.mpNormalize(pub) },
+				{ name: 'k', data: utils.mpNormalize(priv) }
 			]
 		}));
 	} else if (this.type === 'curve25519' && newType === 'ed25519') {
-		if (ed === undefined)
-			ed = require('jodid25519');
+		if (nacl === undefined)
+			nacl = require('tweetnacl');
 
-		priv = this.part.r.data;
+		priv = this.part.k.data;
 		if (priv[0] === 0x00)
 			priv = priv.slice(1);
-		priv = priv.slice(0, 32);
 
-		pub = ed.eddsa.publicKey(priv.toString('binary'));
-		pub = new Buffer(pub, 'binary');
-
-		priv = utils.mpNormalize(Buffer.concat([priv, pub]));
+		pair = nacl.sign.keyPair.fromSeed(new Uint8Array(priv));
+		pub = new Buffer(pair.publicKey);
 
 		return (new PrivateKey({
 			type: 'ed25519',
 			parts: [
-				{ name: 'R', data: utils.mpNormalize(pub) },
-				{ name: 'r', data: priv }
+				{ name: 'A', data: utils.mpNormalize(pub) },
+				{ name: 'k', data: utils.mpNormalize(priv) }
 			]
 		}));
 	}
@@ -61962,12 +63689,14 @@ PrivateKey.prototype.createSign = function (hashAlgo) {
 	var oldSign = v.sign.bind(v);
 	var key = this.toBuffer('pkcs1');
 	var type = this.type;
+	var curve = this.curve;
 	v.sign = function () {
 		var sig = oldSign(key);
 		if (typeof (sig) === 'string')
 			sig = new Buffer(sig, 'binary');
 		sig = Signature.parse(sig, type, 'asn1');
 		sig.hashAlgorithm = hashAlgo;
+		sig.curve = curve;
 		return (sig);
 	};
 	return (v);
@@ -62007,6 +63736,25 @@ PrivateKey.isPrivateKey = function (obj, ver) {
 	return (utils.isCompatible(obj, PrivateKey, ver));
 };
 
+PrivateKey.generate = function (type, options) {
+	if (options === undefined)
+		options = {};
+	assert.object(options, 'options');
+
+	switch (type) {
+	case 'ecdsa':
+		if (options.curve === undefined)
+			options.curve = 'nistp256';
+		assert.string(options.curve, 'options.curve');
+		return (generateECDSA(options.curve));
+	case 'ed25519':
+		return (generateED25519());
+	default:
+		throw (new Error('Key generation not supported with key ' +
+		    'type "' + type + '"'));
+	}
+};
+
 /*
  * API versions for PrivateKey:
  * [1,0] -- initial ver
@@ -62014,8 +63762,9 @@ PrivateKey.isPrivateKey = function (obj, ver) {
  * [1,2] -- added defaultHashAlgorithm
  * [1,3] -- added derive, ed, createDH
  * [1,4] -- first tagged version
+ * [1,5] -- changed ed25519 part names and format
  */
-PrivateKey.prototype._sshpkApiVersion = [1, 4];
+PrivateKey.prototype._sshpkApiVersion = [1, 5];
 
 PrivateKey._oldVersionDetect = function (obj) {
 	assert.func(obj.toPublic);
@@ -62029,7 +63778,7 @@ PrivateKey._oldVersionDetect = function (obj) {
 	return ([1, 0]);
 };
 
-},{"./algs":247,"./ed-compat":250,"./errors":251,"./fingerprint":252,"./formats/auto":253,"./formats/pem":255,"./formats/pkcs1":256,"./formats/pkcs8":257,"./formats/rfc4253":258,"./formats/ssh-private":259,"./key":265,"./signature":267,"./utils":269,"assert-plus":270,"crypto":undefined,"jodid25519":205,"util":undefined}],267:[function(require,module,exports){
+},{"./algs":248,"./dhe":250,"./ed-compat":251,"./errors":252,"./fingerprint":253,"./formats/auto":254,"./formats/dnssec":255,"./formats/pem":257,"./formats/pkcs1":258,"./formats/pkcs8":259,"./formats/rfc4253":260,"./formats/ssh-private":261,"./key":267,"./signature":269,"./utils":271,"assert-plus":272,"crypto":undefined,"tweetnacl":283,"util":undefined}],269:[function(require,module,exports){
 // Copyright 2015 Joyent, Inc.
 
 module.exports = Signature;
@@ -62058,6 +63807,7 @@ function Signature(opts) {
 
 	this.type = opts.type;
 	this.hashAlgorithm = opts.hashAlgo;
+	this.curve = opts.curve;
 	this.parts = opts.parts;
 	this.part = partLookup;
 }
@@ -62068,18 +63818,45 @@ Signature.prototype.toBuffer = function (format) {
 	assert.string(format, 'format');
 
 	var buf;
+	var stype = 'ssh-' + this.type;
 
 	switch (this.type) {
 	case 'rsa':
-	case 'ed25519':
+		switch (this.hashAlgorithm) {
+		case 'sha256':
+			stype = 'rsa-sha2-256';
+			break;
+		case 'sha512':
+			stype = 'rsa-sha2-512';
+			break;
+		case 'sha1':
+		case undefined:
+			break;
+		default:
+			throw (new Error('SSH signature ' +
+			    'format does not support hash ' +
+			    'algorithm ' + this.hashAlgorithm));
+		}
 		if (format === 'ssh') {
 			buf = new SSHBuffer({});
-			buf.writeString('ssh-' + this.type);
+			buf.writeString(stype);
 			buf.writePart(this.part.sig);
 			return (buf.toBuffer());
 		} else {
 			return (this.part.sig.data);
 		}
+		break;
+
+	case 'ed25519':
+		if (format === 'ssh') {
+			buf = new SSHBuffer({});
+			buf.writeString(stype);
+			buf.writePart(this.part.sig);
+			return (buf.toBuffer());
+		} else {
+			return (this.part.sig.data);
+		}
+		break;
 
 	case 'dsa':
 	case 'ecdsa':
@@ -62158,11 +63935,9 @@ Signature.parse = function (data, type, format) {
 		assert.ok(data.length > 0, 'signature must not be empty');
 		switch (opts.type) {
 		case 'rsa':
-			return (parseOneNum(data, type, format, opts,
-			    'ssh-rsa'));
+			return (parseOneNum(data, type, format, opts));
 		case 'ed25519':
-			return (parseOneNum(data, type, format, opts,
-			    'ssh-ed25519'));
+			return (parseOneNum(data, type, format, opts));
 
 		case 'dsa':
 		case 'ecdsa':
@@ -62184,7 +63959,7 @@ Signature.parse = function (data, type, format) {
 	}
 };
 
-function parseOneNum(data, type, format, opts, headType) {
+function parseOneNum(data, type, format, opts) {
 	if (format === 'ssh') {
 		try {
 			var buf = new SSHBuffer({buffer: data});
@@ -62192,7 +63967,30 @@ function parseOneNum(data, type, format, opts, headType) {
 		} catch (e) {
 			/* fall through */
 		}
-		if (head === headType) {
+		if (buf !== undefined) {
+			var msg = 'SSH signature does not match expected ' +
+			    'type (expected ' + type + ', got ' + head + ')';
+			switch (head) {
+			case 'ssh-rsa':
+				assert.strictEqual(type, 'rsa', msg);
+				opts.hashAlgo = 'sha1';
+				break;
+			case 'rsa-sha2-256':
+				assert.strictEqual(type, 'rsa', msg);
+				opts.hashAlgo = 'sha256';
+				break;
+			case 'rsa-sha2-512':
+				assert.strictEqual(type, 'rsa', msg);
+				opts.hashAlgo = 'sha512';
+				break;
+			case 'ssh-ed25519':
+				assert.strictEqual(type, 'ed25519', msg);
+				opts.hashAlgo = 'sha512';
+				break;
+			default:
+				throw (new Error('Unknown SSH signature ' +
+				    'type: ' + head));
+			}
 			var sig = buf.readPart();
 			assert.ok(buf.atEnd(), 'extra trailing bytes');
 			sig.name = 'sig';
@@ -62236,7 +64034,26 @@ function parseECDSA(data, type, format, opts) {
 
 	var r, s;
 	var inner = buf.readBuffer();
-	if (inner.toString('ascii').match(/^ecdsa-/)) {
+	var stype = inner.toString('ascii');
+	if (stype.slice(0, 6) === 'ecdsa-') {
+		var parts = stype.split('-');
+		assert.strictEqual(parts[0], 'ecdsa');
+		assert.strictEqual(parts[1], 'sha2');
+		opts.curve = parts[2];
+		switch (opts.curve) {
+		case 'nistp256':
+			opts.hashAlgo = 'sha256';
+			break;
+		case 'nistp384':
+			opts.hashAlgo = 'sha384';
+			break;
+		case 'nistp521':
+			opts.hashAlgo = 'sha512';
+			break;
+		default:
+			throw (new Error('Unsupported ECDSA curve: ' +
+			    opts.curve));
+		}
 		inner = buf.readBuffer();
 		assert.ok(buf.atEnd(), 'extra trailing bytes on outer');
 		buf = new SSHBuffer({buffer: inner});
@@ -62276,7 +64093,7 @@ Signature._oldVersionDetect = function (obj) {
 	return ([1, 0]);
 };
 
-},{"./algs":247,"./errors":251,"./ssh-buffer":268,"./utils":269,"asn1":78,"assert-plus":270,"crypto":undefined}],268:[function(require,module,exports){
+},{"./algs":248,"./errors":252,"./ssh-buffer":270,"./utils":271,"asn1":80,"assert-plus":272,"crypto":undefined}],270:[function(require,module,exports){
 // Copyright 2015 Joyent, Inc.
 
 module.exports = SSHBuffer;
@@ -62426,25 +64243,38 @@ SSHBuffer.prototype.write = function (buf) {
 	this._offset += buf.length;
 };
 
-},{"assert-plus":270}],269:[function(require,module,exports){
+},{"assert-plus":272}],271:[function(require,module,exports){
 // Copyright 2015 Joyent, Inc.
 
 module.exports = {
 	bufferSplit: bufferSplit,
 	addRSAMissing: addRSAMissing,
 	calculateDSAPublic: calculateDSAPublic,
+	calculateED25519Public: calculateED25519Public,
+	calculateX25519Public: calculateX25519Public,
 	mpNormalize: mpNormalize,
+	mpDenormalize: mpDenormalize,
 	ecNormalize: ecNormalize,
 	countZeros: countZeros,
 	assertCompatible: assertCompatible,
 	isCompatible: isCompatible,
 	opensslKeyDeriv: opensslKeyDeriv,
-	opensshCipherInfo: opensshCipherInfo
+	opensshCipherInfo: opensshCipherInfo,
+	publicFromPrivateECDSA: publicFromPrivateECDSA,
+	zeroPadToLength: zeroPadToLength,
+	writeBitString: writeBitString,
+	readBitString: readBitString
 };
 
 var assert = require('assert-plus');
 var PrivateKey = require('./private-key');
+var Key = require('./key');
 var crypto = require('crypto');
+var algs = require('./algs');
+var asn1 = require('asn1');
+
+var ec, jsbn;
+var nacl;
 
 var MAX_CLASS_DEPTH = 3;
 
@@ -62607,11 +64437,52 @@ function ecNormalize(buf, addZero) {
 	return (b);
 }
 
+function readBitString(der, tag) {
+	if (tag === undefined)
+		tag = asn1.Ber.BitString;
+	var buf = der.readString(tag, true);
+	assert.strictEqual(buf[0], 0x00, 'bit strings with unused bits are ' +
+	    'not supported (0x' + buf[0].toString(16) + ')');
+	return (buf.slice(1));
+}
+
+function writeBitString(der, buf, tag) {
+	if (tag === undefined)
+		tag = asn1.Ber.BitString;
+	var b = new Buffer(buf.length + 1);
+	b[0] = 0x00;
+	buf.copy(b, 1);
+	der.writeBuffer(b, tag);
+}
+
 function mpNormalize(buf) {
 	assert.buffer(buf);
 	while (buf.length > 1 && buf[0] === 0x00 && (buf[1] & 0x80) === 0x00)
 		buf = buf.slice(1);
 	if ((buf[0] & 0x80) === 0x80) {
+		var b = new Buffer(buf.length + 1);
+		b[0] = 0x00;
+		buf.copy(b, 1);
+		buf = b;
+	}
+	return (buf);
+}
+
+function mpDenormalize(buf) {
+	assert.buffer(buf);
+	while (buf.length > 1 && buf[0] === 0x00)
+		buf = buf.slice(1);
+	return (buf);
+}
+
+function zeroPadToLength(buf, len) {
+	assert.buffer(buf);
+	assert.number(len);
+	while (buf.length > len) {
+		assert.equal(buf[0], 0x00);
+		buf = buf.slice(1);
+	}
+	while (buf.length < len) {
 		var b = new Buffer(buf.length + 1);
 		b[0] = 0x00;
 		buf.copy(b, 1);
@@ -62644,6 +64515,26 @@ function calculateDSAPublic(g, p, x) {
 	return (ybuf);
 }
 
+function calculateED25519Public(k) {
+	assert.buffer(k);
+
+	if (nacl === undefined)
+		nacl = require('tweetnacl');
+
+	var kp = nacl.sign.keyPair.fromSeed(new Uint8Array(k));
+	return (new Buffer(kp.publicKey));
+}
+
+function calculateX25519Public(k) {
+	assert.buffer(k);
+
+	if (nacl === undefined)
+		nacl = require('tweetnacl');
+
+	var kp = nacl.box.keyPair.fromSeed(new Uint8Array(k));
+	return (new Buffer(kp.publicKey));
+}
+
 function addRSAMissing(key) {
 	assert.object(key);
 	assertCompatible(key, PrivateKey, [1, 1]);
@@ -62673,6 +64564,32 @@ function addRSAMissing(key) {
 		key.part.dmodq = {name: 'dmodq', data: buf};
 		key.parts.push(key.part.dmodq);
 	}
+}
+
+function publicFromPrivateECDSA(curveName, priv) {
+	assert.string(curveName, 'curveName');
+	assert.buffer(priv);
+	if (ec === undefined)
+		ec = require('ecc-jsbn/lib/ec');
+	if (jsbn === undefined)
+		jsbn = require('jsbn').BigInteger;
+	var params = algs.curves[curveName];
+	var p = new jsbn(params.p);
+	var a = new jsbn(params.a);
+	var b = new jsbn(params.b);
+	var curve = new ec.ECCurveFp(p, a, b);
+	var G = curve.decodePointHex(params.G.toString('hex'));
+
+	var d = new jsbn(mpNormalize(priv));
+	var pub = G.multiply(d);
+	pub = new Buffer(curve.encodePointHex(pub), 'hex');
+
+	var parts = [];
+	parts.push({name: 'curve', data: new Buffer(curveName)});
+	parts.push({name: 'Q', data: pub});
+
+	var key = new Key({type: 'ecdsa', curve: curve, parts: parts});
+	return (key);
 }
 
 function opensshCipherInfo(cipher) {
@@ -62716,220 +64633,9 @@ function opensshCipherInfo(cipher) {
 	return (inf);
 }
 
-},{"./private-key":266,"assert-plus":270,"crypto":undefined,"jsbn":211}],270:[function(require,module,exports){
-// Copyright (c) 2012, Mark Cavage. All rights reserved.
-// Copyright 2015 Joyent, Inc.
-
-var assert = require('assert');
-var Stream = require('stream').Stream;
-var util = require('util');
-
-
-///--- Globals
-
-/* JSSTYLED */
-var UUID_REGEXP = /^[a-fA-F0-9]{8}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{12}$/;
-
-
-///--- Internal
-
-function _capitalize(str) {
-    return (str.charAt(0).toUpperCase() + str.slice(1));
-}
-
-function _toss(name, expected, oper, arg, actual) {
-    throw new assert.AssertionError({
-        message: util.format('%s (%s) is required', name, expected),
-        actual: (actual === undefined) ? typeof (arg) : actual(arg),
-        expected: expected,
-        operator: oper || '===',
-        stackStartFunction: _toss.caller
-    });
-}
-
-function _getClass(arg) {
-    return (Object.prototype.toString.call(arg).slice(8, -1));
-}
-
-function noop() {
-    // Why even bother with asserts?
-}
-
-
-///--- Exports
-
-var types = {
-    bool: {
-        check: function (arg) { return typeof (arg) === 'boolean'; }
-    },
-    func: {
-        check: function (arg) { return typeof (arg) === 'function'; }
-    },
-    string: {
-        check: function (arg) { return typeof (arg) === 'string'; }
-    },
-    object: {
-        check: function (arg) {
-            return typeof (arg) === 'object' && arg !== null;
-        }
-    },
-    number: {
-        check: function (arg) {
-            return typeof (arg) === 'number' && !isNaN(arg);
-        }
-    },
-    finite: {
-        check: function (arg) {
-            return typeof (arg) === 'number' && !isNaN(arg) && isFinite(arg);
-        }
-    },
-    buffer: {
-        check: function (arg) { return Buffer.isBuffer(arg); },
-        operator: 'Buffer.isBuffer'
-    },
-    array: {
-        check: function (arg) { return Array.isArray(arg); },
-        operator: 'Array.isArray'
-    },
-    stream: {
-        check: function (arg) { return arg instanceof Stream; },
-        operator: 'instanceof',
-        actual: _getClass
-    },
-    date: {
-        check: function (arg) { return arg instanceof Date; },
-        operator: 'instanceof',
-        actual: _getClass
-    },
-    regexp: {
-        check: function (arg) { return arg instanceof RegExp; },
-        operator: 'instanceof',
-        actual: _getClass
-    },
-    uuid: {
-        check: function (arg) {
-            return typeof (arg) === 'string' && UUID_REGEXP.test(arg);
-        },
-        operator: 'isUUID'
-    }
-};
-
-function _setExports(ndebug) {
-    var keys = Object.keys(types);
-    var out;
-
-    /* re-export standard assert */
-    if (process.env.NODE_NDEBUG) {
-        out = noop;
-    } else {
-        out = function (arg, msg) {
-            if (!arg) {
-                _toss(msg, 'true', arg);
-            }
-        };
-    }
-
-    /* standard checks */
-    keys.forEach(function (k) {
-        if (ndebug) {
-            out[k] = noop;
-            return;
-        }
-        var type = types[k];
-        out[k] = function (arg, msg) {
-            if (!type.check(arg)) {
-                _toss(msg, k, type.operator, arg, type.actual);
-            }
-        };
-    });
-
-    /* optional checks */
-    keys.forEach(function (k) {
-        var name = 'optional' + _capitalize(k);
-        if (ndebug) {
-            out[name] = noop;
-            return;
-        }
-        var type = types[k];
-        out[name] = function (arg, msg) {
-            if (arg === undefined || arg === null) {
-                return;
-            }
-            if (!type.check(arg)) {
-                _toss(msg, k, type.operator, arg, type.actual);
-            }
-        };
-    });
-
-    /* arrayOf checks */
-    keys.forEach(function (k) {
-        var name = 'arrayOf' + _capitalize(k);
-        if (ndebug) {
-            out[name] = noop;
-            return;
-        }
-        var type = types[k];
-        var expected = '[' + k + ']';
-        out[name] = function (arg, msg) {
-            if (!Array.isArray(arg)) {
-                _toss(msg, expected, type.operator, arg, type.actual);
-            }
-            var i;
-            for (i = 0; i < arg.length; i++) {
-                if (!type.check(arg[i])) {
-                    _toss(msg, expected, type.operator, arg, type.actual);
-                }
-            }
-        };
-    });
-
-    /* optionalArrayOf checks */
-    keys.forEach(function (k) {
-        var name = 'optionalArrayOf' + _capitalize(k);
-        if (ndebug) {
-            out[name] = noop;
-            return;
-        }
-        var type = types[k];
-        var expected = '[' + k + ']';
-        out[name] = function (arg, msg) {
-            if (arg === undefined || arg === null) {
-                return;
-            }
-            if (!Array.isArray(arg)) {
-                _toss(msg, expected, type.operator, arg, type.actual);
-            }
-            var i;
-            for (i = 0; i < arg.length; i++) {
-                if (!type.check(arg[i])) {
-                    _toss(msg, expected, type.operator, arg, type.actual);
-                }
-            }
-        };
-    });
-
-    /* re-export built-in assertions */
-    Object.keys(assert).forEach(function (k) {
-        if (k === 'AssertionError') {
-            out[k] = assert[k];
-            return;
-        }
-        if (ndebug) {
-            out[k] = noop;
-            return;
-        }
-        out[k] = assert[k];
-    });
-
-    /* export ourselves (for unit tests _only_) */
-    out._setExports = _setExports;
-
-    return out;
-}
-
-module.exports = _setExports(process.env.NODE_NDEBUG);
-
-},{"assert":undefined,"stream":undefined,"util":undefined}],271:[function(require,module,exports){
+},{"./algs":248,"./key":267,"./private-key":268,"asn1":80,"assert-plus":272,"crypto":undefined,"ecc-jsbn/lib/ec":159,"jsbn":210,"tweetnacl":283}],272:[function(require,module,exports){
+arguments[4][215][0].apply(exports,arguments)
+},{"assert":undefined,"dup":215,"stream":undefined,"util":undefined}],273:[function(require,module,exports){
 exports.get = function(belowFn) {
   var oldLimit = Error.stackTraceLimit;
   Error.stackTraceLimit = Infinity;
@@ -62971,7 +64677,7 @@ exports.parse = function(err) {
         });
       }
 
-      var lineMatch = line.match(/at (?:(.+)\s+)?\(?(?:(.+?):(\d+):(\d+)|([^)]+))\)?/);
+      var lineMatch = line.match(/at (?:(.+)\s+\()?(?:(.+?):(\d+)(?::(\d+))?|([^)]+))\)?/);
       if (!lineMatch) {
         return;
       }
@@ -62984,11 +64690,20 @@ exports.parse = function(err) {
       var isNative = (lineMatch[5] === 'native');
 
       if (lineMatch[1]) {
-        var methodMatch = lineMatch[1].match(/([^\.]+)(?:\.(.+))?/);
-        object = methodMatch[1];
-        method = methodMatch[2];
         functionName = lineMatch[1];
-        typeName = 'Object';
+        var methodStart = functionName.lastIndexOf('.');
+        if (functionName[methodStart-1] == '.')
+          methodStart--;
+        if (methodStart > 0) {
+          object = functionName.substr(0, methodStart);
+          method = functionName.substr(methodStart + 1);
+          var objectEnd = object.indexOf('.Module');
+          if (objectEnd > 0) {
+            functionName = functionName.substr(objectEnd + 1);
+            object = object.substr(0, objectEnd);
+          }
+        }
+        typeName = null;
       }
 
       if (method) {
@@ -62998,7 +64713,7 @@ exports.parse = function(err) {
 
       if (method === '<anonymous>') {
         methodName = null;
-        functionName = '';
+        functionName = null;
       }
 
       var properties = {
@@ -63018,31 +64733,47 @@ exports.parse = function(err) {
     });
 };
 
+function CallSite(properties) {
+  for (var property in properties) {
+    this[property] = properties[property];
+  }
+}
+
+var strProperties = [
+  'this',
+  'typeName',
+  'functionName',
+  'methodName',
+  'fileName',
+  'lineNumber',
+  'columnNumber',
+  'function',
+  'evalOrigin'
+];
+var boolProperties = [
+  'topLevel',
+  'eval',
+  'native',
+  'constructor'
+];
+strProperties.forEach(function (property) {
+  CallSite.prototype[property] = null;
+  CallSite.prototype['get' + property[0].toUpperCase() + property.substr(1)] = function () {
+    return this[property];
+  }
+});
+boolProperties.forEach(function (property) {
+  CallSite.prototype[property] = false;
+  CallSite.prototype['is' + property[0].toUpperCase() + property.substr(1)] = function () {
+    return this[property];
+  }
+});
+
 exports._createParsedCallSite = function(properties) {
-  var methods = {};
-  for (var property in properties) {
-    var prefix = 'get';
-    if (property === 'native') {
-      prefix = 'is';
-    }
-    var method = prefix + property.substr(0, 1).toUpperCase() + property.substr(1);
-
-    (function(property) {
-      methods[method] = function() {
-        return properties[property];
-      }
-    })(property);
-  }
-
-  var callSite = Object.create(methods);
-  for (var property in properties) {
-    callSite[property] = properties[property];
-  }
-
-  return callSite;
+  return new CallSite(properties);
 };
 
-},{}],272:[function(require,module,exports){
+},{}],274:[function(require,module,exports){
 var util = require('util')
 var Stream = require('stream')
 var StringDecoder = require('string_decoder').StringDecoder
@@ -63146,7 +64877,7 @@ function alignedWrite(buffer) {
   return returnBuffer.toString(this.encoding)
 }
 
-},{"stream":undefined,"string_decoder":undefined,"util":undefined}],273:[function(require,module,exports){
+},{"stream":undefined,"string_decoder":undefined,"util":undefined}],275:[function(require,module,exports){
 /*!
  * Copyright (c) 2015, Salesforce.com, Inc.
  * All rights reserved.
@@ -63193,33 +64924,24 @@ try {
   console.warn("cookie: can't load punycode; won't use punycode for domain normalization");
 }
 
-var DATE_DELIM = /[\x09\x20-\x2F\x3B-\x40\x5B-\x60\x7B-\x7E]/;
-
 // From RFC6265 S4.1.1
 // note that it excludes \x3B ";"
-var COOKIE_OCTET  = /[\x21\x23-\x2B\x2D-\x3A\x3C-\x5B\x5D-\x7E]/;
-var COOKIE_OCTETS = new RegExp('^'+COOKIE_OCTET.source+'+$');
+var COOKIE_OCTETS = /^[\x21\x23-\x2B\x2D-\x3A\x3C-\x5B\x5D-\x7E]+$/;
 
 var CONTROL_CHARS = /[\x00-\x1F]/;
 
-// Double quotes are part of the value (see: S4.1.1).
-// '\r', '\n' and '\0' should be treated as a terminator in the "relaxed" mode
-// (see: https://github.com/ChromiumWebApps/chromium/blob/b3d3b4da8bb94c1b2e061600df106d590fda3620/net/cookies/parsed_cookie.cc#L60)
-// '=' and ';' are attribute/values separators
-// (see: https://github.com/ChromiumWebApps/chromium/blob/b3d3b4da8bb94c1b2e061600df106d590fda3620/net/cookies/parsed_cookie.cc#L64)
-var COOKIE_PAIR = /^(([^=;]+))\s*=\s*([^\n\r\0]*)/;
-
-// Used to parse non-RFC-compliant cookies like '=abc' when given the `loose`
-// option in Cookie.parse:
-var LOOSE_COOKIE_PAIR = /^((?:=)?([^=;]*)\s*=\s*)?([^\n\r\0]*)/;
+// From Chromium // '\r', '\n' and '\0' should be treated as a terminator in
+// the "relaxed" mode, see:
+// https://github.com/ChromiumWebApps/chromium/blob/b3d3b4da8bb94c1b2e061600df106d590fda3620/net/cookies/parsed_cookie.cc#L60
+var TERMINATORS = ['\n', '\r', '\0'];
 
 // RFC6265 S4.1.1 defines path value as 'any CHAR except CTLs or ";"'
 // Note ';' is \x3B
 var PATH_VALUE = /[\x20-\x3A\x3C-\x7E]+/;
 
-var DAY_OF_MONTH = /^(\d{1,2})[^\d]*$/;
-var TIME = /^(\d{1,2})[^\d]*:(\d{1,2})[^\d]*:(\d{1,2})[^\d]*$/;
-var MONTH = /^(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)/i;
+// date-time parsing constants (RFC6265 S5.1.1)
+
+var DATE_DELIM = /[\x09\x20-\x2F\x3B-\x40\x5B-\x60\x7B-\x7E]/;
 
 var MONTH_TO_NUM = {
   jan:0, feb:1, mar:2, apr:3, may:4, jun:5,
@@ -63232,13 +64954,80 @@ var NUM_TO_DAY = [
   'Sun','Mon','Tue','Wed','Thu','Fri','Sat'
 ];
 
-var YEAR = /^(\d{2}|\d{4})$/; // 2 to 4 digits
-
 var MAX_TIME = 2147483647000; // 31-bit max
 var MIN_TIME = 0; // 31-bit min
 
+/*
+ * Parses a Natural number (i.e., non-negative integer) with either the
+ *    <min>*<max>DIGIT ( non-digit *OCTET )
+ * or
+ *    <min>*<max>DIGIT
+ * grammar (RFC6265 S5.1.1).
+ *
+ * The "trailingOK" boolean controls if the grammar accepts a
+ * "( non-digit *OCTET )" trailer.
+ */
+function parseDigits(token, minDigits, maxDigits, trailingOK) {
+  var count = 0;
+  while (count < token.length) {
+    var c = token.charCodeAt(count);
+    // "non-digit = %x00-2F / %x3A-FF"
+    if (c <= 0x2F || c >= 0x3A) {
+      break;
+    }
+    count++;
+  }
 
-// RFC6265 S5.1.1 date parser:
+  // constrain to a minimum and maximum number of digits.
+  if (count < minDigits || count > maxDigits) {
+    return null;
+  }
+
+  if (!trailingOK && count != token.length) {
+    return null;
+  }
+
+  return parseInt(token.substr(0,count), 10);
+}
+
+function parseTime(token) {
+  var parts = token.split(':');
+  var result = [0,0,0];
+
+  /* RF6256 S5.1.1:
+   *      time            = hms-time ( non-digit *OCTET )
+   *      hms-time        = time-field ":" time-field ":" time-field
+   *      time-field      = 1*2DIGIT
+   */
+
+  if (parts.length !== 3) {
+    return null;
+  }
+
+  for (var i = 0; i < 3; i++) {
+    // "time-field" must be strictly "1*2DIGIT", HOWEVER, "hms-time" can be
+    // followed by "( non-digit *OCTET )" so therefore the last time-field can
+    // have a trailer
+    var trailingOK = (i == 2);
+    var num = parseDigits(parts[i], 1, 2, trailingOK);
+    if (num === null) {
+      return null;
+    }
+    result[i] = num;
+  }
+
+  return result;
+}
+
+function parseMonth(token) {
+  token = String(token).substr(0,3).toLowerCase();
+  var num = MONTH_TO_NUM[token];
+  return num >= 0 ? num : null;
+}
+
+/*
+ * RFC6265 S5.1.1 date parser (see RFC for full grammar)
+ */
 function parseDate(str) {
   if (!str) {
     return;
@@ -63254,9 +65043,9 @@ function parseDate(str) {
   }
 
   var hour = null;
-  var minutes = null;
-  var seconds = null;
-  var day = null;
+  var minute = null;
+  var second = null;
+  var dayOfMonth = null;
   var month = null;
   var year = null;
 
@@ -63274,22 +65063,12 @@ function parseDate(str) {
      * the date-token, respectively.  Skip the remaining sub-steps and continue
      * to the next date-token.
      */
-    if (seconds === null) {
-      result = TIME.exec(token);
+    if (second === null) {
+      result = parseTime(token);
       if (result) {
-        hour = parseInt(result[1], 10);
-        minutes = parseInt(result[2], 10);
-        seconds = parseInt(result[3], 10);
-        /* RFC6265 S5.1.1.5:
-         * [fail if]
-         * *  the hour-value is greater than 23,
-         * *  the minute-value is greater than 59, or
-         * *  the second-value is greater than 59.
-         */
-        if(hour > 23 || minutes > 59 || seconds > 59) {
-          return;
-        }
-
+        hour = result[0];
+        minute = result[1];
+        second = result[2];
         continue;
       }
     }
@@ -63299,16 +65078,11 @@ function parseDate(str) {
      * the day-of-month-value to the number denoted by the date-token.  Skip
      * the remaining sub-steps and continue to the next date-token.
      */
-    if (day === null) {
-      result = DAY_OF_MONTH.exec(token);
-      if (result) {
-        day = parseInt(result, 10);
-        /* RFC6265 S5.1.1.5:
-         * [fail if] the day-of-month-value is less than 1 or greater than 31
-         */
-        if(day < 1 || day > 31) {
-          return;
-        }
+    if (dayOfMonth === null) {
+      // "day-of-month = 1*2DIGIT ( non-digit *OCTET )"
+      result = parseDigits(token, 1, 2, true);
+      if (result !== null) {
+        dayOfMonth = result;
         continue;
       }
     }
@@ -63319,47 +65093,63 @@ function parseDate(str) {
      * continue to the next date-token.
      */
     if (month === null) {
-      result = MONTH.exec(token);
-      if (result) {
-        month = MONTH_TO_NUM[result[1].toLowerCase()];
+      result = parseMonth(token);
+      if (result !== null) {
+        month = result;
         continue;
       }
     }
 
-    /* 2.4. If the found-year flag is not set and the date-token matches the year
-     * production, set the found-year flag and set the year-value to the number
-     * denoted by the date-token.  Skip the remaining sub-steps and continue to
-     * the next date-token.
+    /* 2.4. If the found-year flag is not set and the date-token matches the
+     * year production, set the found-year flag and set the year-value to the
+     * number denoted by the date-token.  Skip the remaining sub-steps and
+     * continue to the next date-token.
      */
     if (year === null) {
-      result = YEAR.exec(token);
-      if (result) {
-        year = parseInt(result[0], 10);
+      // "year = 2*4DIGIT ( non-digit *OCTET )"
+      result = parseDigits(token, 2, 4, true);
+      if (result !== null) {
+        year = result;
         /* From S5.1.1:
          * 3.  If the year-value is greater than or equal to 70 and less
          * than or equal to 99, increment the year-value by 1900.
          * 4.  If the year-value is greater than or equal to 0 and less
          * than or equal to 69, increment the year-value by 2000.
          */
-        if (70 <= year && year <= 99) {
+        if (year >= 70 && year <= 99) {
           year += 1900;
-        } else if (0 <= year && year <= 69) {
+        } else if (year >= 0 && year <= 69) {
           year += 2000;
-        }
-
-        if (year < 1601) {
-          return; // 5. ... the year-value is less than 1601
         }
       }
     }
   }
 
-  if (seconds === null || day === null || month === null || year === null) {
-    return; // 5. ... at least one of the found-day-of-month, found-month, found-
-            // year, or found-time flags is not set,
+  /* RFC 6265 S5.1.1
+   * "5. Abort these steps and fail to parse the cookie-date if:
+   *     *  at least one of the found-day-of-month, found-month, found-
+   *        year, or found-time flags is not set,
+   *     *  the day-of-month-value is less than 1 or greater than 31,
+   *     *  the year-value is less than 1601,
+   *     *  the hour-value is greater than 23,
+   *     *  the minute-value is greater than 59, or
+   *     *  the second-value is greater than 59.
+   *     (Note that leap seconds cannot be represented in this syntax.)"
+   *
+   * So, in order as above:
+   */
+  if (
+    dayOfMonth === null || month === null || year === null || second === null ||
+    dayOfMonth < 1 || dayOfMonth > 31 ||
+    year < 1601 ||
+    hour > 23 ||
+    minute > 59 ||
+    second > 59
+  ) {
+    return;
   }
 
-  return new Date(Date.UTC(year, month, day, hour, minutes, seconds));
+  return new Date(Date.UTC(year, month, dayOfMonth, hour, minute, second));
 }
 
 function formatDate(date) {
@@ -63466,6 +65256,50 @@ function defaultPath(path) {
   return path.slice(0, rightSlash);
 }
 
+function trimTerminator(str) {
+  for (var t = 0; t < TERMINATORS.length; t++) {
+    var terminatorIdx = str.indexOf(TERMINATORS[t]);
+    if (terminatorIdx !== -1) {
+      str = str.substr(0,terminatorIdx);
+    }
+  }
+
+  return str;
+}
+
+function parseCookiePair(cookiePair, looseMode) {
+  cookiePair = trimTerminator(cookiePair);
+
+  var firstEq = cookiePair.indexOf('=');
+  if (looseMode) {
+    if (firstEq === 0) { // '=' is immediately at start
+      cookiePair = cookiePair.substr(1);
+      firstEq = cookiePair.indexOf('='); // might still need to split on '='
+    }
+  } else { // non-loose mode
+    if (firstEq <= 0) { // no '=' or is at start
+      return; // needs to have non-empty "cookie-name"
+    }
+  }
+
+  var cookieName, cookieValue;
+  if (firstEq <= 0) {
+    cookieName = "";
+    cookieValue = cookiePair.trim();
+  } else {
+    cookieName = cookiePair.substr(0, firstEq).trim();
+    cookieValue = cookiePair.substr(firstEq+1).trim();
+  }
+
+  if (CONTROL_CHARS.test(cookieName) || CONTROL_CHARS.test(cookieValue)) {
+    return;
+  }
+
+  var c = new Cookie();
+  c.key = cookieName;
+  c.value = cookieValue;
+  return c;
+}
 
 function parse(str, options) {
   if (!options || typeof options !== 'object') {
@@ -63475,23 +65309,9 @@ function parse(str, options) {
 
   // We use a regex to parse the "name-value-pair" part of S5.2
   var firstSemi = str.indexOf(';'); // S5.2 step 1
-  var pairRe = options.loose ? LOOSE_COOKIE_PAIR : COOKIE_PAIR;
-  var result = pairRe.exec(firstSemi === -1 ? str : str.substr(0,firstSemi));
-
-  // Rx satisfies the "the name string is empty" and "lacks a %x3D ("=")"
-  // constraints as well as trimming any whitespace.
-  if (!result) {
-    return;
-  }
-
-  var c = new Cookie();
-  if (result[1]) {
-    c.key = result[2].trim();
-  } else {
-    c.key = '';
-  }
-  c.value = result[3].trim();
-  if (CONTROL_CHARS.test(c.key) || CONTROL_CHARS.test(c.value)) {
+  var cookiePair = (firstSemi === -1) ? str : str.substr(0, firstSemi);
+  var c = parseCookiePair(cookiePair, !!options.loose);
+  if (!c) {
     return;
   }
 
@@ -64355,6 +66175,7 @@ CookieJar.prototype._importCookies = function(serialized, cb) {
   if (!cookies || !Array.isArray(cookies)) {
     return cb(new Error('serialized jar has no cookies array'));
   }
+  cookies = cookies.slice(); // do not modify the original
 
   function putNext(err) {
     if (err) {
@@ -64484,7 +66305,7 @@ module.exports = {
   canonicalDomain: canonicalDomain
 };
 
-},{"../package.json":279,"./memstore":274,"./pathMatch":275,"./permuteDomain":276,"./pubsuffix":277,"./store":278,"net":undefined,"punycode":undefined,"url":undefined}],274:[function(require,module,exports){
+},{"../package.json":281,"./memstore":276,"./pathMatch":277,"./permuteDomain":278,"./pubsuffix":279,"./store":280,"net":undefined,"punycode":undefined,"url":undefined}],276:[function(require,module,exports){
 /*!
  * Copyright (c) 2015, Salesforce.com, Inc.
  * All rights reserved.
@@ -64656,7 +66477,7 @@ MemoryCookieStore.prototype.getAllCookies = function(cb) {
   cb(null, cookies);
 };
 
-},{"./pathMatch":275,"./permuteDomain":276,"./store":278,"util":undefined}],275:[function(require,module,exports){
+},{"./pathMatch":277,"./permuteDomain":278,"./store":280,"util":undefined}],277:[function(require,module,exports){
 /*!
  * Copyright (c) 2015, Salesforce.com, Inc.
  * All rights reserved.
@@ -64719,7 +66540,7 @@ function pathMatch (reqPath, cookiePath) {
 
 exports.pathMatch = pathMatch;
 
-},{}],276:[function(require,module,exports){
+},{}],278:[function(require,module,exports){
 /*!
  * Copyright (c) 2015, Salesforce.com, Inc.
  * All rights reserved.
@@ -64777,7 +66598,7 @@ function permuteDomain (domain) {
 
 exports.permuteDomain = permuteDomain;
 
-},{"./pubsuffix":277}],277:[function(require,module,exports){
+},{"./pubsuffix":279}],279:[function(require,module,exports){
 /****************************************************
  * AUTOMATICALLY GENERATED by generate-pubsuffix.js *
  *                  DO NOT EDIT!                    *
@@ -64873,11 +66694,11 @@ module.exports.getPublicSuffix = function getPublicSuffix(domain) {
 // See public-suffix.txt for more information
 
 var index = module.exports.index = Object.freeze(
-{"ac":true,"com.ac":true,"edu.ac":true,"gov.ac":true,"net.ac":true,"mil.ac":true,"org.ac":true,"ad":true,"nom.ad":true,"ae":true,"co.ae":true,"net.ae":true,"org.ae":true,"sch.ae":true,"ac.ae":true,"gov.ae":true,"mil.ae":true,"aero":true,"accident-investigation.aero":true,"accident-prevention.aero":true,"aerobatic.aero":true,"aeroclub.aero":true,"aerodrome.aero":true,"agents.aero":true,"aircraft.aero":true,"airline.aero":true,"airport.aero":true,"air-surveillance.aero":true,"airtraffic.aero":true,"air-traffic-control.aero":true,"ambulance.aero":true,"amusement.aero":true,"association.aero":true,"author.aero":true,"ballooning.aero":true,"broker.aero":true,"caa.aero":true,"cargo.aero":true,"catering.aero":true,"certification.aero":true,"championship.aero":true,"charter.aero":true,"civilaviation.aero":true,"club.aero":true,"conference.aero":true,"consultant.aero":true,"consulting.aero":true,"control.aero":true,"council.aero":true,"crew.aero":true,"design.aero":true,"dgca.aero":true,"educator.aero":true,"emergency.aero":true,"engine.aero":true,"engineer.aero":true,"entertainment.aero":true,"equipment.aero":true,"exchange.aero":true,"express.aero":true,"federation.aero":true,"flight.aero":true,"freight.aero":true,"fuel.aero":true,"gliding.aero":true,"government.aero":true,"groundhandling.aero":true,"group.aero":true,"hanggliding.aero":true,"homebuilt.aero":true,"insurance.aero":true,"journal.aero":true,"journalist.aero":true,"leasing.aero":true,"logistics.aero":true,"magazine.aero":true,"maintenance.aero":true,"marketplace.aero":true,"media.aero":true,"microlight.aero":true,"modelling.aero":true,"navigation.aero":true,"parachuting.aero":true,"paragliding.aero":true,"passenger-association.aero":true,"pilot.aero":true,"press.aero":true,"production.aero":true,"recreation.aero":true,"repbody.aero":true,"res.aero":true,"research.aero":true,"rotorcraft.aero":true,"safety.aero":true,"scientist.aero":true,"services.aero":true,"show.aero":true,"skydiving.aero":true,"software.aero":true,"student.aero":true,"taxi.aero":true,"trader.aero":true,"trading.aero":true,"trainer.aero":true,"union.aero":true,"workinggroup.aero":true,"works.aero":true,"af":true,"gov.af":true,"com.af":true,"org.af":true,"net.af":true,"edu.af":true,"ag":true,"com.ag":true,"org.ag":true,"net.ag":true,"co.ag":true,"nom.ag":true,"ai":true,"off.ai":true,"com.ai":true,"net.ai":true,"org.ai":true,"al":true,"com.al":true,"edu.al":true,"gov.al":true,"mil.al":true,"net.al":true,"org.al":true,"am":true,"an":true,"com.an":true,"net.an":true,"org.an":true,"edu.an":true,"ao":true,"ed.ao":true,"gv.ao":true,"og.ao":true,"co.ao":true,"pb.ao":true,"it.ao":true,"aq":true,"ar":true,"com.ar":true,"edu.ar":true,"gob.ar":true,"gov.ar":true,"int.ar":true,"mil.ar":true,"net.ar":true,"org.ar":true,"tur.ar":true,"arpa":true,"e164.arpa":true,"in-addr.arpa":true,"ip6.arpa":true,"iris.arpa":true,"uri.arpa":true,"urn.arpa":true,"as":true,"gov.as":true,"asia":true,"at":true,"ac.at":true,"co.at":true,"gv.at":true,"or.at":true,"au":true,"com.au":true,"net.au":true,"org.au":true,"edu.au":true,"gov.au":true,"asn.au":true,"id.au":true,"info.au":true,"conf.au":true,"oz.au":true,"act.au":true,"nsw.au":true,"nt.au":true,"qld.au":true,"sa.au":true,"tas.au":true,"vic.au":true,"wa.au":true,"act.edu.au":true,"nsw.edu.au":true,"nt.edu.au":true,"qld.edu.au":true,"sa.edu.au":true,"tas.edu.au":true,"vic.edu.au":true,"wa.edu.au":true,"qld.gov.au":true,"sa.gov.au":true,"tas.gov.au":true,"vic.gov.au":true,"wa.gov.au":true,"aw":true,"com.aw":true,"ax":true,"az":true,"com.az":true,"net.az":true,"int.az":true,"gov.az":true,"org.az":true,"edu.az":true,"info.az":true,"pp.az":true,"mil.az":true,"name.az":true,"pro.az":true,"biz.az":true,"ba":true,"org.ba":true,"net.ba":true,"edu.ba":true,"gov.ba":true,"mil.ba":true,"unsa.ba":true,"unbi.ba":true,"co.ba":true,"com.ba":true,"rs.ba":true,"bb":true,"biz.bb":true,"co.bb":true,"com.bb":true,"edu.bb":true,"gov.bb":true,"info.bb":true,"net.bb":true,"org.bb":true,"store.bb":true,"tv.bb":true,"*.bd":true,"be":true,"ac.be":true,"bf":true,"gov.bf":true,"bg":true,"a.bg":true,"b.bg":true,"c.bg":true,"d.bg":true,"e.bg":true,"f.bg":true,"g.bg":true,"h.bg":true,"i.bg":true,"j.bg":true,"k.bg":true,"l.bg":true,"m.bg":true,"n.bg":true,"o.bg":true,"p.bg":true,"q.bg":true,"r.bg":true,"s.bg":true,"t.bg":true,"u.bg":true,"v.bg":true,"w.bg":true,"x.bg":true,"y.bg":true,"z.bg":true,"0.bg":true,"1.bg":true,"2.bg":true,"3.bg":true,"4.bg":true,"5.bg":true,"6.bg":true,"7.bg":true,"8.bg":true,"9.bg":true,"bh":true,"com.bh":true,"edu.bh":true,"net.bh":true,"org.bh":true,"gov.bh":true,"bi":true,"co.bi":true,"com.bi":true,"edu.bi":true,"or.bi":true,"org.bi":true,"biz":true,"bj":true,"asso.bj":true,"barreau.bj":true,"gouv.bj":true,"bm":true,"com.bm":true,"edu.bm":true,"gov.bm":true,"net.bm":true,"org.bm":true,"*.bn":true,"bo":true,"com.bo":true,"edu.bo":true,"gov.bo":true,"gob.bo":true,"int.bo":true,"org.bo":true,"net.bo":true,"mil.bo":true,"tv.bo":true,"br":true,"adm.br":true,"adv.br":true,"agr.br":true,"am.br":true,"arq.br":true,"art.br":true,"ato.br":true,"b.br":true,"bio.br":true,"blog.br":true,"bmd.br":true,"cim.br":true,"cng.br":true,"cnt.br":true,"com.br":true,"coop.br":true,"ecn.br":true,"eco.br":true,"edu.br":true,"emp.br":true,"eng.br":true,"esp.br":true,"etc.br":true,"eti.br":true,"far.br":true,"flog.br":true,"fm.br":true,"fnd.br":true,"fot.br":true,"fst.br":true,"g12.br":true,"ggf.br":true,"gov.br":true,"imb.br":true,"ind.br":true,"inf.br":true,"jor.br":true,"jus.br":true,"leg.br":true,"lel.br":true,"mat.br":true,"med.br":true,"mil.br":true,"mp.br":true,"mus.br":true,"net.br":true,"*.nom.br":true,"not.br":true,"ntr.br":true,"odo.br":true,"org.br":true,"ppg.br":true,"pro.br":true,"psc.br":true,"psi.br":true,"qsl.br":true,"radio.br":true,"rec.br":true,"slg.br":true,"srv.br":true,"taxi.br":true,"teo.br":true,"tmp.br":true,"trd.br":true,"tur.br":true,"tv.br":true,"vet.br":true,"vlog.br":true,"wiki.br":true,"zlg.br":true,"bs":true,"com.bs":true,"net.bs":true,"org.bs":true,"edu.bs":true,"gov.bs":true,"bt":true,"com.bt":true,"edu.bt":true,"gov.bt":true,"net.bt":true,"org.bt":true,"bv":true,"bw":true,"co.bw":true,"org.bw":true,"by":true,"gov.by":true,"mil.by":true,"com.by":true,"of.by":true,"bz":true,"com.bz":true,"net.bz":true,"org.bz":true,"edu.bz":true,"gov.bz":true,"ca":true,"ab.ca":true,"bc.ca":true,"mb.ca":true,"nb.ca":true,"nf.ca":true,"nl.ca":true,"ns.ca":true,"nt.ca":true,"nu.ca":true,"on.ca":true,"pe.ca":true,"qc.ca":true,"sk.ca":true,"yk.ca":true,"gc.ca":true,"cat":true,"cc":true,"cd":true,"gov.cd":true,"cf":true,"cg":true,"ch":true,"ci":true,"org.ci":true,"or.ci":true,"com.ci":true,"co.ci":true,"edu.ci":true,"ed.ci":true,"ac.ci":true,"net.ci":true,"go.ci":true,"asso.ci":true,"xn--aroport-bya.ci":true,"int.ci":true,"presse.ci":true,"md.ci":true,"gouv.ci":true,"*.ck":true,"www.ck":false,"cl":true,"gov.cl":true,"gob.cl":true,"co.cl":true,"mil.cl":true,"cm":true,"co.cm":true,"com.cm":true,"gov.cm":true,"net.cm":true,"cn":true,"ac.cn":true,"com.cn":true,"edu.cn":true,"gov.cn":true,"net.cn":true,"org.cn":true,"mil.cn":true,"xn--55qx5d.cn":true,"xn--io0a7i.cn":true,"xn--od0alg.cn":true,"ah.cn":true,"bj.cn":true,"cq.cn":true,"fj.cn":true,"gd.cn":true,"gs.cn":true,"gz.cn":true,"gx.cn":true,"ha.cn":true,"hb.cn":true,"he.cn":true,"hi.cn":true,"hl.cn":true,"hn.cn":true,"jl.cn":true,"js.cn":true,"jx.cn":true,"ln.cn":true,"nm.cn":true,"nx.cn":true,"qh.cn":true,"sc.cn":true,"sd.cn":true,"sh.cn":true,"sn.cn":true,"sx.cn":true,"tj.cn":true,"xj.cn":true,"xz.cn":true,"yn.cn":true,"zj.cn":true,"hk.cn":true,"mo.cn":true,"tw.cn":true,"co":true,"arts.co":true,"com.co":true,"edu.co":true,"firm.co":true,"gov.co":true,"info.co":true,"int.co":true,"mil.co":true,"net.co":true,"nom.co":true,"org.co":true,"rec.co":true,"web.co":true,"com":true,"coop":true,"cr":true,"ac.cr":true,"co.cr":true,"ed.cr":true,"fi.cr":true,"go.cr":true,"or.cr":true,"sa.cr":true,"cu":true,"com.cu":true,"edu.cu":true,"org.cu":true,"net.cu":true,"gov.cu":true,"inf.cu":true,"cv":true,"cw":true,"com.cw":true,"edu.cw":true,"net.cw":true,"org.cw":true,"cx":true,"gov.cx":true,"ac.cy":true,"biz.cy":true,"com.cy":true,"ekloges.cy":true,"gov.cy":true,"ltd.cy":true,"name.cy":true,"net.cy":true,"org.cy":true,"parliament.cy":true,"press.cy":true,"pro.cy":true,"tm.cy":true,"cz":true,"de":true,"dj":true,"dk":true,"dm":true,"com.dm":true,"net.dm":true,"org.dm":true,"edu.dm":true,"gov.dm":true,"do":true,"art.do":true,"com.do":true,"edu.do":true,"gob.do":true,"gov.do":true,"mil.do":true,"net.do":true,"org.do":true,"sld.do":true,"web.do":true,"dz":true,"com.dz":true,"org.dz":true,"net.dz":true,"gov.dz":true,"edu.dz":true,"asso.dz":true,"pol.dz":true,"art.dz":true,"ec":true,"com.ec":true,"info.ec":true,"net.ec":true,"fin.ec":true,"k12.ec":true,"med.ec":true,"pro.ec":true,"org.ec":true,"edu.ec":true,"gov.ec":true,"gob.ec":true,"mil.ec":true,"edu":true,"ee":true,"edu.ee":true,"gov.ee":true,"riik.ee":true,"lib.ee":true,"med.ee":true,"com.ee":true,"pri.ee":true,"aip.ee":true,"org.ee":true,"fie.ee":true,"eg":true,"com.eg":true,"edu.eg":true,"eun.eg":true,"gov.eg":true,"mil.eg":true,"name.eg":true,"net.eg":true,"org.eg":true,"sci.eg":true,"*.er":true,"es":true,"com.es":true,"nom.es":true,"org.es":true,"gob.es":true,"edu.es":true,"et":true,"com.et":true,"gov.et":true,"org.et":true,"edu.et":true,"biz.et":true,"name.et":true,"info.et":true,"net.et":true,"eu":true,"fi":true,"aland.fi":true,"*.fj":true,"*.fk":true,"fm":true,"fo":true,"fr":true,"com.fr":true,"asso.fr":true,"nom.fr":true,"prd.fr":true,"presse.fr":true,"tm.fr":true,"aeroport.fr":true,"assedic.fr":true,"avocat.fr":true,"avoues.fr":true,"cci.fr":true,"chambagri.fr":true,"chirurgiens-dentistes.fr":true,"experts-comptables.fr":true,"geometre-expert.fr":true,"gouv.fr":true,"greta.fr":true,"huissier-justice.fr":true,"medecin.fr":true,"notaires.fr":true,"pharmacien.fr":true,"port.fr":true,"veterinaire.fr":true,"ga":true,"gb":true,"gd":true,"ge":true,"com.ge":true,"edu.ge":true,"gov.ge":true,"org.ge":true,"mil.ge":true,"net.ge":true,"pvt.ge":true,"gf":true,"gg":true,"co.gg":true,"net.gg":true,"org.gg":true,"gh":true,"com.gh":true,"edu.gh":true,"gov.gh":true,"org.gh":true,"mil.gh":true,"gi":true,"com.gi":true,"ltd.gi":true,"gov.gi":true,"mod.gi":true,"edu.gi":true,"org.gi":true,"gl":true,"co.gl":true,"com.gl":true,"edu.gl":true,"net.gl":true,"org.gl":true,"gm":true,"gn":true,"ac.gn":true,"com.gn":true,"edu.gn":true,"gov.gn":true,"org.gn":true,"net.gn":true,"gov":true,"gp":true,"com.gp":true,"net.gp":true,"mobi.gp":true,"edu.gp":true,"org.gp":true,"asso.gp":true,"gq":true,"gr":true,"com.gr":true,"edu.gr":true,"net.gr":true,"org.gr":true,"gov.gr":true,"gs":true,"gt":true,"com.gt":true,"edu.gt":true,"gob.gt":true,"ind.gt":true,"mil.gt":true,"net.gt":true,"org.gt":true,"*.gu":true,"gw":true,"gy":true,"co.gy":true,"com.gy":true,"net.gy":true,"hk":true,"com.hk":true,"edu.hk":true,"gov.hk":true,"idv.hk":true,"net.hk":true,"org.hk":true,"xn--55qx5d.hk":true,"xn--wcvs22d.hk":true,"xn--lcvr32d.hk":true,"xn--mxtq1m.hk":true,"xn--gmqw5a.hk":true,"xn--ciqpn.hk":true,"xn--gmq050i.hk":true,"xn--zf0avx.hk":true,"xn--io0a7i.hk":true,"xn--mk0axi.hk":true,"xn--od0alg.hk":true,"xn--od0aq3b.hk":true,"xn--tn0ag.hk":true,"xn--uc0atv.hk":true,"xn--uc0ay4a.hk":true,"hm":true,"hn":true,"com.hn":true,"edu.hn":true,"org.hn":true,"net.hn":true,"mil.hn":true,"gob.hn":true,"hr":true,"iz.hr":true,"from.hr":true,"name.hr":true,"com.hr":true,"ht":true,"com.ht":true,"shop.ht":true,"firm.ht":true,"info.ht":true,"adult.ht":true,"net.ht":true,"pro.ht":true,"org.ht":true,"med.ht":true,"art.ht":true,"coop.ht":true,"pol.ht":true,"asso.ht":true,"edu.ht":true,"rel.ht":true,"gouv.ht":true,"perso.ht":true,"hu":true,"co.hu":true,"info.hu":true,"org.hu":true,"priv.hu":true,"sport.hu":true,"tm.hu":true,"2000.hu":true,"agrar.hu":true,"bolt.hu":true,"casino.hu":true,"city.hu":true,"erotica.hu":true,"erotika.hu":true,"film.hu":true,"forum.hu":true,"games.hu":true,"hotel.hu":true,"ingatlan.hu":true,"jogasz.hu":true,"konyvelo.hu":true,"lakas.hu":true,"media.hu":true,"news.hu":true,"reklam.hu":true,"sex.hu":true,"shop.hu":true,"suli.hu":true,"szex.hu":true,"tozsde.hu":true,"utazas.hu":true,"video.hu":true,"id":true,"ac.id":true,"biz.id":true,"co.id":true,"desa.id":true,"go.id":true,"mil.id":true,"my.id":true,"net.id":true,"or.id":true,"sch.id":true,"web.id":true,"ie":true,"gov.ie":true,"il":true,"ac.il":true,"co.il":true,"gov.il":true,"idf.il":true,"k12.il":true,"muni.il":true,"net.il":true,"org.il":true,"im":true,"ac.im":true,"co.im":true,"com.im":true,"ltd.co.im":true,"net.im":true,"org.im":true,"plc.co.im":true,"tt.im":true,"tv.im":true,"in":true,"co.in":true,"firm.in":true,"net.in":true,"org.in":true,"gen.in":true,"ind.in":true,"nic.in":true,"ac.in":true,"edu.in":true,"res.in":true,"gov.in":true,"mil.in":true,"info":true,"int":true,"eu.int":true,"io":true,"com.io":true,"iq":true,"gov.iq":true,"edu.iq":true,"mil.iq":true,"com.iq":true,"org.iq":true,"net.iq":true,"ir":true,"ac.ir":true,"co.ir":true,"gov.ir":true,"id.ir":true,"net.ir":true,"org.ir":true,"sch.ir":true,"xn--mgba3a4f16a.ir":true,"xn--mgba3a4fra.ir":true,"is":true,"net.is":true,"com.is":true,"edu.is":true,"gov.is":true,"org.is":true,"int.is":true,"it":true,"gov.it":true,"edu.it":true,"abr.it":true,"abruzzo.it":true,"aosta-valley.it":true,"aostavalley.it":true,"bas.it":true,"basilicata.it":true,"cal.it":true,"calabria.it":true,"cam.it":true,"campania.it":true,"emilia-romagna.it":true,"emiliaromagna.it":true,"emr.it":true,"friuli-v-giulia.it":true,"friuli-ve-giulia.it":true,"friuli-vegiulia.it":true,"friuli-venezia-giulia.it":true,"friuli-veneziagiulia.it":true,"friuli-vgiulia.it":true,"friuliv-giulia.it":true,"friulive-giulia.it":true,"friulivegiulia.it":true,"friulivenezia-giulia.it":true,"friuliveneziagiulia.it":true,"friulivgiulia.it":true,"fvg.it":true,"laz.it":true,"lazio.it":true,"lig.it":true,"liguria.it":true,"lom.it":true,"lombardia.it":true,"lombardy.it":true,"lucania.it":true,"mar.it":true,"marche.it":true,"mol.it":true,"molise.it":true,"piedmont.it":true,"piemonte.it":true,"pmn.it":true,"pug.it":true,"puglia.it":true,"sar.it":true,"sardegna.it":true,"sardinia.it":true,"sic.it":true,"sicilia.it":true,"sicily.it":true,"taa.it":true,"tos.it":true,"toscana.it":true,"trentino-a-adige.it":true,"trentino-aadige.it":true,"trentino-alto-adige.it":true,"trentino-altoadige.it":true,"trentino-s-tirol.it":true,"trentino-stirol.it":true,"trentino-sud-tirol.it":true,"trentino-sudtirol.it":true,"trentino-sued-tirol.it":true,"trentino-suedtirol.it":true,"trentinoa-adige.it":true,"trentinoaadige.it":true,"trentinoalto-adige.it":true,"trentinoaltoadige.it":true,"trentinos-tirol.it":true,"trentinostirol.it":true,"trentinosud-tirol.it":true,"trentinosudtirol.it":true,"trentinosued-tirol.it":true,"trentinosuedtirol.it":true,"tuscany.it":true,"umb.it":true,"umbria.it":true,"val-d-aosta.it":true,"val-daosta.it":true,"vald-aosta.it":true,"valdaosta.it":true,"valle-aosta.it":true,"valle-d-aosta.it":true,"valle-daosta.it":true,"valleaosta.it":true,"valled-aosta.it":true,"valledaosta.it":true,"vallee-aoste.it":true,"valleeaoste.it":true,"vao.it":true,"vda.it":true,"ven.it":true,"veneto.it":true,"ag.it":true,"agrigento.it":true,"al.it":true,"alessandria.it":true,"alto-adige.it":true,"altoadige.it":true,"an.it":true,"ancona.it":true,"andria-barletta-trani.it":true,"andria-trani-barletta.it":true,"andriabarlettatrani.it":true,"andriatranibarletta.it":true,"ao.it":true,"aosta.it":true,"aoste.it":true,"ap.it":true,"aq.it":true,"aquila.it":true,"ar.it":true,"arezzo.it":true,"ascoli-piceno.it":true,"ascolipiceno.it":true,"asti.it":true,"at.it":true,"av.it":true,"avellino.it":true,"ba.it":true,"balsan.it":true,"bari.it":true,"barletta-trani-andria.it":true,"barlettatraniandria.it":true,"belluno.it":true,"benevento.it":true,"bergamo.it":true,"bg.it":true,"bi.it":true,"biella.it":true,"bl.it":true,"bn.it":true,"bo.it":true,"bologna.it":true,"bolzano.it":true,"bozen.it":true,"br.it":true,"brescia.it":true,"brindisi.it":true,"bs.it":true,"bt.it":true,"bz.it":true,"ca.it":true,"cagliari.it":true,"caltanissetta.it":true,"campidano-medio.it":true,"campidanomedio.it":true,"campobasso.it":true,"carbonia-iglesias.it":true,"carboniaiglesias.it":true,"carrara-massa.it":true,"carraramassa.it":true,"caserta.it":true,"catania.it":true,"catanzaro.it":true,"cb.it":true,"ce.it":true,"cesena-forli.it":true,"cesenaforli.it":true,"ch.it":true,"chieti.it":true,"ci.it":true,"cl.it":true,"cn.it":true,"co.it":true,"como.it":true,"cosenza.it":true,"cr.it":true,"cremona.it":true,"crotone.it":true,"cs.it":true,"ct.it":true,"cuneo.it":true,"cz.it":true,"dell-ogliastra.it":true,"dellogliastra.it":true,"en.it":true,"enna.it":true,"fc.it":true,"fe.it":true,"fermo.it":true,"ferrara.it":true,"fg.it":true,"fi.it":true,"firenze.it":true,"florence.it":true,"fm.it":true,"foggia.it":true,"forli-cesena.it":true,"forlicesena.it":true,"fr.it":true,"frosinone.it":true,"ge.it":true,"genoa.it":true,"genova.it":true,"go.it":true,"gorizia.it":true,"gr.it":true,"grosseto.it":true,"iglesias-carbonia.it":true,"iglesiascarbonia.it":true,"im.it":true,"imperia.it":true,"is.it":true,"isernia.it":true,"kr.it":true,"la-spezia.it":true,"laquila.it":true,"laspezia.it":true,"latina.it":true,"lc.it":true,"le.it":true,"lecce.it":true,"lecco.it":true,"li.it":true,"livorno.it":true,"lo.it":true,"lodi.it":true,"lt.it":true,"lu.it":true,"lucca.it":true,"macerata.it":true,"mantova.it":true,"massa-carrara.it":true,"massacarrara.it":true,"matera.it":true,"mb.it":true,"mc.it":true,"me.it":true,"medio-campidano.it":true,"mediocampidano.it":true,"messina.it":true,"mi.it":true,"milan.it":true,"milano.it":true,"mn.it":true,"mo.it":true,"modena.it":true,"monza-brianza.it":true,"monza-e-della-brianza.it":true,"monza.it":true,"monzabrianza.it":true,"monzaebrianza.it":true,"monzaedellabrianza.it":true,"ms.it":true,"mt.it":true,"na.it":true,"naples.it":true,"napoli.it":true,"no.it":true,"novara.it":true,"nu.it":true,"nuoro.it":true,"og.it":true,"ogliastra.it":true,"olbia-tempio.it":true,"olbiatempio.it":true,"or.it":true,"oristano.it":true,"ot.it":true,"pa.it":true,"padova.it":true,"padua.it":true,"palermo.it":true,"parma.it":true,"pavia.it":true,"pc.it":true,"pd.it":true,"pe.it":true,"perugia.it":true,"pesaro-urbino.it":true,"pesarourbino.it":true,"pescara.it":true,"pg.it":true,"pi.it":true,"piacenza.it":true,"pisa.it":true,"pistoia.it":true,"pn.it":true,"po.it":true,"pordenone.it":true,"potenza.it":true,"pr.it":true,"prato.it":true,"pt.it":true,"pu.it":true,"pv.it":true,"pz.it":true,"ra.it":true,"ragusa.it":true,"ravenna.it":true,"rc.it":true,"re.it":true,"reggio-calabria.it":true,"reggio-emilia.it":true,"reggiocalabria.it":true,"reggioemilia.it":true,"rg.it":true,"ri.it":true,"rieti.it":true,"rimini.it":true,"rm.it":true,"rn.it":true,"ro.it":true,"roma.it":true,"rome.it":true,"rovigo.it":true,"sa.it":true,"salerno.it":true,"sassari.it":true,"savona.it":true,"si.it":true,"siena.it":true,"siracusa.it":true,"so.it":true,"sondrio.it":true,"sp.it":true,"sr.it":true,"ss.it":true,"suedtirol.it":true,"sv.it":true,"ta.it":true,"taranto.it":true,"te.it":true,"tempio-olbia.it":true,"tempioolbia.it":true,"teramo.it":true,"terni.it":true,"tn.it":true,"to.it":true,"torino.it":true,"tp.it":true,"tr.it":true,"trani-andria-barletta.it":true,"trani-barletta-andria.it":true,"traniandriabarletta.it":true,"tranibarlettaandria.it":true,"trapani.it":true,"trentino.it":true,"trento.it":true,"treviso.it":true,"trieste.it":true,"ts.it":true,"turin.it":true,"tv.it":true,"ud.it":true,"udine.it":true,"urbino-pesaro.it":true,"urbinopesaro.it":true,"va.it":true,"varese.it":true,"vb.it":true,"vc.it":true,"ve.it":true,"venezia.it":true,"venice.it":true,"verbania.it":true,"vercelli.it":true,"verona.it":true,"vi.it":true,"vibo-valentia.it":true,"vibovalentia.it":true,"vicenza.it":true,"viterbo.it":true,"vr.it":true,"vs.it":true,"vt.it":true,"vv.it":true,"je":true,"co.je":true,"net.je":true,"org.je":true,"*.jm":true,"jo":true,"com.jo":true,"org.jo":true,"net.jo":true,"edu.jo":true,"sch.jo":true,"gov.jo":true,"mil.jo":true,"name.jo":true,"jobs":true,"jp":true,"ac.jp":true,"ad.jp":true,"co.jp":true,"ed.jp":true,"go.jp":true,"gr.jp":true,"lg.jp":true,"ne.jp":true,"or.jp":true,"aichi.jp":true,"akita.jp":true,"aomori.jp":true,"chiba.jp":true,"ehime.jp":true,"fukui.jp":true,"fukuoka.jp":true,"fukushima.jp":true,"gifu.jp":true,"gunma.jp":true,"hiroshima.jp":true,"hokkaido.jp":true,"hyogo.jp":true,"ibaraki.jp":true,"ishikawa.jp":true,"iwate.jp":true,"kagawa.jp":true,"kagoshima.jp":true,"kanagawa.jp":true,"kochi.jp":true,"kumamoto.jp":true,"kyoto.jp":true,"mie.jp":true,"miyagi.jp":true,"miyazaki.jp":true,"nagano.jp":true,"nagasaki.jp":true,"nara.jp":true,"niigata.jp":true,"oita.jp":true,"okayama.jp":true,"okinawa.jp":true,"osaka.jp":true,"saga.jp":true,"saitama.jp":true,"shiga.jp":true,"shimane.jp":true,"shizuoka.jp":true,"tochigi.jp":true,"tokushima.jp":true,"tokyo.jp":true,"tottori.jp":true,"toyama.jp":true,"wakayama.jp":true,"yamagata.jp":true,"yamaguchi.jp":true,"yamanashi.jp":true,"xn--4pvxs.jp":true,"xn--vgu402c.jp":true,"xn--c3s14m.jp":true,"xn--f6qx53a.jp":true,"xn--8pvr4u.jp":true,"xn--uist22h.jp":true,"xn--djrs72d6uy.jp":true,"xn--mkru45i.jp":true,"xn--0trq7p7nn.jp":true,"xn--8ltr62k.jp":true,"xn--2m4a15e.jp":true,"xn--efvn9s.jp":true,"xn--32vp30h.jp":true,"xn--4it797k.jp":true,"xn--1lqs71d.jp":true,"xn--5rtp49c.jp":true,"xn--5js045d.jp":true,"xn--ehqz56n.jp":true,"xn--1lqs03n.jp":true,"xn--qqqt11m.jp":true,"xn--kbrq7o.jp":true,"xn--pssu33l.jp":true,"xn--ntsq17g.jp":true,"xn--uisz3g.jp":true,"xn--6btw5a.jp":true,"xn--1ctwo.jp":true,"xn--6orx2r.jp":true,"xn--rht61e.jp":true,"xn--rht27z.jp":true,"xn--djty4k.jp":true,"xn--nit225k.jp":true,"xn--rht3d.jp":true,"xn--klty5x.jp":true,"xn--kltx9a.jp":true,"xn--kltp7d.jp":true,"xn--uuwu58a.jp":true,"xn--zbx025d.jp":true,"xn--ntso0iqx3a.jp":true,"xn--elqq16h.jp":true,"xn--4it168d.jp":true,"xn--klt787d.jp":true,"xn--rny31h.jp":true,"xn--7t0a264c.jp":true,"xn--5rtq34k.jp":true,"xn--k7yn95e.jp":true,"xn--tor131o.jp":true,"xn--d5qv7z876c.jp":true,"*.kawasaki.jp":true,"*.kitakyushu.jp":true,"*.kobe.jp":true,"*.nagoya.jp":true,"*.sapporo.jp":true,"*.sendai.jp":true,"*.yokohama.jp":true,"city.kawasaki.jp":false,"city.kitakyushu.jp":false,"city.kobe.jp":false,"city.nagoya.jp":false,"city.sapporo.jp":false,"city.sendai.jp":false,"city.yokohama.jp":false,"aisai.aichi.jp":true,"ama.aichi.jp":true,"anjo.aichi.jp":true,"asuke.aichi.jp":true,"chiryu.aichi.jp":true,"chita.aichi.jp":true,"fuso.aichi.jp":true,"gamagori.aichi.jp":true,"handa.aichi.jp":true,"hazu.aichi.jp":true,"hekinan.aichi.jp":true,"higashiura.aichi.jp":true,"ichinomiya.aichi.jp":true,"inazawa.aichi.jp":true,"inuyama.aichi.jp":true,"isshiki.aichi.jp":true,"iwakura.aichi.jp":true,"kanie.aichi.jp":true,"kariya.aichi.jp":true,"kasugai.aichi.jp":true,"kira.aichi.jp":true,"kiyosu.aichi.jp":true,"komaki.aichi.jp":true,"konan.aichi.jp":true,"kota.aichi.jp":true,"mihama.aichi.jp":true,"miyoshi.aichi.jp":true,"nishio.aichi.jp":true,"nisshin.aichi.jp":true,"obu.aichi.jp":true,"oguchi.aichi.jp":true,"oharu.aichi.jp":true,"okazaki.aichi.jp":true,"owariasahi.aichi.jp":true,"seto.aichi.jp":true,"shikatsu.aichi.jp":true,"shinshiro.aichi.jp":true,"shitara.aichi.jp":true,"tahara.aichi.jp":true,"takahama.aichi.jp":true,"tobishima.aichi.jp":true,"toei.aichi.jp":true,"togo.aichi.jp":true,"tokai.aichi.jp":true,"tokoname.aichi.jp":true,"toyoake.aichi.jp":true,"toyohashi.aichi.jp":true,"toyokawa.aichi.jp":true,"toyone.aichi.jp":true,"toyota.aichi.jp":true,"tsushima.aichi.jp":true,"yatomi.aichi.jp":true,"akita.akita.jp":true,"daisen.akita.jp":true,"fujisato.akita.jp":true,"gojome.akita.jp":true,"hachirogata.akita.jp":true,"happou.akita.jp":true,"higashinaruse.akita.jp":true,"honjo.akita.jp":true,"honjyo.akita.jp":true,"ikawa.akita.jp":true,"kamikoani.akita.jp":true,"kamioka.akita.jp":true,"katagami.akita.jp":true,"kazuno.akita.jp":true,"kitaakita.akita.jp":true,"kosaka.akita.jp":true,"kyowa.akita.jp":true,"misato.akita.jp":true,"mitane.akita.jp":true,"moriyoshi.akita.jp":true,"nikaho.akita.jp":true,"noshiro.akita.jp":true,"odate.akita.jp":true,"oga.akita.jp":true,"ogata.akita.jp":true,"semboku.akita.jp":true,"yokote.akita.jp":true,"yurihonjo.akita.jp":true,"aomori.aomori.jp":true,"gonohe.aomori.jp":true,"hachinohe.aomori.jp":true,"hashikami.aomori.jp":true,"hiranai.aomori.jp":true,"hirosaki.aomori.jp":true,"itayanagi.aomori.jp":true,"kuroishi.aomori.jp":true,"misawa.aomori.jp":true,"mutsu.aomori.jp":true,"nakadomari.aomori.jp":true,"noheji.aomori.jp":true,"oirase.aomori.jp":true,"owani.aomori.jp":true,"rokunohe.aomori.jp":true,"sannohe.aomori.jp":true,"shichinohe.aomori.jp":true,"shingo.aomori.jp":true,"takko.aomori.jp":true,"towada.aomori.jp":true,"tsugaru.aomori.jp":true,"tsuruta.aomori.jp":true,"abiko.chiba.jp":true,"asahi.chiba.jp":true,"chonan.chiba.jp":true,"chosei.chiba.jp":true,"choshi.chiba.jp":true,"chuo.chiba.jp":true,"funabashi.chiba.jp":true,"futtsu.chiba.jp":true,"hanamigawa.chiba.jp":true,"ichihara.chiba.jp":true,"ichikawa.chiba.jp":true,"ichinomiya.chiba.jp":true,"inzai.chiba.jp":true,"isumi.chiba.jp":true,"kamagaya.chiba.jp":true,"kamogawa.chiba.jp":true,"kashiwa.chiba.jp":true,"katori.chiba.jp":true,"katsuura.chiba.jp":true,"kimitsu.chiba.jp":true,"kisarazu.chiba.jp":true,"kozaki.chiba.jp":true,"kujukuri.chiba.jp":true,"kyonan.chiba.jp":true,"matsudo.chiba.jp":true,"midori.chiba.jp":true,"mihama.chiba.jp":true,"minamiboso.chiba.jp":true,"mobara.chiba.jp":true,"mutsuzawa.chiba.jp":true,"nagara.chiba.jp":true,"nagareyama.chiba.jp":true,"narashino.chiba.jp":true,"narita.chiba.jp":true,"noda.chiba.jp":true,"oamishirasato.chiba.jp":true,"omigawa.chiba.jp":true,"onjuku.chiba.jp":true,"otaki.chiba.jp":true,"sakae.chiba.jp":true,"sakura.chiba.jp":true,"shimofusa.chiba.jp":true,"shirako.chiba.jp":true,"shiroi.chiba.jp":true,"shisui.chiba.jp":true,"sodegaura.chiba.jp":true,"sosa.chiba.jp":true,"tako.chiba.jp":true,"tateyama.chiba.jp":true,"togane.chiba.jp":true,"tohnosho.chiba.jp":true,"tomisato.chiba.jp":true,"urayasu.chiba.jp":true,"yachimata.chiba.jp":true,"yachiyo.chiba.jp":true,"yokaichiba.chiba.jp":true,"yokoshibahikari.chiba.jp":true,"yotsukaido.chiba.jp":true,"ainan.ehime.jp":true,"honai.ehime.jp":true,"ikata.ehime.jp":true,"imabari.ehime.jp":true,"iyo.ehime.jp":true,"kamijima.ehime.jp":true,"kihoku.ehime.jp":true,"kumakogen.ehime.jp":true,"masaki.ehime.jp":true,"matsuno.ehime.jp":true,"matsuyama.ehime.jp":true,"namikata.ehime.jp":true,"niihama.ehime.jp":true,"ozu.ehime.jp":true,"saijo.ehime.jp":true,"seiyo.ehime.jp":true,"shikokuchuo.ehime.jp":true,"tobe.ehime.jp":true,"toon.ehime.jp":true,"uchiko.ehime.jp":true,"uwajima.ehime.jp":true,"yawatahama.ehime.jp":true,"echizen.fukui.jp":true,"eiheiji.fukui.jp":true,"fukui.fukui.jp":true,"ikeda.fukui.jp":true,"katsuyama.fukui.jp":true,"mihama.fukui.jp":true,"minamiechizen.fukui.jp":true,"obama.fukui.jp":true,"ohi.fukui.jp":true,"ono.fukui.jp":true,"sabae.fukui.jp":true,"sakai.fukui.jp":true,"takahama.fukui.jp":true,"tsuruga.fukui.jp":true,"wakasa.fukui.jp":true,"ashiya.fukuoka.jp":true,"buzen.fukuoka.jp":true,"chikugo.fukuoka.jp":true,"chikuho.fukuoka.jp":true,"chikujo.fukuoka.jp":true,"chikushino.fukuoka.jp":true,"chikuzen.fukuoka.jp":true,"chuo.fukuoka.jp":true,"dazaifu.fukuoka.jp":true,"fukuchi.fukuoka.jp":true,"hakata.fukuoka.jp":true,"higashi.fukuoka.jp":true,"hirokawa.fukuoka.jp":true,"hisayama.fukuoka.jp":true,"iizuka.fukuoka.jp":true,"inatsuki.fukuoka.jp":true,"kaho.fukuoka.jp":true,"kasuga.fukuoka.jp":true,"kasuya.fukuoka.jp":true,"kawara.fukuoka.jp":true,"keisen.fukuoka.jp":true,"koga.fukuoka.jp":true,"kurate.fukuoka.jp":true,"kurogi.fukuoka.jp":true,"kurume.fukuoka.jp":true,"minami.fukuoka.jp":true,"miyako.fukuoka.jp":true,"miyama.fukuoka.jp":true,"miyawaka.fukuoka.jp":true,"mizumaki.fukuoka.jp":true,"munakata.fukuoka.jp":true,"nakagawa.fukuoka.jp":true,"nakama.fukuoka.jp":true,"nishi.fukuoka.jp":true,"nogata.fukuoka.jp":true,"ogori.fukuoka.jp":true,"okagaki.fukuoka.jp":true,"okawa.fukuoka.jp":true,"oki.fukuoka.jp":true,"omuta.fukuoka.jp":true,"onga.fukuoka.jp":true,"onojo.fukuoka.jp":true,"oto.fukuoka.jp":true,"saigawa.fukuoka.jp":true,"sasaguri.fukuoka.jp":true,"shingu.fukuoka.jp":true,"shinyoshitomi.fukuoka.jp":true,"shonai.fukuoka.jp":true,"soeda.fukuoka.jp":true,"sue.fukuoka.jp":true,"tachiarai.fukuoka.jp":true,"tagawa.fukuoka.jp":true,"takata.fukuoka.jp":true,"toho.fukuoka.jp":true,"toyotsu.fukuoka.jp":true,"tsuiki.fukuoka.jp":true,"ukiha.fukuoka.jp":true,"umi.fukuoka.jp":true,"usui.fukuoka.jp":true,"yamada.fukuoka.jp":true,"yame.fukuoka.jp":true,"yanagawa.fukuoka.jp":true,"yukuhashi.fukuoka.jp":true,"aizubange.fukushima.jp":true,"aizumisato.fukushima.jp":true,"aizuwakamatsu.fukushima.jp":true,"asakawa.fukushima.jp":true,"bandai.fukushima.jp":true,"date.fukushima.jp":true,"fukushima.fukushima.jp":true,"furudono.fukushima.jp":true,"futaba.fukushima.jp":true,"hanawa.fukushima.jp":true,"higashi.fukushima.jp":true,"hirata.fukushima.jp":true,"hirono.fukushima.jp":true,"iitate.fukushima.jp":true,"inawashiro.fukushima.jp":true,"ishikawa.fukushima.jp":true,"iwaki.fukushima.jp":true,"izumizaki.fukushima.jp":true,"kagamiishi.fukushima.jp":true,"kaneyama.fukushima.jp":true,"kawamata.fukushima.jp":true,"kitakata.fukushima.jp":true,"kitashiobara.fukushima.jp":true,"koori.fukushima.jp":true,"koriyama.fukushima.jp":true,"kunimi.fukushima.jp":true,"miharu.fukushima.jp":true,"mishima.fukushima.jp":true,"namie.fukushima.jp":true,"nango.fukushima.jp":true,"nishiaizu.fukushima.jp":true,"nishigo.fukushima.jp":true,"okuma.fukushima.jp":true,"omotego.fukushima.jp":true,"ono.fukushima.jp":true,"otama.fukushima.jp":true,"samegawa.fukushima.jp":true,"shimogo.fukushima.jp":true,"shirakawa.fukushima.jp":true,"showa.fukushima.jp":true,"soma.fukushima.jp":true,"sukagawa.fukushima.jp":true,"taishin.fukushima.jp":true,"tamakawa.fukushima.jp":true,"tanagura.fukushima.jp":true,"tenei.fukushima.jp":true,"yabuki.fukushima.jp":true,"yamato.fukushima.jp":true,"yamatsuri.fukushima.jp":true,"yanaizu.fukushima.jp":true,"yugawa.fukushima.jp":true,"anpachi.gifu.jp":true,"ena.gifu.jp":true,"gifu.gifu.jp":true,"ginan.gifu.jp":true,"godo.gifu.jp":true,"gujo.gifu.jp":true,"hashima.gifu.jp":true,"hichiso.gifu.jp":true,"hida.gifu.jp":true,"higashishirakawa.gifu.jp":true,"ibigawa.gifu.jp":true,"ikeda.gifu.jp":true,"kakamigahara.gifu.jp":true,"kani.gifu.jp":true,"kasahara.gifu.jp":true,"kasamatsu.gifu.jp":true,"kawaue.gifu.jp":true,"kitagata.gifu.jp":true,"mino.gifu.jp":true,"minokamo.gifu.jp":true,"mitake.gifu.jp":true,"mizunami.gifu.jp":true,"motosu.gifu.jp":true,"nakatsugawa.gifu.jp":true,"ogaki.gifu.jp":true,"sakahogi.gifu.jp":true,"seki.gifu.jp":true,"sekigahara.gifu.jp":true,"shirakawa.gifu.jp":true,"tajimi.gifu.jp":true,"takayama.gifu.jp":true,"tarui.gifu.jp":true,"toki.gifu.jp":true,"tomika.gifu.jp":true,"wanouchi.gifu.jp":true,"yamagata.gifu.jp":true,"yaotsu.gifu.jp":true,"yoro.gifu.jp":true,"annaka.gunma.jp":true,"chiyoda.gunma.jp":true,"fujioka.gunma.jp":true,"higashiagatsuma.gunma.jp":true,"isesaki.gunma.jp":true,"itakura.gunma.jp":true,"kanna.gunma.jp":true,"kanra.gunma.jp":true,"katashina.gunma.jp":true,"kawaba.gunma.jp":true,"kiryu.gunma.jp":true,"kusatsu.gunma.jp":true,"maebashi.gunma.jp":true,"meiwa.gunma.jp":true,"midori.gunma.jp":true,"minakami.gunma.jp":true,"naganohara.gunma.jp":true,"nakanojo.gunma.jp":true,"nanmoku.gunma.jp":true,"numata.gunma.jp":true,"oizumi.gunma.jp":true,"ora.gunma.jp":true,"ota.gunma.jp":true,"shibukawa.gunma.jp":true,"shimonita.gunma.jp":true,"shinto.gunma.jp":true,"showa.gunma.jp":true,"takasaki.gunma.jp":true,"takayama.gunma.jp":true,"tamamura.gunma.jp":true,"tatebayashi.gunma.jp":true,"tomioka.gunma.jp":true,"tsukiyono.gunma.jp":true,"tsumagoi.gunma.jp":true,"ueno.gunma.jp":true,"yoshioka.gunma.jp":true,"asaminami.hiroshima.jp":true,"daiwa.hiroshima.jp":true,"etajima.hiroshima.jp":true,"fuchu.hiroshima.jp":true,"fukuyama.hiroshima.jp":true,"hatsukaichi.hiroshima.jp":true,"higashihiroshima.hiroshima.jp":true,"hongo.hiroshima.jp":true,"jinsekikogen.hiroshima.jp":true,"kaita.hiroshima.jp":true,"kui.hiroshima.jp":true,"kumano.hiroshima.jp":true,"kure.hiroshima.jp":true,"mihara.hiroshima.jp":true,"miyoshi.hiroshima.jp":true,"naka.hiroshima.jp":true,"onomichi.hiroshima.jp":true,"osakikamijima.hiroshima.jp":true,"otake.hiroshima.jp":true,"saka.hiroshima.jp":true,"sera.hiroshima.jp":true,"seranishi.hiroshima.jp":true,"shinichi.hiroshima.jp":true,"shobara.hiroshima.jp":true,"takehara.hiroshima.jp":true,"abashiri.hokkaido.jp":true,"abira.hokkaido.jp":true,"aibetsu.hokkaido.jp":true,"akabira.hokkaido.jp":true,"akkeshi.hokkaido.jp":true,"asahikawa.hokkaido.jp":true,"ashibetsu.hokkaido.jp":true,"ashoro.hokkaido.jp":true,"assabu.hokkaido.jp":true,"atsuma.hokkaido.jp":true,"bibai.hokkaido.jp":true,"biei.hokkaido.jp":true,"bifuka.hokkaido.jp":true,"bihoro.hokkaido.jp":true,"biratori.hokkaido.jp":true,"chippubetsu.hokkaido.jp":true,"chitose.hokkaido.jp":true,"date.hokkaido.jp":true,"ebetsu.hokkaido.jp":true,"embetsu.hokkaido.jp":true,"eniwa.hokkaido.jp":true,"erimo.hokkaido.jp":true,"esan.hokkaido.jp":true,"esashi.hokkaido.jp":true,"fukagawa.hokkaido.jp":true,"fukushima.hokkaido.jp":true,"furano.hokkaido.jp":true,"furubira.hokkaido.jp":true,"haboro.hokkaido.jp":true,"hakodate.hokkaido.jp":true,"hamatonbetsu.hokkaido.jp":true,"hidaka.hokkaido.jp":true,"higashikagura.hokkaido.jp":true,"higashikawa.hokkaido.jp":true,"hiroo.hokkaido.jp":true,"hokuryu.hokkaido.jp":true,"hokuto.hokkaido.jp":true,"honbetsu.hokkaido.jp":true,"horokanai.hokkaido.jp":true,"horonobe.hokkaido.jp":true,"ikeda.hokkaido.jp":true,"imakane.hokkaido.jp":true,"ishikari.hokkaido.jp":true,"iwamizawa.hokkaido.jp":true,"iwanai.hokkaido.jp":true,"kamifurano.hokkaido.jp":true,"kamikawa.hokkaido.jp":true,"kamishihoro.hokkaido.jp":true,"kamisunagawa.hokkaido.jp":true,"kamoenai.hokkaido.jp":true,"kayabe.hokkaido.jp":true,"kembuchi.hokkaido.jp":true,"kikonai.hokkaido.jp":true,"kimobetsu.hokkaido.jp":true,"kitahiroshima.hokkaido.jp":true,"kitami.hokkaido.jp":true,"kiyosato.hokkaido.jp":true,"koshimizu.hokkaido.jp":true,"kunneppu.hokkaido.jp":true,"kuriyama.hokkaido.jp":true,"kuromatsunai.hokkaido.jp":true,"kushiro.hokkaido.jp":true,"kutchan.hokkaido.jp":true,"kyowa.hokkaido.jp":true,"mashike.hokkaido.jp":true,"matsumae.hokkaido.jp":true,"mikasa.hokkaido.jp":true,"minamifurano.hokkaido.jp":true,"mombetsu.hokkaido.jp":true,"moseushi.hokkaido.jp":true,"mukawa.hokkaido.jp":true,"muroran.hokkaido.jp":true,"naie.hokkaido.jp":true,"nakagawa.hokkaido.jp":true,"nakasatsunai.hokkaido.jp":true,"nakatombetsu.hokkaido.jp":true,"nanae.hokkaido.jp":true,"nanporo.hokkaido.jp":true,"nayoro.hokkaido.jp":true,"nemuro.hokkaido.jp":true,"niikappu.hokkaido.jp":true,"niki.hokkaido.jp":true,"nishiokoppe.hokkaido.jp":true,"noboribetsu.hokkaido.jp":true,"numata.hokkaido.jp":true,"obihiro.hokkaido.jp":true,"obira.hokkaido.jp":true,"oketo.hokkaido.jp":true,"okoppe.hokkaido.jp":true,"otaru.hokkaido.jp":true,"otobe.hokkaido.jp":true,"otofuke.hokkaido.jp":true,"otoineppu.hokkaido.jp":true,"oumu.hokkaido.jp":true,"ozora.hokkaido.jp":true,"pippu.hokkaido.jp":true,"rankoshi.hokkaido.jp":true,"rebun.hokkaido.jp":true,"rikubetsu.hokkaido.jp":true,"rishiri.hokkaido.jp":true,"rishirifuji.hokkaido.jp":true,"saroma.hokkaido.jp":true,"sarufutsu.hokkaido.jp":true,"shakotan.hokkaido.jp":true,"shari.hokkaido.jp":true,"shibecha.hokkaido.jp":true,"shibetsu.hokkaido.jp":true,"shikabe.hokkaido.jp":true,"shikaoi.hokkaido.jp":true,"shimamaki.hokkaido.jp":true,"shimizu.hokkaido.jp":true,"shimokawa.hokkaido.jp":true,"shinshinotsu.hokkaido.jp":true,"shintoku.hokkaido.jp":true,"shiranuka.hokkaido.jp":true,"shiraoi.hokkaido.jp":true,"shiriuchi.hokkaido.jp":true,"sobetsu.hokkaido.jp":true,"sunagawa.hokkaido.jp":true,"taiki.hokkaido.jp":true,"takasu.hokkaido.jp":true,"takikawa.hokkaido.jp":true,"takinoue.hokkaido.jp":true,"teshikaga.hokkaido.jp":true,"tobetsu.hokkaido.jp":true,"tohma.hokkaido.jp":true,"tomakomai.hokkaido.jp":true,"tomari.hokkaido.jp":true,"toya.hokkaido.jp":true,"toyako.hokkaido.jp":true,"toyotomi.hokkaido.jp":true,"toyoura.hokkaido.jp":true,"tsubetsu.hokkaido.jp":true,"tsukigata.hokkaido.jp":true,"urakawa.hokkaido.jp":true,"urausu.hokkaido.jp":true,"uryu.hokkaido.jp":true,"utashinai.hokkaido.jp":true,"wakkanai.hokkaido.jp":true,"wassamu.hokkaido.jp":true,"yakumo.hokkaido.jp":true,"yoichi.hokkaido.jp":true,"aioi.hyogo.jp":true,"akashi.hyogo.jp":true,"ako.hyogo.jp":true,"amagasaki.hyogo.jp":true,"aogaki.hyogo.jp":true,"asago.hyogo.jp":true,"ashiya.hyogo.jp":true,"awaji.hyogo.jp":true,"fukusaki.hyogo.jp":true,"goshiki.hyogo.jp":true,"harima.hyogo.jp":true,"himeji.hyogo.jp":true,"ichikawa.hyogo.jp":true,"inagawa.hyogo.jp":true,"itami.hyogo.jp":true,"kakogawa.hyogo.jp":true,"kamigori.hyogo.jp":true,"kamikawa.hyogo.jp":true,"kasai.hyogo.jp":true,"kasuga.hyogo.jp":true,"kawanishi.hyogo.jp":true,"miki.hyogo.jp":true,"minamiawaji.hyogo.jp":true,"nishinomiya.hyogo.jp":true,"nishiwaki.hyogo.jp":true,"ono.hyogo.jp":true,"sanda.hyogo.jp":true,"sannan.hyogo.jp":true,"sasayama.hyogo.jp":true,"sayo.hyogo.jp":true,"shingu.hyogo.jp":true,"shinonsen.hyogo.jp":true,"shiso.hyogo.jp":true,"sumoto.hyogo.jp":true,"taishi.hyogo.jp":true,"taka.hyogo.jp":true,"takarazuka.hyogo.jp":true,"takasago.hyogo.jp":true,"takino.hyogo.jp":true,"tamba.hyogo.jp":true,"tatsuno.hyogo.jp":true,"toyooka.hyogo.jp":true,"yabu.hyogo.jp":true,"yashiro.hyogo.jp":true,"yoka.hyogo.jp":true,"yokawa.hyogo.jp":true,"ami.ibaraki.jp":true,"asahi.ibaraki.jp":true,"bando.ibaraki.jp":true,"chikusei.ibaraki.jp":true,"daigo.ibaraki.jp":true,"fujishiro.ibaraki.jp":true,"hitachi.ibaraki.jp":true,"hitachinaka.ibaraki.jp":true,"hitachiomiya.ibaraki.jp":true,"hitachiota.ibaraki.jp":true,"ibaraki.ibaraki.jp":true,"ina.ibaraki.jp":true,"inashiki.ibaraki.jp":true,"itako.ibaraki.jp":true,"iwama.ibaraki.jp":true,"joso.ibaraki.jp":true,"kamisu.ibaraki.jp":true,"kasama.ibaraki.jp":true,"kashima.ibaraki.jp":true,"kasumigaura.ibaraki.jp":true,"koga.ibaraki.jp":true,"miho.ibaraki.jp":true,"mito.ibaraki.jp":true,"moriya.ibaraki.jp":true,"naka.ibaraki.jp":true,"namegata.ibaraki.jp":true,"oarai.ibaraki.jp":true,"ogawa.ibaraki.jp":true,"omitama.ibaraki.jp":true,"ryugasaki.ibaraki.jp":true,"sakai.ibaraki.jp":true,"sakuragawa.ibaraki.jp":true,"shimodate.ibaraki.jp":true,"shimotsuma.ibaraki.jp":true,"shirosato.ibaraki.jp":true,"sowa.ibaraki.jp":true,"suifu.ibaraki.jp":true,"takahagi.ibaraki.jp":true,"tamatsukuri.ibaraki.jp":true,"tokai.ibaraki.jp":true,"tomobe.ibaraki.jp":true,"tone.ibaraki.jp":true,"toride.ibaraki.jp":true,"tsuchiura.ibaraki.jp":true,"tsukuba.ibaraki.jp":true,"uchihara.ibaraki.jp":true,"ushiku.ibaraki.jp":true,"yachiyo.ibaraki.jp":true,"yamagata.ibaraki.jp":true,"yawara.ibaraki.jp":true,"yuki.ibaraki.jp":true,"anamizu.ishikawa.jp":true,"hakui.ishikawa.jp":true,"hakusan.ishikawa.jp":true,"kaga.ishikawa.jp":true,"kahoku.ishikawa.jp":true,"kanazawa.ishikawa.jp":true,"kawakita.ishikawa.jp":true,"komatsu.ishikawa.jp":true,"nakanoto.ishikawa.jp":true,"nanao.ishikawa.jp":true,"nomi.ishikawa.jp":true,"nonoichi.ishikawa.jp":true,"noto.ishikawa.jp":true,"shika.ishikawa.jp":true,"suzu.ishikawa.jp":true,"tsubata.ishikawa.jp":true,"tsurugi.ishikawa.jp":true,"uchinada.ishikawa.jp":true,"wajima.ishikawa.jp":true,"fudai.iwate.jp":true,"fujisawa.iwate.jp":true,"hanamaki.iwate.jp":true,"hiraizumi.iwate.jp":true,"hirono.iwate.jp":true,"ichinohe.iwate.jp":true,"ichinoseki.iwate.jp":true,"iwaizumi.iwate.jp":true,"iwate.iwate.jp":true,"joboji.iwate.jp":true,"kamaishi.iwate.jp":true,"kanegasaki.iwate.jp":true,"karumai.iwate.jp":true,"kawai.iwate.jp":true,"kitakami.iwate.jp":true,"kuji.iwate.jp":true,"kunohe.iwate.jp":true,"kuzumaki.iwate.jp":true,"miyako.iwate.jp":true,"mizusawa.iwate.jp":true,"morioka.iwate.jp":true,"ninohe.iwate.jp":true,"noda.iwate.jp":true,"ofunato.iwate.jp":true,"oshu.iwate.jp":true,"otsuchi.iwate.jp":true,"rikuzentakata.iwate.jp":true,"shiwa.iwate.jp":true,"shizukuishi.iwate.jp":true,"sumita.iwate.jp":true,"tanohata.iwate.jp":true,"tono.iwate.jp":true,"yahaba.iwate.jp":true,"yamada.iwate.jp":true,"ayagawa.kagawa.jp":true,"higashikagawa.kagawa.jp":true,"kanonji.kagawa.jp":true,"kotohira.kagawa.jp":true,"manno.kagawa.jp":true,"marugame.kagawa.jp":true,"mitoyo.kagawa.jp":true,"naoshima.kagawa.jp":true,"sanuki.kagawa.jp":true,"tadotsu.kagawa.jp":true,"takamatsu.kagawa.jp":true,"tonosho.kagawa.jp":true,"uchinomi.kagawa.jp":true,"utazu.kagawa.jp":true,"zentsuji.kagawa.jp":true,"akune.kagoshima.jp":true,"amami.kagoshima.jp":true,"hioki.kagoshima.jp":true,"isa.kagoshima.jp":true,"isen.kagoshima.jp":true,"izumi.kagoshima.jp":true,"kagoshima.kagoshima.jp":true,"kanoya.kagoshima.jp":true,"kawanabe.kagoshima.jp":true,"kinko.kagoshima.jp":true,"kouyama.kagoshima.jp":true,"makurazaki.kagoshima.jp":true,"matsumoto.kagoshima.jp":true,"minamitane.kagoshima.jp":true,"nakatane.kagoshima.jp":true,"nishinoomote.kagoshima.jp":true,"satsumasendai.kagoshima.jp":true,"soo.kagoshima.jp":true,"tarumizu.kagoshima.jp":true,"yusui.kagoshima.jp":true,"aikawa.kanagawa.jp":true,"atsugi.kanagawa.jp":true,"ayase.kanagawa.jp":true,"chigasaki.kanagawa.jp":true,"ebina.kanagawa.jp":true,"fujisawa.kanagawa.jp":true,"hadano.kanagawa.jp":true,"hakone.kanagawa.jp":true,"hiratsuka.kanagawa.jp":true,"isehara.kanagawa.jp":true,"kaisei.kanagawa.jp":true,"kamakura.kanagawa.jp":true,"kiyokawa.kanagawa.jp":true,"matsuda.kanagawa.jp":true,"minamiashigara.kanagawa.jp":true,"miura.kanagawa.jp":true,"nakai.kanagawa.jp":true,"ninomiya.kanagawa.jp":true,"odawara.kanagawa.jp":true,"oi.kanagawa.jp":true,"oiso.kanagawa.jp":true,"sagamihara.kanagawa.jp":true,"samukawa.kanagawa.jp":true,"tsukui.kanagawa.jp":true,"yamakita.kanagawa.jp":true,"yamato.kanagawa.jp":true,"yokosuka.kanagawa.jp":true,"yugawara.kanagawa.jp":true,"zama.kanagawa.jp":true,"zushi.kanagawa.jp":true,"aki.kochi.jp":true,"geisei.kochi.jp":true,"hidaka.kochi.jp":true,"higashitsuno.kochi.jp":true,"ino.kochi.jp":true,"kagami.kochi.jp":true,"kami.kochi.jp":true,"kitagawa.kochi.jp":true,"kochi.kochi.jp":true,"mihara.kochi.jp":true,"motoyama.kochi.jp":true,"muroto.kochi.jp":true,"nahari.kochi.jp":true,"nakamura.kochi.jp":true,"nankoku.kochi.jp":true,"nishitosa.kochi.jp":true,"niyodogawa.kochi.jp":true,"ochi.kochi.jp":true,"okawa.kochi.jp":true,"otoyo.kochi.jp":true,"otsuki.kochi.jp":true,"sakawa.kochi.jp":true,"sukumo.kochi.jp":true,"susaki.kochi.jp":true,"tosa.kochi.jp":true,"tosashimizu.kochi.jp":true,"toyo.kochi.jp":true,"tsuno.kochi.jp":true,"umaji.kochi.jp":true,"yasuda.kochi.jp":true,"yusuhara.kochi.jp":true,"amakusa.kumamoto.jp":true,"arao.kumamoto.jp":true,"aso.kumamoto.jp":true,"choyo.kumamoto.jp":true,"gyokuto.kumamoto.jp":true,"hitoyoshi.kumamoto.jp":true,"kamiamakusa.kumamoto.jp":true,"kashima.kumamoto.jp":true,"kikuchi.kumamoto.jp":true,"kosa.kumamoto.jp":true,"kumamoto.kumamoto.jp":true,"mashiki.kumamoto.jp":true,"mifune.kumamoto.jp":true,"minamata.kumamoto.jp":true,"minamioguni.kumamoto.jp":true,"nagasu.kumamoto.jp":true,"nishihara.kumamoto.jp":true,"oguni.kumamoto.jp":true,"ozu.kumamoto.jp":true,"sumoto.kumamoto.jp":true,"takamori.kumamoto.jp":true,"uki.kumamoto.jp":true,"uto.kumamoto.jp":true,"yamaga.kumamoto.jp":true,"yamato.kumamoto.jp":true,"yatsushiro.kumamoto.jp":true,"ayabe.kyoto.jp":true,"fukuchiyama.kyoto.jp":true,"higashiyama.kyoto.jp":true,"ide.kyoto.jp":true,"ine.kyoto.jp":true,"joyo.kyoto.jp":true,"kameoka.kyoto.jp":true,"kamo.kyoto.jp":true,"kita.kyoto.jp":true,"kizu.kyoto.jp":true,"kumiyama.kyoto.jp":true,"kyotamba.kyoto.jp":true,"kyotanabe.kyoto.jp":true,"kyotango.kyoto.jp":true,"maizuru.kyoto.jp":true,"minami.kyoto.jp":true,"minamiyamashiro.kyoto.jp":true,"miyazu.kyoto.jp":true,"muko.kyoto.jp":true,"nagaokakyo.kyoto.jp":true,"nakagyo.kyoto.jp":true,"nantan.kyoto.jp":true,"oyamazaki.kyoto.jp":true,"sakyo.kyoto.jp":true,"seika.kyoto.jp":true,"tanabe.kyoto.jp":true,"uji.kyoto.jp":true,"ujitawara.kyoto.jp":true,"wazuka.kyoto.jp":true,"yamashina.kyoto.jp":true,"yawata.kyoto.jp":true,"asahi.mie.jp":true,"inabe.mie.jp":true,"ise.mie.jp":true,"kameyama.mie.jp":true,"kawagoe.mie.jp":true,"kiho.mie.jp":true,"kisosaki.mie.jp":true,"kiwa.mie.jp":true,"komono.mie.jp":true,"kumano.mie.jp":true,"kuwana.mie.jp":true,"matsusaka.mie.jp":true,"meiwa.mie.jp":true,"mihama.mie.jp":true,"minamiise.mie.jp":true,"misugi.mie.jp":true,"miyama.mie.jp":true,"nabari.mie.jp":true,"shima.mie.jp":true,"suzuka.mie.jp":true,"tado.mie.jp":true,"taiki.mie.jp":true,"taki.mie.jp":true,"tamaki.mie.jp":true,"toba.mie.jp":true,"tsu.mie.jp":true,"udono.mie.jp":true,"ureshino.mie.jp":true,"watarai.mie.jp":true,"yokkaichi.mie.jp":true,"furukawa.miyagi.jp":true,"higashimatsushima.miyagi.jp":true,"ishinomaki.miyagi.jp":true,"iwanuma.miyagi.jp":true,"kakuda.miyagi.jp":true,"kami.miyagi.jp":true,"kawasaki.miyagi.jp":true,"kesennuma.miyagi.jp":true,"marumori.miyagi.jp":true,"matsushima.miyagi.jp":true,"minamisanriku.miyagi.jp":true,"misato.miyagi.jp":true,"murata.miyagi.jp":true,"natori.miyagi.jp":true,"ogawara.miyagi.jp":true,"ohira.miyagi.jp":true,"onagawa.miyagi.jp":true,"osaki.miyagi.jp":true,"rifu.miyagi.jp":true,"semine.miyagi.jp":true,"shibata.miyagi.jp":true,"shichikashuku.miyagi.jp":true,"shikama.miyagi.jp":true,"shiogama.miyagi.jp":true,"shiroishi.miyagi.jp":true,"tagajo.miyagi.jp":true,"taiwa.miyagi.jp":true,"tome.miyagi.jp":true,"tomiya.miyagi.jp":true,"wakuya.miyagi.jp":true,"watari.miyagi.jp":true,"yamamoto.miyagi.jp":true,"zao.miyagi.jp":true,"aya.miyazaki.jp":true,"ebino.miyazaki.jp":true,"gokase.miyazaki.jp":true,"hyuga.miyazaki.jp":true,"kadogawa.miyazaki.jp":true,"kawaminami.miyazaki.jp":true,"kijo.miyazaki.jp":true,"kitagawa.miyazaki.jp":true,"kitakata.miyazaki.jp":true,"kitaura.miyazaki.jp":true,"kobayashi.miyazaki.jp":true,"kunitomi.miyazaki.jp":true,"kushima.miyazaki.jp":true,"mimata.miyazaki.jp":true,"miyakonojo.miyazaki.jp":true,"miyazaki.miyazaki.jp":true,"morotsuka.miyazaki.jp":true,"nichinan.miyazaki.jp":true,"nishimera.miyazaki.jp":true,"nobeoka.miyazaki.jp":true,"saito.miyazaki.jp":true,"shiiba.miyazaki.jp":true,"shintomi.miyazaki.jp":true,"takaharu.miyazaki.jp":true,"takanabe.miyazaki.jp":true,"takazaki.miyazaki.jp":true,"tsuno.miyazaki.jp":true,"achi.nagano.jp":true,"agematsu.nagano.jp":true,"anan.nagano.jp":true,"aoki.nagano.jp":true,"asahi.nagano.jp":true,"azumino.nagano.jp":true,"chikuhoku.nagano.jp":true,"chikuma.nagano.jp":true,"chino.nagano.jp":true,"fujimi.nagano.jp":true,"hakuba.nagano.jp":true,"hara.nagano.jp":true,"hiraya.nagano.jp":true,"iida.nagano.jp":true,"iijima.nagano.jp":true,"iiyama.nagano.jp":true,"iizuna.nagano.jp":true,"ikeda.nagano.jp":true,"ikusaka.nagano.jp":true,"ina.nagano.jp":true,"karuizawa.nagano.jp":true,"kawakami.nagano.jp":true,"kiso.nagano.jp":true,"kisofukushima.nagano.jp":true,"kitaaiki.nagano.jp":true,"komagane.nagano.jp":true,"komoro.nagano.jp":true,"matsukawa.nagano.jp":true,"matsumoto.nagano.jp":true,"miasa.nagano.jp":true,"minamiaiki.nagano.jp":true,"minamimaki.nagano.jp":true,"minamiminowa.nagano.jp":true,"minowa.nagano.jp":true,"miyada.nagano.jp":true,"miyota.nagano.jp":true,"mochizuki.nagano.jp":true,"nagano.nagano.jp":true,"nagawa.nagano.jp":true,"nagiso.nagano.jp":true,"nakagawa.nagano.jp":true,"nakano.nagano.jp":true,"nozawaonsen.nagano.jp":true,"obuse.nagano.jp":true,"ogawa.nagano.jp":true,"okaya.nagano.jp":true,"omachi.nagano.jp":true,"omi.nagano.jp":true,"ookuwa.nagano.jp":true,"ooshika.nagano.jp":true,"otaki.nagano.jp":true,"otari.nagano.jp":true,"sakae.nagano.jp":true,"sakaki.nagano.jp":true,"saku.nagano.jp":true,"sakuho.nagano.jp":true,"shimosuwa.nagano.jp":true,"shinanomachi.nagano.jp":true,"shiojiri.nagano.jp":true,"suwa.nagano.jp":true,"suzaka.nagano.jp":true,"takagi.nagano.jp":true,"takamori.nagano.jp":true,"takayama.nagano.jp":true,"tateshina.nagano.jp":true,"tatsuno.nagano.jp":true,"togakushi.nagano.jp":true,"togura.nagano.jp":true,"tomi.nagano.jp":true,"ueda.nagano.jp":true,"wada.nagano.jp":true,"yamagata.nagano.jp":true,"yamanouchi.nagano.jp":true,"yasaka.nagano.jp":true,"yasuoka.nagano.jp":true,"chijiwa.nagasaki.jp":true,"futsu.nagasaki.jp":true,"goto.nagasaki.jp":true,"hasami.nagasaki.jp":true,"hirado.nagasaki.jp":true,"iki.nagasaki.jp":true,"isahaya.nagasaki.jp":true,"kawatana.nagasaki.jp":true,"kuchinotsu.nagasaki.jp":true,"matsuura.nagasaki.jp":true,"nagasaki.nagasaki.jp":true,"obama.nagasaki.jp":true,"omura.nagasaki.jp":true,"oseto.nagasaki.jp":true,"saikai.nagasaki.jp":true,"sasebo.nagasaki.jp":true,"seihi.nagasaki.jp":true,"shimabara.nagasaki.jp":true,"shinkamigoto.nagasaki.jp":true,"togitsu.nagasaki.jp":true,"tsushima.nagasaki.jp":true,"unzen.nagasaki.jp":true,"ando.nara.jp":true,"gose.nara.jp":true,"heguri.nara.jp":true,"higashiyoshino.nara.jp":true,"ikaruga.nara.jp":true,"ikoma.nara.jp":true,"kamikitayama.nara.jp":true,"kanmaki.nara.jp":true,"kashiba.nara.jp":true,"kashihara.nara.jp":true,"katsuragi.nara.jp":true,"kawai.nara.jp":true,"kawakami.nara.jp":true,"kawanishi.nara.jp":true,"koryo.nara.jp":true,"kurotaki.nara.jp":true,"mitsue.nara.jp":true,"miyake.nara.jp":true,"nara.nara.jp":true,"nosegawa.nara.jp":true,"oji.nara.jp":true,"ouda.nara.jp":true,"oyodo.nara.jp":true,"sakurai.nara.jp":true,"sango.nara.jp":true,"shimoichi.nara.jp":true,"shimokitayama.nara.jp":true,"shinjo.nara.jp":true,"soni.nara.jp":true,"takatori.nara.jp":true,"tawaramoto.nara.jp":true,"tenkawa.nara.jp":true,"tenri.nara.jp":true,"uda.nara.jp":true,"yamatokoriyama.nara.jp":true,"yamatotakada.nara.jp":true,"yamazoe.nara.jp":true,"yoshino.nara.jp":true,"aga.niigata.jp":true,"agano.niigata.jp":true,"gosen.niigata.jp":true,"itoigawa.niigata.jp":true,"izumozaki.niigata.jp":true,"joetsu.niigata.jp":true,"kamo.niigata.jp":true,"kariwa.niigata.jp":true,"kashiwazaki.niigata.jp":true,"minamiuonuma.niigata.jp":true,"mitsuke.niigata.jp":true,"muika.niigata.jp":true,"murakami.niigata.jp":true,"myoko.niigata.jp":true,"nagaoka.niigata.jp":true,"niigata.niigata.jp":true,"ojiya.niigata.jp":true,"omi.niigata.jp":true,"sado.niigata.jp":true,"sanjo.niigata.jp":true,"seiro.niigata.jp":true,"seirou.niigata.jp":true,"sekikawa.niigata.jp":true,"shibata.niigata.jp":true,"tagami.niigata.jp":true,"tainai.niigata.jp":true,"tochio.niigata.jp":true,"tokamachi.niigata.jp":true,"tsubame.niigata.jp":true,"tsunan.niigata.jp":true,"uonuma.niigata.jp":true,"yahiko.niigata.jp":true,"yoita.niigata.jp":true,"yuzawa.niigata.jp":true,"beppu.oita.jp":true,"bungoono.oita.jp":true,"bungotakada.oita.jp":true,"hasama.oita.jp":true,"hiji.oita.jp":true,"himeshima.oita.jp":true,"hita.oita.jp":true,"kamitsue.oita.jp":true,"kokonoe.oita.jp":true,"kuju.oita.jp":true,"kunisaki.oita.jp":true,"kusu.oita.jp":true,"oita.oita.jp":true,"saiki.oita.jp":true,"taketa.oita.jp":true,"tsukumi.oita.jp":true,"usa.oita.jp":true,"usuki.oita.jp":true,"yufu.oita.jp":true,"akaiwa.okayama.jp":true,"asakuchi.okayama.jp":true,"bizen.okayama.jp":true,"hayashima.okayama.jp":true,"ibara.okayama.jp":true,"kagamino.okayama.jp":true,"kasaoka.okayama.jp":true,"kibichuo.okayama.jp":true,"kumenan.okayama.jp":true,"kurashiki.okayama.jp":true,"maniwa.okayama.jp":true,"misaki.okayama.jp":true,"nagi.okayama.jp":true,"niimi.okayama.jp":true,"nishiawakura.okayama.jp":true,"okayama.okayama.jp":true,"satosho.okayama.jp":true,"setouchi.okayama.jp":true,"shinjo.okayama.jp":true,"shoo.okayama.jp":true,"soja.okayama.jp":true,"takahashi.okayama.jp":true,"tamano.okayama.jp":true,"tsuyama.okayama.jp":true,"wake.okayama.jp":true,"yakage.okayama.jp":true,"aguni.okinawa.jp":true,"ginowan.okinawa.jp":true,"ginoza.okinawa.jp":true,"gushikami.okinawa.jp":true,"haebaru.okinawa.jp":true,"higashi.okinawa.jp":true,"hirara.okinawa.jp":true,"iheya.okinawa.jp":true,"ishigaki.okinawa.jp":true,"ishikawa.okinawa.jp":true,"itoman.okinawa.jp":true,"izena.okinawa.jp":true,"kadena.okinawa.jp":true,"kin.okinawa.jp":true,"kitadaito.okinawa.jp":true,"kitanakagusuku.okinawa.jp":true,"kumejima.okinawa.jp":true,"kunigami.okinawa.jp":true,"minamidaito.okinawa.jp":true,"motobu.okinawa.jp":true,"nago.okinawa.jp":true,"naha.okinawa.jp":true,"nakagusuku.okinawa.jp":true,"nakijin.okinawa.jp":true,"nanjo.okinawa.jp":true,"nishihara.okinawa.jp":true,"ogimi.okinawa.jp":true,"okinawa.okinawa.jp":true,"onna.okinawa.jp":true,"shimoji.okinawa.jp":true,"taketomi.okinawa.jp":true,"tarama.okinawa.jp":true,"tokashiki.okinawa.jp":true,"tomigusuku.okinawa.jp":true,"tonaki.okinawa.jp":true,"urasoe.okinawa.jp":true,"uruma.okinawa.jp":true,"yaese.okinawa.jp":true,"yomitan.okinawa.jp":true,"yonabaru.okinawa.jp":true,"yonaguni.okinawa.jp":true,"zamami.okinawa.jp":true,"abeno.osaka.jp":true,"chihayaakasaka.osaka.jp":true,"chuo.osaka.jp":true,"daito.osaka.jp":true,"fujiidera.osaka.jp":true,"habikino.osaka.jp":true,"hannan.osaka.jp":true,"higashiosaka.osaka.jp":true,"higashisumiyoshi.osaka.jp":true,"higashiyodogawa.osaka.jp":true,"hirakata.osaka.jp":true,"ibaraki.osaka.jp":true,"ikeda.osaka.jp":true,"izumi.osaka.jp":true,"izumiotsu.osaka.jp":true,"izumisano.osaka.jp":true,"kadoma.osaka.jp":true,"kaizuka.osaka.jp":true,"kanan.osaka.jp":true,"kashiwara.osaka.jp":true,"katano.osaka.jp":true,"kawachinagano.osaka.jp":true,"kishiwada.osaka.jp":true,"kita.osaka.jp":true,"kumatori.osaka.jp":true,"matsubara.osaka.jp":true,"minato.osaka.jp":true,"minoh.osaka.jp":true,"misaki.osaka.jp":true,"moriguchi.osaka.jp":true,"neyagawa.osaka.jp":true,"nishi.osaka.jp":true,"nose.osaka.jp":true,"osakasayama.osaka.jp":true,"sakai.osaka.jp":true,"sayama.osaka.jp":true,"sennan.osaka.jp":true,"settsu.osaka.jp":true,"shijonawate.osaka.jp":true,"shimamoto.osaka.jp":true,"suita.osaka.jp":true,"tadaoka.osaka.jp":true,"taishi.osaka.jp":true,"tajiri.osaka.jp":true,"takaishi.osaka.jp":true,"takatsuki.osaka.jp":true,"tondabayashi.osaka.jp":true,"toyonaka.osaka.jp":true,"toyono.osaka.jp":true,"yao.osaka.jp":true,"ariake.saga.jp":true,"arita.saga.jp":true,"fukudomi.saga.jp":true,"genkai.saga.jp":true,"hamatama.saga.jp":true,"hizen.saga.jp":true,"imari.saga.jp":true,"kamimine.saga.jp":true,"kanzaki.saga.jp":true,"karatsu.saga.jp":true,"kashima.saga.jp":true,"kitagata.saga.jp":true,"kitahata.saga.jp":true,"kiyama.saga.jp":true,"kouhoku.saga.jp":true,"kyuragi.saga.jp":true,"nishiarita.saga.jp":true,"ogi.saga.jp":true,"omachi.saga.jp":true,"ouchi.saga.jp":true,"saga.saga.jp":true,"shiroishi.saga.jp":true,"taku.saga.jp":true,"tara.saga.jp":true,"tosu.saga.jp":true,"yoshinogari.saga.jp":true,"arakawa.saitama.jp":true,"asaka.saitama.jp":true,"chichibu.saitama.jp":true,"fujimi.saitama.jp":true,"fujimino.saitama.jp":true,"fukaya.saitama.jp":true,"hanno.saitama.jp":true,"hanyu.saitama.jp":true,"hasuda.saitama.jp":true,"hatogaya.saitama.jp":true,"hatoyama.saitama.jp":true,"hidaka.saitama.jp":true,"higashichichibu.saitama.jp":true,"higashimatsuyama.saitama.jp":true,"honjo.saitama.jp":true,"ina.saitama.jp":true,"iruma.saitama.jp":true,"iwatsuki.saitama.jp":true,"kamiizumi.saitama.jp":true,"kamikawa.saitama.jp":true,"kamisato.saitama.jp":true,"kasukabe.saitama.jp":true,"kawagoe.saitama.jp":true,"kawaguchi.saitama.jp":true,"kawajima.saitama.jp":true,"kazo.saitama.jp":true,"kitamoto.saitama.jp":true,"koshigaya.saitama.jp":true,"kounosu.saitama.jp":true,"kuki.saitama.jp":true,"kumagaya.saitama.jp":true,"matsubushi.saitama.jp":true,"minano.saitama.jp":true,"misato.saitama.jp":true,"miyashiro.saitama.jp":true,"miyoshi.saitama.jp":true,"moroyama.saitama.jp":true,"nagatoro.saitama.jp":true,"namegawa.saitama.jp":true,"niiza.saitama.jp":true,"ogano.saitama.jp":true,"ogawa.saitama.jp":true,"ogose.saitama.jp":true,"okegawa.saitama.jp":true,"omiya.saitama.jp":true,"otaki.saitama.jp":true,"ranzan.saitama.jp":true,"ryokami.saitama.jp":true,"saitama.saitama.jp":true,"sakado.saitama.jp":true,"satte.saitama.jp":true,"sayama.saitama.jp":true,"shiki.saitama.jp":true,"shiraoka.saitama.jp":true,"soka.saitama.jp":true,"sugito.saitama.jp":true,"toda.saitama.jp":true,"tokigawa.saitama.jp":true,"tokorozawa.saitama.jp":true,"tsurugashima.saitama.jp":true,"urawa.saitama.jp":true,"warabi.saitama.jp":true,"yashio.saitama.jp":true,"yokoze.saitama.jp":true,"yono.saitama.jp":true,"yorii.saitama.jp":true,"yoshida.saitama.jp":true,"yoshikawa.saitama.jp":true,"yoshimi.saitama.jp":true,"aisho.shiga.jp":true,"gamo.shiga.jp":true,"higashiomi.shiga.jp":true,"hikone.shiga.jp":true,"koka.shiga.jp":true,"konan.shiga.jp":true,"kosei.shiga.jp":true,"koto.shiga.jp":true,"kusatsu.shiga.jp":true,"maibara.shiga.jp":true,"moriyama.shiga.jp":true,"nagahama.shiga.jp":true,"nishiazai.shiga.jp":true,"notogawa.shiga.jp":true,"omihachiman.shiga.jp":true,"otsu.shiga.jp":true,"ritto.shiga.jp":true,"ryuoh.shiga.jp":true,"takashima.shiga.jp":true,"takatsuki.shiga.jp":true,"torahime.shiga.jp":true,"toyosato.shiga.jp":true,"yasu.shiga.jp":true,"akagi.shimane.jp":true,"ama.shimane.jp":true,"gotsu.shimane.jp":true,"hamada.shimane.jp":true,"higashiizumo.shimane.jp":true,"hikawa.shimane.jp":true,"hikimi.shimane.jp":true,"izumo.shimane.jp":true,"kakinoki.shimane.jp":true,"masuda.shimane.jp":true,"matsue.shimane.jp":true,"misato.shimane.jp":true,"nishinoshima.shimane.jp":true,"ohda.shimane.jp":true,"okinoshima.shimane.jp":true,"okuizumo.shimane.jp":true,"shimane.shimane.jp":true,"tamayu.shimane.jp":true,"tsuwano.shimane.jp":true,"unnan.shimane.jp":true,"yakumo.shimane.jp":true,"yasugi.shimane.jp":true,"yatsuka.shimane.jp":true,"arai.shizuoka.jp":true,"atami.shizuoka.jp":true,"fuji.shizuoka.jp":true,"fujieda.shizuoka.jp":true,"fujikawa.shizuoka.jp":true,"fujinomiya.shizuoka.jp":true,"fukuroi.shizuoka.jp":true,"gotemba.shizuoka.jp":true,"haibara.shizuoka.jp":true,"hamamatsu.shizuoka.jp":true,"higashiizu.shizuoka.jp":true,"ito.shizuoka.jp":true,"iwata.shizuoka.jp":true,"izu.shizuoka.jp":true,"izunokuni.shizuoka.jp":true,"kakegawa.shizuoka.jp":true,"kannami.shizuoka.jp":true,"kawanehon.shizuoka.jp":true,"kawazu.shizuoka.jp":true,"kikugawa.shizuoka.jp":true,"kosai.shizuoka.jp":true,"makinohara.shizuoka.jp":true,"matsuzaki.shizuoka.jp":true,"minamiizu.shizuoka.jp":true,"mishima.shizuoka.jp":true,"morimachi.shizuoka.jp":true,"nishiizu.shizuoka.jp":true,"numazu.shizuoka.jp":true,"omaezaki.shizuoka.jp":true,"shimada.shizuoka.jp":true,"shimizu.shizuoka.jp":true,"shimoda.shizuoka.jp":true,"shizuoka.shizuoka.jp":true,"susono.shizuoka.jp":true,"yaizu.shizuoka.jp":true,"yoshida.shizuoka.jp":true,"ashikaga.tochigi.jp":true,"bato.tochigi.jp":true,"haga.tochigi.jp":true,"ichikai.tochigi.jp":true,"iwafune.tochigi.jp":true,"kaminokawa.tochigi.jp":true,"kanuma.tochigi.jp":true,"karasuyama.tochigi.jp":true,"kuroiso.tochigi.jp":true,"mashiko.tochigi.jp":true,"mibu.tochigi.jp":true,"moka.tochigi.jp":true,"motegi.tochigi.jp":true,"nasu.tochigi.jp":true,"nasushiobara.tochigi.jp":true,"nikko.tochigi.jp":true,"nishikata.tochigi.jp":true,"nogi.tochigi.jp":true,"ohira.tochigi.jp":true,"ohtawara.tochigi.jp":true,"oyama.tochigi.jp":true,"sakura.tochigi.jp":true,"sano.tochigi.jp":true,"shimotsuke.tochigi.jp":true,"shioya.tochigi.jp":true,"takanezawa.tochigi.jp":true,"tochigi.tochigi.jp":true,"tsuga.tochigi.jp":true,"ujiie.tochigi.jp":true,"utsunomiya.tochigi.jp":true,"yaita.tochigi.jp":true,"aizumi.tokushima.jp":true,"anan.tokushima.jp":true,"ichiba.tokushima.jp":true,"itano.tokushima.jp":true,"kainan.tokushima.jp":true,"komatsushima.tokushima.jp":true,"matsushige.tokushima.jp":true,"mima.tokushima.jp":true,"minami.tokushima.jp":true,"miyoshi.tokushima.jp":true,"mugi.tokushima.jp":true,"nakagawa.tokushima.jp":true,"naruto.tokushima.jp":true,"sanagochi.tokushima.jp":true,"shishikui.tokushima.jp":true,"tokushima.tokushima.jp":true,"wajiki.tokushima.jp":true,"adachi.tokyo.jp":true,"akiruno.tokyo.jp":true,"akishima.tokyo.jp":true,"aogashima.tokyo.jp":true,"arakawa.tokyo.jp":true,"bunkyo.tokyo.jp":true,"chiyoda.tokyo.jp":true,"chofu.tokyo.jp":true,"chuo.tokyo.jp":true,"edogawa.tokyo.jp":true,"fuchu.tokyo.jp":true,"fussa.tokyo.jp":true,"hachijo.tokyo.jp":true,"hachioji.tokyo.jp":true,"hamura.tokyo.jp":true,"higashikurume.tokyo.jp":true,"higashimurayama.tokyo.jp":true,"higashiyamato.tokyo.jp":true,"hino.tokyo.jp":true,"hinode.tokyo.jp":true,"hinohara.tokyo.jp":true,"inagi.tokyo.jp":true,"itabashi.tokyo.jp":true,"katsushika.tokyo.jp":true,"kita.tokyo.jp":true,"kiyose.tokyo.jp":true,"kodaira.tokyo.jp":true,"koganei.tokyo.jp":true,"kokubunji.tokyo.jp":true,"komae.tokyo.jp":true,"koto.tokyo.jp":true,"kouzushima.tokyo.jp":true,"kunitachi.tokyo.jp":true,"machida.tokyo.jp":true,"meguro.tokyo.jp":true,"minato.tokyo.jp":true,"mitaka.tokyo.jp":true,"mizuho.tokyo.jp":true,"musashimurayama.tokyo.jp":true,"musashino.tokyo.jp":true,"nakano.tokyo.jp":true,"nerima.tokyo.jp":true,"ogasawara.tokyo.jp":true,"okutama.tokyo.jp":true,"ome.tokyo.jp":true,"oshima.tokyo.jp":true,"ota.tokyo.jp":true,"setagaya.tokyo.jp":true,"shibuya.tokyo.jp":true,"shinagawa.tokyo.jp":true,"shinjuku.tokyo.jp":true,"suginami.tokyo.jp":true,"sumida.tokyo.jp":true,"tachikawa.tokyo.jp":true,"taito.tokyo.jp":true,"tama.tokyo.jp":true,"toshima.tokyo.jp":true,"chizu.tottori.jp":true,"hino.tottori.jp":true,"kawahara.tottori.jp":true,"koge.tottori.jp":true,"kotoura.tottori.jp":true,"misasa.tottori.jp":true,"nanbu.tottori.jp":true,"nichinan.tottori.jp":true,"sakaiminato.tottori.jp":true,"tottori.tottori.jp":true,"wakasa.tottori.jp":true,"yazu.tottori.jp":true,"yonago.tottori.jp":true,"asahi.toyama.jp":true,"fuchu.toyama.jp":true,"fukumitsu.toyama.jp":true,"funahashi.toyama.jp":true,"himi.toyama.jp":true,"imizu.toyama.jp":true,"inami.toyama.jp":true,"johana.toyama.jp":true,"kamiichi.toyama.jp":true,"kurobe.toyama.jp":true,"nakaniikawa.toyama.jp":true,"namerikawa.toyama.jp":true,"nanto.toyama.jp":true,"nyuzen.toyama.jp":true,"oyabe.toyama.jp":true,"taira.toyama.jp":true,"takaoka.toyama.jp":true,"tateyama.toyama.jp":true,"toga.toyama.jp":true,"tonami.toyama.jp":true,"toyama.toyama.jp":true,"unazuki.toyama.jp":true,"uozu.toyama.jp":true,"yamada.toyama.jp":true,"arida.wakayama.jp":true,"aridagawa.wakayama.jp":true,"gobo.wakayama.jp":true,"hashimoto.wakayama.jp":true,"hidaka.wakayama.jp":true,"hirogawa.wakayama.jp":true,"inami.wakayama.jp":true,"iwade.wakayama.jp":true,"kainan.wakayama.jp":true,"kamitonda.wakayama.jp":true,"katsuragi.wakayama.jp":true,"kimino.wakayama.jp":true,"kinokawa.wakayama.jp":true,"kitayama.wakayama.jp":true,"koya.wakayama.jp":true,"koza.wakayama.jp":true,"kozagawa.wakayama.jp":true,"kudoyama.wakayama.jp":true,"kushimoto.wakayama.jp":true,"mihama.wakayama.jp":true,"misato.wakayama.jp":true,"nachikatsuura.wakayama.jp":true,"shingu.wakayama.jp":true,"shirahama.wakayama.jp":true,"taiji.wakayama.jp":true,"tanabe.wakayama.jp":true,"wakayama.wakayama.jp":true,"yuasa.wakayama.jp":true,"yura.wakayama.jp":true,"asahi.yamagata.jp":true,"funagata.yamagata.jp":true,"higashine.yamagata.jp":true,"iide.yamagata.jp":true,"kahoku.yamagata.jp":true,"kaminoyama.yamagata.jp":true,"kaneyama.yamagata.jp":true,"kawanishi.yamagata.jp":true,"mamurogawa.yamagata.jp":true,"mikawa.yamagata.jp":true,"murayama.yamagata.jp":true,"nagai.yamagata.jp":true,"nakayama.yamagata.jp":true,"nanyo.yamagata.jp":true,"nishikawa.yamagata.jp":true,"obanazawa.yamagata.jp":true,"oe.yamagata.jp":true,"oguni.yamagata.jp":true,"ohkura.yamagata.jp":true,"oishida.yamagata.jp":true,"sagae.yamagata.jp":true,"sakata.yamagata.jp":true,"sakegawa.yamagata.jp":true,"shinjo.yamagata.jp":true,"shirataka.yamagata.jp":true,"shonai.yamagata.jp":true,"takahata.yamagata.jp":true,"tendo.yamagata.jp":true,"tozawa.yamagata.jp":true,"tsuruoka.yamagata.jp":true,"yamagata.yamagata.jp":true,"yamanobe.yamagata.jp":true,"yonezawa.yamagata.jp":true,"yuza.yamagata.jp":true,"abu.yamaguchi.jp":true,"hagi.yamaguchi.jp":true,"hikari.yamaguchi.jp":true,"hofu.yamaguchi.jp":true,"iwakuni.yamaguchi.jp":true,"kudamatsu.yamaguchi.jp":true,"mitou.yamaguchi.jp":true,"nagato.yamaguchi.jp":true,"oshima.yamaguchi.jp":true,"shimonoseki.yamaguchi.jp":true,"shunan.yamaguchi.jp":true,"tabuse.yamaguchi.jp":true,"tokuyama.yamaguchi.jp":true,"toyota.yamaguchi.jp":true,"ube.yamaguchi.jp":true,"yuu.yamaguchi.jp":true,"chuo.yamanashi.jp":true,"doshi.yamanashi.jp":true,"fuefuki.yamanashi.jp":true,"fujikawa.yamanashi.jp":true,"fujikawaguchiko.yamanashi.jp":true,"fujiyoshida.yamanashi.jp":true,"hayakawa.yamanashi.jp":true,"hokuto.yamanashi.jp":true,"ichikawamisato.yamanashi.jp":true,"kai.yamanashi.jp":true,"kofu.yamanashi.jp":true,"koshu.yamanashi.jp":true,"kosuge.yamanashi.jp":true,"minami-alps.yamanashi.jp":true,"minobu.yamanashi.jp":true,"nakamichi.yamanashi.jp":true,"nanbu.yamanashi.jp":true,"narusawa.yamanashi.jp":true,"nirasaki.yamanashi.jp":true,"nishikatsura.yamanashi.jp":true,"oshino.yamanashi.jp":true,"otsuki.yamanashi.jp":true,"showa.yamanashi.jp":true,"tabayama.yamanashi.jp":true,"tsuru.yamanashi.jp":true,"uenohara.yamanashi.jp":true,"yamanakako.yamanashi.jp":true,"yamanashi.yamanashi.jp":true,"*.ke":true,"kg":true,"org.kg":true,"net.kg":true,"com.kg":true,"edu.kg":true,"gov.kg":true,"mil.kg":true,"*.kh":true,"ki":true,"edu.ki":true,"biz.ki":true,"net.ki":true,"org.ki":true,"gov.ki":true,"info.ki":true,"com.ki":true,"km":true,"org.km":true,"nom.km":true,"gov.km":true,"prd.km":true,"tm.km":true,"edu.km":true,"mil.km":true,"ass.km":true,"com.km":true,"coop.km":true,"asso.km":true,"presse.km":true,"medecin.km":true,"notaires.km":true,"pharmaciens.km":true,"veterinaire.km":true,"gouv.km":true,"kn":true,"net.kn":true,"org.kn":true,"edu.kn":true,"gov.kn":true,"kp":true,"com.kp":true,"edu.kp":true,"gov.kp":true,"org.kp":true,"rep.kp":true,"tra.kp":true,"kr":true,"ac.kr":true,"co.kr":true,"es.kr":true,"go.kr":true,"hs.kr":true,"kg.kr":true,"mil.kr":true,"ms.kr":true,"ne.kr":true,"or.kr":true,"pe.kr":true,"re.kr":true,"sc.kr":true,"busan.kr":true,"chungbuk.kr":true,"chungnam.kr":true,"daegu.kr":true,"daejeon.kr":true,"gangwon.kr":true,"gwangju.kr":true,"gyeongbuk.kr":true,"gyeonggi.kr":true,"gyeongnam.kr":true,"incheon.kr":true,"jeju.kr":true,"jeonbuk.kr":true,"jeonnam.kr":true,"seoul.kr":true,"ulsan.kr":true,"*.kw":true,"ky":true,"edu.ky":true,"gov.ky":true,"com.ky":true,"org.ky":true,"net.ky":true,"kz":true,"org.kz":true,"edu.kz":true,"net.kz":true,"gov.kz":true,"mil.kz":true,"com.kz":true,"la":true,"int.la":true,"net.la":true,"info.la":true,"edu.la":true,"gov.la":true,"per.la":true,"com.la":true,"org.la":true,"lb":true,"com.lb":true,"edu.lb":true,"gov.lb":true,"net.lb":true,"org.lb":true,"lc":true,"com.lc":true,"net.lc":true,"co.lc":true,"org.lc":true,"edu.lc":true,"gov.lc":true,"li":true,"lk":true,"gov.lk":true,"sch.lk":true,"net.lk":true,"int.lk":true,"com.lk":true,"org.lk":true,"edu.lk":true,"ngo.lk":true,"soc.lk":true,"web.lk":true,"ltd.lk":true,"assn.lk":true,"grp.lk":true,"hotel.lk":true,"ac.lk":true,"lr":true,"com.lr":true,"edu.lr":true,"gov.lr":true,"org.lr":true,"net.lr":true,"ls":true,"co.ls":true,"org.ls":true,"lt":true,"gov.lt":true,"lu":true,"lv":true,"com.lv":true,"edu.lv":true,"gov.lv":true,"org.lv":true,"mil.lv":true,"id.lv":true,"net.lv":true,"asn.lv":true,"conf.lv":true,"ly":true,"com.ly":true,"net.ly":true,"gov.ly":true,"plc.ly":true,"edu.ly":true,"sch.ly":true,"med.ly":true,"org.ly":true,"id.ly":true,"ma":true,"co.ma":true,"net.ma":true,"gov.ma":true,"org.ma":true,"ac.ma":true,"press.ma":true,"mc":true,"tm.mc":true,"asso.mc":true,"md":true,"me":true,"co.me":true,"net.me":true,"org.me":true,"edu.me":true,"ac.me":true,"gov.me":true,"its.me":true,"priv.me":true,"mg":true,"org.mg":true,"nom.mg":true,"gov.mg":true,"prd.mg":true,"tm.mg":true,"edu.mg":true,"mil.mg":true,"com.mg":true,"co.mg":true,"mh":true,"mil":true,"mk":true,"com.mk":true,"org.mk":true,"net.mk":true,"edu.mk":true,"gov.mk":true,"inf.mk":true,"name.mk":true,"ml":true,"com.ml":true,"edu.ml":true,"gouv.ml":true,"gov.ml":true,"net.ml":true,"org.ml":true,"presse.ml":true,"*.mm":true,"mn":true,"gov.mn":true,"edu.mn":true,"org.mn":true,"mo":true,"com.mo":true,"net.mo":true,"org.mo":true,"edu.mo":true,"gov.mo":true,"mobi":true,"mp":true,"mq":true,"mr":true,"gov.mr":true,"ms":true,"com.ms":true,"edu.ms":true,"gov.ms":true,"net.ms":true,"org.ms":true,"mt":true,"com.mt":true,"edu.mt":true,"net.mt":true,"org.mt":true,"mu":true,"com.mu":true,"net.mu":true,"org.mu":true,"gov.mu":true,"ac.mu":true,"co.mu":true,"or.mu":true,"museum":true,"academy.museum":true,"agriculture.museum":true,"air.museum":true,"airguard.museum":true,"alabama.museum":true,"alaska.museum":true,"amber.museum":true,"ambulance.museum":true,"american.museum":true,"americana.museum":true,"americanantiques.museum":true,"americanart.museum":true,"amsterdam.museum":true,"and.museum":true,"annefrank.museum":true,"anthro.museum":true,"anthropology.museum":true,"antiques.museum":true,"aquarium.museum":true,"arboretum.museum":true,"archaeological.museum":true,"archaeology.museum":true,"architecture.museum":true,"art.museum":true,"artanddesign.museum":true,"artcenter.museum":true,"artdeco.museum":true,"arteducation.museum":true,"artgallery.museum":true,"arts.museum":true,"artsandcrafts.museum":true,"asmatart.museum":true,"assassination.museum":true,"assisi.museum":true,"association.museum":true,"astronomy.museum":true,"atlanta.museum":true,"austin.museum":true,"australia.museum":true,"automotive.museum":true,"aviation.museum":true,"axis.museum":true,"badajoz.museum":true,"baghdad.museum":true,"bahn.museum":true,"bale.museum":true,"baltimore.museum":true,"barcelona.museum":true,"baseball.museum":true,"basel.museum":true,"baths.museum":true,"bauern.museum":true,"beauxarts.museum":true,"beeldengeluid.museum":true,"bellevue.museum":true,"bergbau.museum":true,"berkeley.museum":true,"berlin.museum":true,"bern.museum":true,"bible.museum":true,"bilbao.museum":true,"bill.museum":true,"birdart.museum":true,"birthplace.museum":true,"bonn.museum":true,"boston.museum":true,"botanical.museum":true,"botanicalgarden.museum":true,"botanicgarden.museum":true,"botany.museum":true,"brandywinevalley.museum":true,"brasil.museum":true,"bristol.museum":true,"british.museum":true,"britishcolumbia.museum":true,"broadcast.museum":true,"brunel.museum":true,"brussel.museum":true,"brussels.museum":true,"bruxelles.museum":true,"building.museum":true,"burghof.museum":true,"bus.museum":true,"bushey.museum":true,"cadaques.museum":true,"california.museum":true,"cambridge.museum":true,"can.museum":true,"canada.museum":true,"capebreton.museum":true,"carrier.museum":true,"cartoonart.museum":true,"casadelamoneda.museum":true,"castle.museum":true,"castres.museum":true,"celtic.museum":true,"center.museum":true,"chattanooga.museum":true,"cheltenham.museum":true,"chesapeakebay.museum":true,"chicago.museum":true,"children.museum":true,"childrens.museum":true,"childrensgarden.museum":true,"chiropractic.museum":true,"chocolate.museum":true,"christiansburg.museum":true,"cincinnati.museum":true,"cinema.museum":true,"circus.museum":true,"civilisation.museum":true,"civilization.museum":true,"civilwar.museum":true,"clinton.museum":true,"clock.museum":true,"coal.museum":true,"coastaldefence.museum":true,"cody.museum":true,"coldwar.museum":true,"collection.museum":true,"colonialwilliamsburg.museum":true,"coloradoplateau.museum":true,"columbia.museum":true,"columbus.museum":true,"communication.museum":true,"communications.museum":true,"community.museum":true,"computer.museum":true,"computerhistory.museum":true,"xn--comunicaes-v6a2o.museum":true,"contemporary.museum":true,"contemporaryart.museum":true,"convent.museum":true,"copenhagen.museum":true,"corporation.museum":true,"xn--correios-e-telecomunicaes-ghc29a.museum":true,"corvette.museum":true,"costume.museum":true,"countryestate.museum":true,"county.museum":true,"crafts.museum":true,"cranbrook.museum":true,"creation.museum":true,"cultural.museum":true,"culturalcenter.museum":true,"culture.museum":true,"cyber.museum":true,"cymru.museum":true,"dali.museum":true,"dallas.museum":true,"database.museum":true,"ddr.museum":true,"decorativearts.museum":true,"delaware.museum":true,"delmenhorst.museum":true,"denmark.museum":true,"depot.museum":true,"design.museum":true,"detroit.museum":true,"dinosaur.museum":true,"discovery.museum":true,"dolls.museum":true,"donostia.museum":true,"durham.museum":true,"eastafrica.museum":true,"eastcoast.museum":true,"education.museum":true,"educational.museum":true,"egyptian.museum":true,"eisenbahn.museum":true,"elburg.museum":true,"elvendrell.museum":true,"embroidery.museum":true,"encyclopedic.museum":true,"england.museum":true,"entomology.museum":true,"environment.museum":true,"environmentalconservation.museum":true,"epilepsy.museum":true,"essex.museum":true,"estate.museum":true,"ethnology.museum":true,"exeter.museum":true,"exhibition.museum":true,"family.museum":true,"farm.museum":true,"farmequipment.museum":true,"farmers.museum":true,"farmstead.museum":true,"field.museum":true,"figueres.museum":true,"filatelia.museum":true,"film.museum":true,"fineart.museum":true,"finearts.museum":true,"finland.museum":true,"flanders.museum":true,"florida.museum":true,"force.museum":true,"fortmissoula.museum":true,"fortworth.museum":true,"foundation.museum":true,"francaise.museum":true,"frankfurt.museum":true,"franziskaner.museum":true,"freemasonry.museum":true,"freiburg.museum":true,"fribourg.museum":true,"frog.museum":true,"fundacio.museum":true,"furniture.museum":true,"gallery.museum":true,"garden.museum":true,"gateway.museum":true,"geelvinck.museum":true,"gemological.museum":true,"geology.museum":true,"georgia.museum":true,"giessen.museum":true,"glas.museum":true,"glass.museum":true,"gorge.museum":true,"grandrapids.museum":true,"graz.museum":true,"guernsey.museum":true,"halloffame.museum":true,"hamburg.museum":true,"handson.museum":true,"harvestcelebration.museum":true,"hawaii.museum":true,"health.museum":true,"heimatunduhren.museum":true,"hellas.museum":true,"helsinki.museum":true,"hembygdsforbund.museum":true,"heritage.museum":true,"histoire.museum":true,"historical.museum":true,"historicalsociety.museum":true,"historichouses.museum":true,"historisch.museum":true,"historisches.museum":true,"history.museum":true,"historyofscience.museum":true,"horology.museum":true,"house.museum":true,"humanities.museum":true,"illustration.museum":true,"imageandsound.museum":true,"indian.museum":true,"indiana.museum":true,"indianapolis.museum":true,"indianmarket.museum":true,"intelligence.museum":true,"interactive.museum":true,"iraq.museum":true,"iron.museum":true,"isleofman.museum":true,"jamison.museum":true,"jefferson.museum":true,"jerusalem.museum":true,"jewelry.museum":true,"jewish.museum":true,"jewishart.museum":true,"jfk.museum":true,"journalism.museum":true,"judaica.museum":true,"judygarland.museum":true,"juedisches.museum":true,"juif.museum":true,"karate.museum":true,"karikatur.museum":true,"kids.museum":true,"koebenhavn.museum":true,"koeln.museum":true,"kunst.museum":true,"kunstsammlung.museum":true,"kunstunddesign.museum":true,"labor.museum":true,"labour.museum":true,"lajolla.museum":true,"lancashire.museum":true,"landes.museum":true,"lans.museum":true,"xn--lns-qla.museum":true,"larsson.museum":true,"lewismiller.museum":true,"lincoln.museum":true,"linz.museum":true,"living.museum":true,"livinghistory.museum":true,"localhistory.museum":true,"london.museum":true,"losangeles.museum":true,"louvre.museum":true,"loyalist.museum":true,"lucerne.museum":true,"luxembourg.museum":true,"luzern.museum":true,"mad.museum":true,"madrid.museum":true,"mallorca.museum":true,"manchester.museum":true,"mansion.museum":true,"mansions.museum":true,"manx.museum":true,"marburg.museum":true,"maritime.museum":true,"maritimo.museum":true,"maryland.museum":true,"marylhurst.museum":true,"media.museum":true,"medical.museum":true,"medizinhistorisches.museum":true,"meeres.museum":true,"memorial.museum":true,"mesaverde.museum":true,"michigan.museum":true,"midatlantic.museum":true,"military.museum":true,"mill.museum":true,"miners.museum":true,"mining.museum":true,"minnesota.museum":true,"missile.museum":true,"missoula.museum":true,"modern.museum":true,"moma.museum":true,"money.museum":true,"monmouth.museum":true,"monticello.museum":true,"montreal.museum":true,"moscow.museum":true,"motorcycle.museum":true,"muenchen.museum":true,"muenster.museum":true,"mulhouse.museum":true,"muncie.museum":true,"museet.museum":true,"museumcenter.museum":true,"museumvereniging.museum":true,"music.museum":true,"national.museum":true,"nationalfirearms.museum":true,"nationalheritage.museum":true,"nativeamerican.museum":true,"naturalhistory.museum":true,"naturalhistorymuseum.museum":true,"naturalsciences.museum":true,"nature.museum":true,"naturhistorisches.museum":true,"natuurwetenschappen.museum":true,"naumburg.museum":true,"naval.museum":true,"nebraska.museum":true,"neues.museum":true,"newhampshire.museum":true,"newjersey.museum":true,"newmexico.museum":true,"newport.museum":true,"newspaper.museum":true,"newyork.museum":true,"niepce.museum":true,"norfolk.museum":true,"north.museum":true,"nrw.museum":true,"nuernberg.museum":true,"nuremberg.museum":true,"nyc.museum":true,"nyny.museum":true,"oceanographic.museum":true,"oceanographique.museum":true,"omaha.museum":true,"online.museum":true,"ontario.museum":true,"openair.museum":true,"oregon.museum":true,"oregontrail.museum":true,"otago.museum":true,"oxford.museum":true,"pacific.museum":true,"paderborn.museum":true,"palace.museum":true,"paleo.museum":true,"palmsprings.museum":true,"panama.museum":true,"paris.museum":true,"pasadena.museum":true,"pharmacy.museum":true,"philadelphia.museum":true,"philadelphiaarea.museum":true,"philately.museum":true,"phoenix.museum":true,"photography.museum":true,"pilots.museum":true,"pittsburgh.museum":true,"planetarium.museum":true,"plantation.museum":true,"plants.museum":true,"plaza.museum":true,"portal.museum":true,"portland.museum":true,"portlligat.museum":true,"posts-and-telecommunications.museum":true,"preservation.museum":true,"presidio.museum":true,"press.museum":true,"project.museum":true,"public.museum":true,"pubol.museum":true,"quebec.museum":true,"railroad.museum":true,"railway.museum":true,"research.museum":true,"resistance.museum":true,"riodejaneiro.museum":true,"rochester.museum":true,"rockart.museum":true,"roma.museum":true,"russia.museum":true,"saintlouis.museum":true,"salem.museum":true,"salvadordali.museum":true,"salzburg.museum":true,"sandiego.museum":true,"sanfrancisco.museum":true,"santabarbara.museum":true,"santacruz.museum":true,"santafe.museum":true,"saskatchewan.museum":true,"satx.museum":true,"savannahga.museum":true,"schlesisches.museum":true,"schoenbrunn.museum":true,"schokoladen.museum":true,"school.museum":true,"schweiz.museum":true,"science.museum":true,"scienceandhistory.museum":true,"scienceandindustry.museum":true,"sciencecenter.museum":true,"sciencecenters.museum":true,"science-fiction.museum":true,"sciencehistory.museum":true,"sciences.museum":true,"sciencesnaturelles.museum":true,"scotland.museum":true,"seaport.museum":true,"settlement.museum":true,"settlers.museum":true,"shell.museum":true,"sherbrooke.museum":true,"sibenik.museum":true,"silk.museum":true,"ski.museum":true,"skole.museum":true,"society.museum":true,"sologne.museum":true,"soundandvision.museum":true,"southcarolina.museum":true,"southwest.museum":true,"space.museum":true,"spy.museum":true,"square.museum":true,"stadt.museum":true,"stalbans.museum":true,"starnberg.museum":true,"state.museum":true,"stateofdelaware.museum":true,"station.museum":true,"steam.museum":true,"steiermark.museum":true,"stjohn.museum":true,"stockholm.museum":true,"stpetersburg.museum":true,"stuttgart.museum":true,"suisse.museum":true,"surgeonshall.museum":true,"surrey.museum":true,"svizzera.museum":true,"sweden.museum":true,"sydney.museum":true,"tank.museum":true,"tcm.museum":true,"technology.museum":true,"telekommunikation.museum":true,"television.museum":true,"texas.museum":true,"textile.museum":true,"theater.museum":true,"time.museum":true,"timekeeping.museum":true,"topology.museum":true,"torino.museum":true,"touch.museum":true,"town.museum":true,"transport.museum":true,"tree.museum":true,"trolley.museum":true,"trust.museum":true,"trustee.museum":true,"uhren.museum":true,"ulm.museum":true,"undersea.museum":true,"university.museum":true,"usa.museum":true,"usantiques.museum":true,"usarts.museum":true,"uscountryestate.museum":true,"usculture.museum":true,"usdecorativearts.museum":true,"usgarden.museum":true,"ushistory.museum":true,"ushuaia.museum":true,"uslivinghistory.museum":true,"utah.museum":true,"uvic.museum":true,"valley.museum":true,"vantaa.museum":true,"versailles.museum":true,"viking.museum":true,"village.museum":true,"virginia.museum":true,"virtual.museum":true,"virtuel.museum":true,"vlaanderen.museum":true,"volkenkunde.museum":true,"wales.museum":true,"wallonie.museum":true,"war.museum":true,"washingtondc.museum":true,"watchandclock.museum":true,"watch-and-clock.museum":true,"western.museum":true,"westfalen.museum":true,"whaling.museum":true,"wildlife.museum":true,"williamsburg.museum":true,"windmill.museum":true,"workshop.museum":true,"york.museum":true,"yorkshire.museum":true,"yosemite.museum":true,"youth.museum":true,"zoological.museum":true,"zoology.museum":true,"xn--9dbhblg6di.museum":true,"xn--h1aegh.museum":true,"mv":true,"aero.mv":true,"biz.mv":true,"com.mv":true,"coop.mv":true,"edu.mv":true,"gov.mv":true,"info.mv":true,"int.mv":true,"mil.mv":true,"museum.mv":true,"name.mv":true,"net.mv":true,"org.mv":true,"pro.mv":true,"mw":true,"ac.mw":true,"biz.mw":true,"co.mw":true,"com.mw":true,"coop.mw":true,"edu.mw":true,"gov.mw":true,"int.mw":true,"museum.mw":true,"net.mw":true,"org.mw":true,"mx":true,"com.mx":true,"org.mx":true,"gob.mx":true,"edu.mx":true,"net.mx":true,"my":true,"com.my":true,"net.my":true,"org.my":true,"gov.my":true,"edu.my":true,"mil.my":true,"name.my":true,"*.mz":true,"teledata.mz":false,"na":true,"info.na":true,"pro.na":true,"name.na":true,"school.na":true,"or.na":true,"dr.na":true,"us.na":true,"mx.na":true,"ca.na":true,"in.na":true,"cc.na":true,"tv.na":true,"ws.na":true,"mobi.na":true,"co.na":true,"com.na":true,"org.na":true,"name":true,"nc":true,"asso.nc":true,"ne":true,"net":true,"nf":true,"com.nf":true,"net.nf":true,"per.nf":true,"rec.nf":true,"web.nf":true,"arts.nf":true,"firm.nf":true,"info.nf":true,"other.nf":true,"store.nf":true,"ng":true,"com.ng":true,"edu.ng":true,"name.ng":true,"net.ng":true,"org.ng":true,"sch.ng":true,"gov.ng":true,"mil.ng":true,"mobi.ng":true,"*.ni":true,"nl":true,"bv.nl":true,"no":true,"fhs.no":true,"vgs.no":true,"fylkesbibl.no":true,"folkebibl.no":true,"museum.no":true,"idrett.no":true,"priv.no":true,"mil.no":true,"stat.no":true,"dep.no":true,"kommune.no":true,"herad.no":true,"aa.no":true,"ah.no":true,"bu.no":true,"fm.no":true,"hl.no":true,"hm.no":true,"jan-mayen.no":true,"mr.no":true,"nl.no":true,"nt.no":true,"of.no":true,"ol.no":true,"oslo.no":true,"rl.no":true,"sf.no":true,"st.no":true,"svalbard.no":true,"tm.no":true,"tr.no":true,"va.no":true,"vf.no":true,"gs.aa.no":true,"gs.ah.no":true,"gs.bu.no":true,"gs.fm.no":true,"gs.hl.no":true,"gs.hm.no":true,"gs.jan-mayen.no":true,"gs.mr.no":true,"gs.nl.no":true,"gs.nt.no":true,"gs.of.no":true,"gs.ol.no":true,"gs.oslo.no":true,"gs.rl.no":true,"gs.sf.no":true,"gs.st.no":true,"gs.svalbard.no":true,"gs.tm.no":true,"gs.tr.no":true,"gs.va.no":true,"gs.vf.no":true,"akrehamn.no":true,"xn--krehamn-dxa.no":true,"algard.no":true,"xn--lgrd-poac.no":true,"arna.no":true,"brumunddal.no":true,"bryne.no":true,"bronnoysund.no":true,"xn--brnnysund-m8ac.no":true,"drobak.no":true,"xn--drbak-wua.no":true,"egersund.no":true,"fetsund.no":true,"floro.no":true,"xn--flor-jra.no":true,"fredrikstad.no":true,"hokksund.no":true,"honefoss.no":true,"xn--hnefoss-q1a.no":true,"jessheim.no":true,"jorpeland.no":true,"xn--jrpeland-54a.no":true,"kirkenes.no":true,"kopervik.no":true,"krokstadelva.no":true,"langevag.no":true,"xn--langevg-jxa.no":true,"leirvik.no":true,"mjondalen.no":true,"xn--mjndalen-64a.no":true,"mo-i-rana.no":true,"mosjoen.no":true,"xn--mosjen-eya.no":true,"nesoddtangen.no":true,"orkanger.no":true,"osoyro.no":true,"xn--osyro-wua.no":true,"raholt.no":true,"xn--rholt-mra.no":true,"sandnessjoen.no":true,"xn--sandnessjen-ogb.no":true,"skedsmokorset.no":true,"slattum.no":true,"spjelkavik.no":true,"stathelle.no":true,"stavern.no":true,"stjordalshalsen.no":true,"xn--stjrdalshalsen-sqb.no":true,"tananger.no":true,"tranby.no":true,"vossevangen.no":true,"afjord.no":true,"xn--fjord-lra.no":true,"agdenes.no":true,"al.no":true,"xn--l-1fa.no":true,"alesund.no":true,"xn--lesund-hua.no":true,"alstahaug.no":true,"alta.no":true,"xn--lt-liac.no":true,"alaheadju.no":true,"xn--laheadju-7ya.no":true,"alvdal.no":true,"amli.no":true,"xn--mli-tla.no":true,"amot.no":true,"xn--mot-tla.no":true,"andebu.no":true,"andoy.no":true,"xn--andy-ira.no":true,"andasuolo.no":true,"ardal.no":true,"xn--rdal-poa.no":true,"aremark.no":true,"arendal.no":true,"xn--s-1fa.no":true,"aseral.no":true,"xn--seral-lra.no":true,"asker.no":true,"askim.no":true,"askvoll.no":true,"askoy.no":true,"xn--asky-ira.no":true,"asnes.no":true,"xn--snes-poa.no":true,"audnedaln.no":true,"aukra.no":true,"aure.no":true,"aurland.no":true,"aurskog-holand.no":true,"xn--aurskog-hland-jnb.no":true,"austevoll.no":true,"austrheim.no":true,"averoy.no":true,"xn--avery-yua.no":true,"balestrand.no":true,"ballangen.no":true,"balat.no":true,"xn--blt-elab.no":true,"balsfjord.no":true,"bahccavuotna.no":true,"xn--bhccavuotna-k7a.no":true,"bamble.no":true,"bardu.no":true,"beardu.no":true,"beiarn.no":true,"bajddar.no":true,"xn--bjddar-pta.no":true,"baidar.no":true,"xn--bidr-5nac.no":true,"berg.no":true,"bergen.no":true,"berlevag.no":true,"xn--berlevg-jxa.no":true,"bearalvahki.no":true,"xn--bearalvhki-y4a.no":true,"bindal.no":true,"birkenes.no":true,"bjarkoy.no":true,"xn--bjarky-fya.no":true,"bjerkreim.no":true,"bjugn.no":true,"bodo.no":true,"xn--bod-2na.no":true,"badaddja.no":true,"xn--bdddj-mrabd.no":true,"budejju.no":true,"bokn.no":true,"bremanger.no":true,"bronnoy.no":true,"xn--brnny-wuac.no":true,"bygland.no":true,"bykle.no":true,"barum.no":true,"xn--brum-voa.no":true,"bo.telemark.no":true,"xn--b-5ga.telemark.no":true,"bo.nordland.no":true,"xn--b-5ga.nordland.no":true,"bievat.no":true,"xn--bievt-0qa.no":true,"bomlo.no":true,"xn--bmlo-gra.no":true,"batsfjord.no":true,"xn--btsfjord-9za.no":true,"bahcavuotna.no":true,"xn--bhcavuotna-s4a.no":true,"dovre.no":true,"drammen.no":true,"drangedal.no":true,"dyroy.no":true,"xn--dyry-ira.no":true,"donna.no":true,"xn--dnna-gra.no":true,"eid.no":true,"eidfjord.no":true,"eidsberg.no":true,"eidskog.no":true,"eidsvoll.no":true,"eigersund.no":true,"elverum.no":true,"enebakk.no":true,"engerdal.no":true,"etne.no":true,"etnedal.no":true,"evenes.no":true,"evenassi.no":true,"xn--eveni-0qa01ga.no":true,"evje-og-hornnes.no":true,"farsund.no":true,"fauske.no":true,"fuossko.no":true,"fuoisku.no":true,"fedje.no":true,"fet.no":true,"finnoy.no":true,"xn--finny-yua.no":true,"fitjar.no":true,"fjaler.no":true,"fjell.no":true,"flakstad.no":true,"flatanger.no":true,"flekkefjord.no":true,"flesberg.no":true,"flora.no":true,"fla.no":true,"xn--fl-zia.no":true,"folldal.no":true,"forsand.no":true,"fosnes.no":true,"frei.no":true,"frogn.no":true,"froland.no":true,"frosta.no":true,"frana.no":true,"xn--frna-woa.no":true,"froya.no":true,"xn--frya-hra.no":true,"fusa.no":true,"fyresdal.no":true,"forde.no":true,"xn--frde-gra.no":true,"gamvik.no":true,"gangaviika.no":true,"xn--ggaviika-8ya47h.no":true,"gaular.no":true,"gausdal.no":true,"gildeskal.no":true,"xn--gildeskl-g0a.no":true,"giske.no":true,"gjemnes.no":true,"gjerdrum.no":true,"gjerstad.no":true,"gjesdal.no":true,"gjovik.no":true,"xn--gjvik-wua.no":true,"gloppen.no":true,"gol.no":true,"gran.no":true,"grane.no":true,"granvin.no":true,"gratangen.no":true,"grimstad.no":true,"grong.no":true,"kraanghke.no":true,"xn--kranghke-b0a.no":true,"grue.no":true,"gulen.no":true,"hadsel.no":true,"halden.no":true,"halsa.no":true,"hamar.no":true,"hamaroy.no":true,"habmer.no":true,"xn--hbmer-xqa.no":true,"hapmir.no":true,"xn--hpmir-xqa.no":true,"hammerfest.no":true,"hammarfeasta.no":true,"xn--hmmrfeasta-s4ac.no":true,"haram.no":true,"hareid.no":true,"harstad.no":true,"hasvik.no":true,"aknoluokta.no":true,"xn--koluokta-7ya57h.no":true,"hattfjelldal.no":true,"aarborte.no":true,"haugesund.no":true,"hemne.no":true,"hemnes.no":true,"hemsedal.no":true,"heroy.more-og-romsdal.no":true,"xn--hery-ira.xn--mre-og-romsdal-qqb.no":true,"heroy.nordland.no":true,"xn--hery-ira.nordland.no":true,"hitra.no":true,"hjartdal.no":true,"hjelmeland.no":true,"hobol.no":true,"xn--hobl-ira.no":true,"hof.no":true,"hol.no":true,"hole.no":true,"holmestrand.no":true,"holtalen.no":true,"xn--holtlen-hxa.no":true,"hornindal.no":true,"horten.no":true,"hurdal.no":true,"hurum.no":true,"hvaler.no":true,"hyllestad.no":true,"hagebostad.no":true,"xn--hgebostad-g3a.no":true,"hoyanger.no":true,"xn--hyanger-q1a.no":true,"hoylandet.no":true,"xn--hylandet-54a.no":true,"ha.no":true,"xn--h-2fa.no":true,"ibestad.no":true,"inderoy.no":true,"xn--indery-fya.no":true,"iveland.no":true,"jevnaker.no":true,"jondal.no":true,"jolster.no":true,"xn--jlster-bya.no":true,"karasjok.no":true,"karasjohka.no":true,"xn--krjohka-hwab49j.no":true,"karlsoy.no":true,"galsa.no":true,"xn--gls-elac.no":true,"karmoy.no":true,"xn--karmy-yua.no":true,"kautokeino.no":true,"guovdageaidnu.no":true,"klepp.no":true,"klabu.no":true,"xn--klbu-woa.no":true,"kongsberg.no":true,"kongsvinger.no":true,"kragero.no":true,"xn--krager-gya.no":true,"kristiansand.no":true,"kristiansund.no":true,"krodsherad.no":true,"xn--krdsherad-m8a.no":true,"kvalsund.no":true,"rahkkeravju.no":true,"xn--rhkkervju-01af.no":true,"kvam.no":true,"kvinesdal.no":true,"kvinnherad.no":true,"kviteseid.no":true,"kvitsoy.no":true,"xn--kvitsy-fya.no":true,"kvafjord.no":true,"xn--kvfjord-nxa.no":true,"giehtavuoatna.no":true,"kvanangen.no":true,"xn--kvnangen-k0a.no":true,"navuotna.no":true,"xn--nvuotna-hwa.no":true,"kafjord.no":true,"xn--kfjord-iua.no":true,"gaivuotna.no":true,"xn--givuotna-8ya.no":true,"larvik.no":true,"lavangen.no":true,"lavagis.no":true,"loabat.no":true,"xn--loabt-0qa.no":true,"lebesby.no":true,"davvesiida.no":true,"leikanger.no":true,"leirfjord.no":true,"leka.no":true,"leksvik.no":true,"lenvik.no":true,"leangaviika.no":true,"xn--leagaviika-52b.no":true,"lesja.no":true,"levanger.no":true,"lier.no":true,"lierne.no":true,"lillehammer.no":true,"lillesand.no":true,"lindesnes.no":true,"lindas.no":true,"xn--linds-pra.no":true,"lom.no":true,"loppa.no":true,"lahppi.no":true,"xn--lhppi-xqa.no":true,"lund.no":true,"lunner.no":true,"luroy.no":true,"xn--lury-ira.no":true,"luster.no":true,"lyngdal.no":true,"lyngen.no":true,"ivgu.no":true,"lardal.no":true,"lerdal.no":true,"xn--lrdal-sra.no":true,"lodingen.no":true,"xn--ldingen-q1a.no":true,"lorenskog.no":true,"xn--lrenskog-54a.no":true,"loten.no":true,"xn--lten-gra.no":true,"malvik.no":true,"masoy.no":true,"xn--msy-ula0h.no":true,"muosat.no":true,"xn--muost-0qa.no":true,"mandal.no":true,"marker.no":true,"marnardal.no":true,"masfjorden.no":true,"meland.no":true,"meldal.no":true,"melhus.no":true,"meloy.no":true,"xn--mely-ira.no":true,"meraker.no":true,"xn--merker-kua.no":true,"moareke.no":true,"xn--moreke-jua.no":true,"midsund.no":true,"midtre-gauldal.no":true,"modalen.no":true,"modum.no":true,"molde.no":true,"moskenes.no":true,"moss.no":true,"mosvik.no":true,"malselv.no":true,"xn--mlselv-iua.no":true,"malatvuopmi.no":true,"xn--mlatvuopmi-s4a.no":true,"namdalseid.no":true,"aejrie.no":true,"namsos.no":true,"namsskogan.no":true,"naamesjevuemie.no":true,"xn--nmesjevuemie-tcba.no":true,"laakesvuemie.no":true,"nannestad.no":true,"narvik.no":true,"narviika.no":true,"naustdal.no":true,"nedre-eiker.no":true,"nes.akershus.no":true,"nes.buskerud.no":true,"nesna.no":true,"nesodden.no":true,"nesseby.no":true,"unjarga.no":true,"xn--unjrga-rta.no":true,"nesset.no":true,"nissedal.no":true,"nittedal.no":true,"nord-aurdal.no":true,"nord-fron.no":true,"nord-odal.no":true,"norddal.no":true,"nordkapp.no":true,"davvenjarga.no":true,"xn--davvenjrga-y4a.no":true,"nordre-land.no":true,"nordreisa.no":true,"raisa.no":true,"xn--risa-5na.no":true,"nore-og-uvdal.no":true,"notodden.no":true,"naroy.no":true,"xn--nry-yla5g.no":true,"notteroy.no":true,"xn--nttery-byae.no":true,"odda.no":true,"oksnes.no":true,"xn--ksnes-uua.no":true,"oppdal.no":true,"oppegard.no":true,"xn--oppegrd-ixa.no":true,"orkdal.no":true,"orland.no":true,"xn--rland-uua.no":true,"orskog.no":true,"xn--rskog-uua.no":true,"orsta.no":true,"xn--rsta-fra.no":true,"os.hedmark.no":true,"os.hordaland.no":true,"osen.no":true,"osteroy.no":true,"xn--ostery-fya.no":true,"ostre-toten.no":true,"xn--stre-toten-zcb.no":true,"overhalla.no":true,"ovre-eiker.no":true,"xn--vre-eiker-k8a.no":true,"oyer.no":true,"xn--yer-zna.no":true,"oygarden.no":true,"xn--ygarden-p1a.no":true,"oystre-slidre.no":true,"xn--ystre-slidre-ujb.no":true,"porsanger.no":true,"porsangu.no":true,"xn--porsgu-sta26f.no":true,"porsgrunn.no":true,"radoy.no":true,"xn--rady-ira.no":true,"rakkestad.no":true,"rana.no":true,"ruovat.no":true,"randaberg.no":true,"rauma.no":true,"rendalen.no":true,"rennebu.no":true,"rennesoy.no":true,"xn--rennesy-v1a.no":true,"rindal.no":true,"ringebu.no":true,"ringerike.no":true,"ringsaker.no":true,"rissa.no":true,"risor.no":true,"xn--risr-ira.no":true,"roan.no":true,"rollag.no":true,"rygge.no":true,"ralingen.no":true,"xn--rlingen-mxa.no":true,"rodoy.no":true,"xn--rdy-0nab.no":true,"romskog.no":true,"xn--rmskog-bya.no":true,"roros.no":true,"xn--rros-gra.no":true,"rost.no":true,"xn--rst-0na.no":true,"royken.no":true,"xn--ryken-vua.no":true,"royrvik.no":true,"xn--ryrvik-bya.no":true,"rade.no":true,"xn--rde-ula.no":true,"salangen.no":true,"siellak.no":true,"saltdal.no":true,"salat.no":true,"xn--slt-elab.no":true,"xn--slat-5na.no":true,"samnanger.no":true,"sande.more-og-romsdal.no":true,"sande.xn--mre-og-romsdal-qqb.no":true,"sande.vestfold.no":true,"sandefjord.no":true,"sandnes.no":true,"sandoy.no":true,"xn--sandy-yua.no":true,"sarpsborg.no":true,"sauda.no":true,"sauherad.no":true,"sel.no":true,"selbu.no":true,"selje.no":true,"seljord.no":true,"sigdal.no":true,"siljan.no":true,"sirdal.no":true,"skaun.no":true,"skedsmo.no":true,"ski.no":true,"skien.no":true,"skiptvet.no":true,"skjervoy.no":true,"xn--skjervy-v1a.no":true,"skierva.no":true,"xn--skierv-uta.no":true,"skjak.no":true,"xn--skjk-soa.no":true,"skodje.no":true,"skanland.no":true,"xn--sknland-fxa.no":true,"skanit.no":true,"xn--sknit-yqa.no":true,"smola.no":true,"xn--smla-hra.no":true,"snillfjord.no":true,"snasa.no":true,"xn--snsa-roa.no":true,"snoasa.no":true,"snaase.no":true,"xn--snase-nra.no":true,"sogndal.no":true,"sokndal.no":true,"sola.no":true,"solund.no":true,"songdalen.no":true,"sortland.no":true,"spydeberg.no":true,"stange.no":true,"stavanger.no":true,"steigen.no":true,"steinkjer.no":true,"stjordal.no":true,"xn--stjrdal-s1a.no":true,"stokke.no":true,"stor-elvdal.no":true,"stord.no":true,"stordal.no":true,"storfjord.no":true,"omasvuotna.no":true,"strand.no":true,"stranda.no":true,"stryn.no":true,"sula.no":true,"suldal.no":true,"sund.no":true,"sunndal.no":true,"surnadal.no":true,"sveio.no":true,"svelvik.no":true,"sykkylven.no":true,"sogne.no":true,"xn--sgne-gra.no":true,"somna.no":true,"xn--smna-gra.no":true,"sondre-land.no":true,"xn--sndre-land-0cb.no":true,"sor-aurdal.no":true,"xn--sr-aurdal-l8a.no":true,"sor-fron.no":true,"xn--sr-fron-q1a.no":true,"sor-odal.no":true,"xn--sr-odal-q1a.no":true,"sor-varanger.no":true,"xn--sr-varanger-ggb.no":true,"matta-varjjat.no":true,"xn--mtta-vrjjat-k7af.no":true,"sorfold.no":true,"xn--srfold-bya.no":true,"sorreisa.no":true,"xn--srreisa-q1a.no":true,"sorum.no":true,"xn--srum-gra.no":true,"tana.no":true,"deatnu.no":true,"time.no":true,"tingvoll.no":true,"tinn.no":true,"tjeldsund.no":true,"dielddanuorri.no":true,"tjome.no":true,"xn--tjme-hra.no":true,"tokke.no":true,"tolga.no":true,"torsken.no":true,"tranoy.no":true,"xn--trany-yua.no":true,"tromso.no":true,"xn--troms-zua.no":true,"tromsa.no":true,"romsa.no":true,"trondheim.no":true,"troandin.no":true,"trysil.no":true,"trana.no":true,"xn--trna-woa.no":true,"trogstad.no":true,"xn--trgstad-r1a.no":true,"tvedestrand.no":true,"tydal.no":true,"tynset.no":true,"tysfjord.no":true,"divtasvuodna.no":true,"divttasvuotna.no":true,"tysnes.no":true,"tysvar.no":true,"xn--tysvr-vra.no":true,"tonsberg.no":true,"xn--tnsberg-q1a.no":true,"ullensaker.no":true,"ullensvang.no":true,"ulvik.no":true,"utsira.no":true,"vadso.no":true,"xn--vads-jra.no":true,"cahcesuolo.no":true,"xn--hcesuolo-7ya35b.no":true,"vaksdal.no":true,"valle.no":true,"vang.no":true,"vanylven.no":true,"vardo.no":true,"xn--vard-jra.no":true,"varggat.no":true,"xn--vrggt-xqad.no":true,"vefsn.no":true,"vaapste.no":true,"vega.no":true,"vegarshei.no":true,"xn--vegrshei-c0a.no":true,"vennesla.no":true,"verdal.no":true,"verran.no":true,"vestby.no":true,"vestnes.no":true,"vestre-slidre.no":true,"vestre-toten.no":true,"vestvagoy.no":true,"xn--vestvgy-ixa6o.no":true,"vevelstad.no":true,"vik.no":true,"vikna.no":true,"vindafjord.no":true,"volda.no":true,"voss.no":true,"varoy.no":true,"xn--vry-yla5g.no":true,"vagan.no":true,"xn--vgan-qoa.no":true,"voagat.no":true,"vagsoy.no":true,"xn--vgsy-qoa0j.no":true,"vaga.no":true,"xn--vg-yiab.no":true,"valer.ostfold.no":true,"xn--vler-qoa.xn--stfold-9xa.no":true,"valer.hedmark.no":true,"xn--vler-qoa.hedmark.no":true,"*.np":true,"nr":true,"biz.nr":true,"info.nr":true,"gov.nr":true,"edu.nr":true,"org.nr":true,"net.nr":true,"com.nr":true,"nu":true,"nz":true,"ac.nz":true,"co.nz":true,"cri.nz":true,"geek.nz":true,"gen.nz":true,"govt.nz":true,"health.nz":true,"iwi.nz":true,"kiwi.nz":true,"maori.nz":true,"mil.nz":true,"xn--mori-qsa.nz":true,"net.nz":true,"org.nz":true,"parliament.nz":true,"school.nz":true,"om":true,"co.om":true,"com.om":true,"edu.om":true,"gov.om":true,"med.om":true,"museum.om":true,"net.om":true,"org.om":true,"pro.om":true,"org":true,"pa":true,"ac.pa":true,"gob.pa":true,"com.pa":true,"org.pa":true,"sld.pa":true,"edu.pa":true,"net.pa":true,"ing.pa":true,"abo.pa":true,"med.pa":true,"nom.pa":true,"pe":true,"edu.pe":true,"gob.pe":true,"nom.pe":true,"mil.pe":true,"org.pe":true,"com.pe":true,"net.pe":true,"pf":true,"com.pf":true,"org.pf":true,"edu.pf":true,"*.pg":true,"ph":true,"com.ph":true,"net.ph":true,"org.ph":true,"gov.ph":true,"edu.ph":true,"ngo.ph":true,"mil.ph":true,"i.ph":true,"pk":true,"com.pk":true,"net.pk":true,"edu.pk":true,"org.pk":true,"fam.pk":true,"biz.pk":true,"web.pk":true,"gov.pk":true,"gob.pk":true,"gok.pk":true,"gon.pk":true,"gop.pk":true,"gos.pk":true,"info.pk":true,"pl":true,"com.pl":true,"net.pl":true,"org.pl":true,"aid.pl":true,"agro.pl":true,"atm.pl":true,"auto.pl":true,"biz.pl":true,"edu.pl":true,"gmina.pl":true,"gsm.pl":true,"info.pl":true,"mail.pl":true,"miasta.pl":true,"media.pl":true,"mil.pl":true,"nieruchomosci.pl":true,"nom.pl":true,"pc.pl":true,"powiat.pl":true,"priv.pl":true,"realestate.pl":true,"rel.pl":true,"sex.pl":true,"shop.pl":true,"sklep.pl":true,"sos.pl":true,"szkola.pl":true,"targi.pl":true,"tm.pl":true,"tourism.pl":true,"travel.pl":true,"turystyka.pl":true,"gov.pl":true,"ap.gov.pl":true,"ic.gov.pl":true,"is.gov.pl":true,"us.gov.pl":true,"kmpsp.gov.pl":true,"kppsp.gov.pl":true,"kwpsp.gov.pl":true,"psp.gov.pl":true,"wskr.gov.pl":true,"kwp.gov.pl":true,"mw.gov.pl":true,"ug.gov.pl":true,"um.gov.pl":true,"umig.gov.pl":true,"ugim.gov.pl":true,"upow.gov.pl":true,"uw.gov.pl":true,"starostwo.gov.pl":true,"pa.gov.pl":true,"po.gov.pl":true,"psse.gov.pl":true,"pup.gov.pl":true,"rzgw.gov.pl":true,"sa.gov.pl":true,"so.gov.pl":true,"sr.gov.pl":true,"wsa.gov.pl":true,"sko.gov.pl":true,"uzs.gov.pl":true,"wiih.gov.pl":true,"winb.gov.pl":true,"pinb.gov.pl":true,"wios.gov.pl":true,"witd.gov.pl":true,"wzmiuw.gov.pl":true,"piw.gov.pl":true,"wiw.gov.pl":true,"griw.gov.pl":true,"wif.gov.pl":true,"oum.gov.pl":true,"sdn.gov.pl":true,"zp.gov.pl":true,"uppo.gov.pl":true,"mup.gov.pl":true,"wuoz.gov.pl":true,"konsulat.gov.pl":true,"oirm.gov.pl":true,"augustow.pl":true,"babia-gora.pl":true,"bedzin.pl":true,"beskidy.pl":true,"bialowieza.pl":true,"bialystok.pl":true,"bielawa.pl":true,"bieszczady.pl":true,"boleslawiec.pl":true,"bydgoszcz.pl":true,"bytom.pl":true,"cieszyn.pl":true,"czeladz.pl":true,"czest.pl":true,"dlugoleka.pl":true,"elblag.pl":true,"elk.pl":true,"glogow.pl":true,"gniezno.pl":true,"gorlice.pl":true,"grajewo.pl":true,"ilawa.pl":true,"jaworzno.pl":true,"jelenia-gora.pl":true,"jgora.pl":true,"kalisz.pl":true,"kazimierz-dolny.pl":true,"karpacz.pl":true,"kartuzy.pl":true,"kaszuby.pl":true,"katowice.pl":true,"kepno.pl":true,"ketrzyn.pl":true,"klodzko.pl":true,"kobierzyce.pl":true,"kolobrzeg.pl":true,"konin.pl":true,"konskowola.pl":true,"kutno.pl":true,"lapy.pl":true,"lebork.pl":true,"legnica.pl":true,"lezajsk.pl":true,"limanowa.pl":true,"lomza.pl":true,"lowicz.pl":true,"lubin.pl":true,"lukow.pl":true,"malbork.pl":true,"malopolska.pl":true,"mazowsze.pl":true,"mazury.pl":true,"mielec.pl":true,"mielno.pl":true,"mragowo.pl":true,"naklo.pl":true,"nowaruda.pl":true,"nysa.pl":true,"olawa.pl":true,"olecko.pl":true,"olkusz.pl":true,"olsztyn.pl":true,"opoczno.pl":true,"opole.pl":true,"ostroda.pl":true,"ostroleka.pl":true,"ostrowiec.pl":true,"ostrowwlkp.pl":true,"pila.pl":true,"pisz.pl":true,"podhale.pl":true,"podlasie.pl":true,"polkowice.pl":true,"pomorze.pl":true,"pomorskie.pl":true,"prochowice.pl":true,"pruszkow.pl":true,"przeworsk.pl":true,"pulawy.pl":true,"radom.pl":true,"rawa-maz.pl":true,"rybnik.pl":true,"rzeszow.pl":true,"sanok.pl":true,"sejny.pl":true,"slask.pl":true,"slupsk.pl":true,"sosnowiec.pl":true,"stalowa-wola.pl":true,"skoczow.pl":true,"starachowice.pl":true,"stargard.pl":true,"suwalki.pl":true,"swidnica.pl":true,"swiebodzin.pl":true,"swinoujscie.pl":true,"szczecin.pl":true,"szczytno.pl":true,"tarnobrzeg.pl":true,"tgory.pl":true,"turek.pl":true,"tychy.pl":true,"ustka.pl":true,"walbrzych.pl":true,"warmia.pl":true,"warszawa.pl":true,"waw.pl":true,"wegrow.pl":true,"wielun.pl":true,"wlocl.pl":true,"wloclawek.pl":true,"wodzislaw.pl":true,"wolomin.pl":true,"wroclaw.pl":true,"zachpomor.pl":true,"zagan.pl":true,"zarow.pl":true,"zgora.pl":true,"zgorzelec.pl":true,"pm":true,"pn":true,"gov.pn":true,"co.pn":true,"org.pn":true,"edu.pn":true,"net.pn":true,"post":true,"pr":true,"com.pr":true,"net.pr":true,"org.pr":true,"gov.pr":true,"edu.pr":true,"isla.pr":true,"pro.pr":true,"biz.pr":true,"info.pr":true,"name.pr":true,"est.pr":true,"prof.pr":true,"ac.pr":true,"pro":true,"aca.pro":true,"bar.pro":true,"cpa.pro":true,"jur.pro":true,"law.pro":true,"med.pro":true,"eng.pro":true,"ps":true,"edu.ps":true,"gov.ps":true,"sec.ps":true,"plo.ps":true,"com.ps":true,"org.ps":true,"net.ps":true,"pt":true,"net.pt":true,"gov.pt":true,"org.pt":true,"edu.pt":true,"int.pt":true,"publ.pt":true,"com.pt":true,"nome.pt":true,"pw":true,"co.pw":true,"ne.pw":true,"or.pw":true,"ed.pw":true,"go.pw":true,"belau.pw":true,"py":true,"com.py":true,"coop.py":true,"edu.py":true,"gov.py":true,"mil.py":true,"net.py":true,"org.py":true,"qa":true,"com.qa":true,"edu.qa":true,"gov.qa":true,"mil.qa":true,"name.qa":true,"net.qa":true,"org.qa":true,"sch.qa":true,"re":true,"com.re":true,"asso.re":true,"nom.re":true,"ro":true,"com.ro":true,"org.ro":true,"tm.ro":true,"nt.ro":true,"nom.ro":true,"info.ro":true,"rec.ro":true,"arts.ro":true,"firm.ro":true,"store.ro":true,"www.ro":true,"rs":true,"co.rs":true,"org.rs":true,"edu.rs":true,"ac.rs":true,"gov.rs":true,"in.rs":true,"ru":true,"ac.ru":true,"com.ru":true,"edu.ru":true,"int.ru":true,"net.ru":true,"org.ru":true,"pp.ru":true,"adygeya.ru":true,"altai.ru":true,"amur.ru":true,"arkhangelsk.ru":true,"astrakhan.ru":true,"bashkiria.ru":true,"belgorod.ru":true,"bir.ru":true,"bryansk.ru":true,"buryatia.ru":true,"cbg.ru":true,"chel.ru":true,"chelyabinsk.ru":true,"chita.ru":true,"chukotka.ru":true,"chuvashia.ru":true,"dagestan.ru":true,"dudinka.ru":true,"e-burg.ru":true,"grozny.ru":true,"irkutsk.ru":true,"ivanovo.ru":true,"izhevsk.ru":true,"jar.ru":true,"joshkar-ola.ru":true,"kalmykia.ru":true,"kaluga.ru":true,"kamchatka.ru":true,"karelia.ru":true,"kazan.ru":true,"kchr.ru":true,"kemerovo.ru":true,"khabarovsk.ru":true,"khakassia.ru":true,"khv.ru":true,"kirov.ru":true,"koenig.ru":true,"komi.ru":true,"kostroma.ru":true,"krasnoyarsk.ru":true,"kuban.ru":true,"kurgan.ru":true,"kursk.ru":true,"lipetsk.ru":true,"magadan.ru":true,"mari.ru":true,"mari-el.ru":true,"marine.ru":true,"mordovia.ru":true,"msk.ru":true,"murmansk.ru":true,"nalchik.ru":true,"nnov.ru":true,"nov.ru":true,"novosibirsk.ru":true,"nsk.ru":true,"omsk.ru":true,"orenburg.ru":true,"oryol.ru":true,"palana.ru":true,"penza.ru":true,"perm.ru":true,"ptz.ru":true,"rnd.ru":true,"ryazan.ru":true,"sakhalin.ru":true,"samara.ru":true,"saratov.ru":true,"simbirsk.ru":true,"smolensk.ru":true,"spb.ru":true,"stavropol.ru":true,"stv.ru":true,"surgut.ru":true,"tambov.ru":true,"tatarstan.ru":true,"tom.ru":true,"tomsk.ru":true,"tsaritsyn.ru":true,"tsk.ru":true,"tula.ru":true,"tuva.ru":true,"tver.ru":true,"tyumen.ru":true,"udm.ru":true,"udmurtia.ru":true,"ulan-ude.ru":true,"vladikavkaz.ru":true,"vladimir.ru":true,"vladivostok.ru":true,"volgograd.ru":true,"vologda.ru":true,"voronezh.ru":true,"vrn.ru":true,"vyatka.ru":true,"yakutia.ru":true,"yamal.ru":true,"yaroslavl.ru":true,"yekaterinburg.ru":true,"yuzhno-sakhalinsk.ru":true,"amursk.ru":true,"baikal.ru":true,"cmw.ru":true,"fareast.ru":true,"jamal.ru":true,"kms.ru":true,"k-uralsk.ru":true,"kustanai.ru":true,"kuzbass.ru":true,"magnitka.ru":true,"mytis.ru":true,"nakhodka.ru":true,"nkz.ru":true,"norilsk.ru":true,"oskol.ru":true,"pyatigorsk.ru":true,"rubtsovsk.ru":true,"snz.ru":true,"syzran.ru":true,"vdonsk.ru":true,"zgrad.ru":true,"gov.ru":true,"mil.ru":true,"test.ru":true,"rw":true,"gov.rw":true,"net.rw":true,"edu.rw":true,"ac.rw":true,"com.rw":true,"co.rw":true,"int.rw":true,"mil.rw":true,"gouv.rw":true,"sa":true,"com.sa":true,"net.sa":true,"org.sa":true,"gov.sa":true,"med.sa":true,"pub.sa":true,"edu.sa":true,"sch.sa":true,"sb":true,"com.sb":true,"edu.sb":true,"gov.sb":true,"net.sb":true,"org.sb":true,"sc":true,"com.sc":true,"gov.sc":true,"net.sc":true,"org.sc":true,"edu.sc":true,"sd":true,"com.sd":true,"net.sd":true,"org.sd":true,"edu.sd":true,"med.sd":true,"tv.sd":true,"gov.sd":true,"info.sd":true,"se":true,"a.se":true,"ac.se":true,"b.se":true,"bd.se":true,"brand.se":true,"c.se":true,"d.se":true,"e.se":true,"f.se":true,"fh.se":true,"fhsk.se":true,"fhv.se":true,"g.se":true,"h.se":true,"i.se":true,"k.se":true,"komforb.se":true,"kommunalforbund.se":true,"komvux.se":true,"l.se":true,"lanbib.se":true,"m.se":true,"n.se":true,"naturbruksgymn.se":true,"o.se":true,"org.se":true,"p.se":true,"parti.se":true,"pp.se":true,"press.se":true,"r.se":true,"s.se":true,"t.se":true,"tm.se":true,"u.se":true,"w.se":true,"x.se":true,"y.se":true,"z.se":true,"sg":true,"com.sg":true,"net.sg":true,"org.sg":true,"gov.sg":true,"edu.sg":true,"per.sg":true,"sh":true,"com.sh":true,"net.sh":true,"gov.sh":true,"org.sh":true,"mil.sh":true,"si":true,"sj":true,"sk":true,"sl":true,"com.sl":true,"net.sl":true,"edu.sl":true,"gov.sl":true,"org.sl":true,"sm":true,"sn":true,"art.sn":true,"com.sn":true,"edu.sn":true,"gouv.sn":true,"org.sn":true,"perso.sn":true,"univ.sn":true,"so":true,"com.so":true,"net.so":true,"org.so":true,"sr":true,"st":true,"co.st":true,"com.st":true,"consulado.st":true,"edu.st":true,"embaixada.st":true,"gov.st":true,"mil.st":true,"net.st":true,"org.st":true,"principe.st":true,"saotome.st":true,"store.st":true,"su":true,"adygeya.su":true,"arkhangelsk.su":true,"balashov.su":true,"bashkiria.su":true,"bryansk.su":true,"dagestan.su":true,"grozny.su":true,"ivanovo.su":true,"kalmykia.su":true,"kaluga.su":true,"karelia.su":true,"khakassia.su":true,"krasnodar.su":true,"kurgan.su":true,"lenug.su":true,"mordovia.su":true,"msk.su":true,"murmansk.su":true,"nalchik.su":true,"nov.su":true,"obninsk.su":true,"penza.su":true,"pokrovsk.su":true,"sochi.su":true,"spb.su":true,"togliatti.su":true,"troitsk.su":true,"tula.su":true,"tuva.su":true,"vladikavkaz.su":true,"vladimir.su":true,"vologda.su":true,"sv":true,"com.sv":true,"edu.sv":true,"gob.sv":true,"org.sv":true,"red.sv":true,"sx":true,"gov.sx":true,"sy":true,"edu.sy":true,"gov.sy":true,"net.sy":true,"mil.sy":true,"com.sy":true,"org.sy":true,"sz":true,"co.sz":true,"ac.sz":true,"org.sz":true,"tc":true,"td":true,"tel":true,"tf":true,"tg":true,"th":true,"ac.th":true,"co.th":true,"go.th":true,"in.th":true,"mi.th":true,"net.th":true,"or.th":true,"tj":true,"ac.tj":true,"biz.tj":true,"co.tj":true,"com.tj":true,"edu.tj":true,"go.tj":true,"gov.tj":true,"int.tj":true,"mil.tj":true,"name.tj":true,"net.tj":true,"nic.tj":true,"org.tj":true,"test.tj":true,"web.tj":true,"tk":true,"tl":true,"gov.tl":true,"tm":true,"com.tm":true,"co.tm":true,"org.tm":true,"net.tm":true,"nom.tm":true,"gov.tm":true,"mil.tm":true,"edu.tm":true,"tn":true,"com.tn":true,"ens.tn":true,"fin.tn":true,"gov.tn":true,"ind.tn":true,"intl.tn":true,"nat.tn":true,"net.tn":true,"org.tn":true,"info.tn":true,"perso.tn":true,"tourism.tn":true,"edunet.tn":true,"rnrt.tn":true,"rns.tn":true,"rnu.tn":true,"mincom.tn":true,"agrinet.tn":true,"defense.tn":true,"turen.tn":true,"to":true,"com.to":true,"gov.to":true,"net.to":true,"org.to":true,"edu.to":true,"mil.to":true,"tp":true,"tr":true,"com.tr":true,"info.tr":true,"biz.tr":true,"net.tr":true,"org.tr":true,"web.tr":true,"gen.tr":true,"tv.tr":true,"av.tr":true,"dr.tr":true,"bbs.tr":true,"name.tr":true,"tel.tr":true,"gov.tr":true,"bel.tr":true,"pol.tr":true,"mil.tr":true,"k12.tr":true,"edu.tr":true,"kep.tr":true,"nc.tr":true,"gov.nc.tr":true,"travel":true,"tt":true,"co.tt":true,"com.tt":true,"org.tt":true,"net.tt":true,"biz.tt":true,"info.tt":true,"pro.tt":true,"int.tt":true,"coop.tt":true,"jobs.tt":true,"mobi.tt":true,"travel.tt":true,"museum.tt":true,"aero.tt":true,"name.tt":true,"gov.tt":true,"edu.tt":true,"tv":true,"tw":true,"edu.tw":true,"gov.tw":true,"mil.tw":true,"com.tw":true,"net.tw":true,"org.tw":true,"idv.tw":true,"game.tw":true,"ebiz.tw":true,"club.tw":true,"xn--zf0ao64a.tw":true,"xn--uc0atv.tw":true,"xn--czrw28b.tw":true,"tz":true,"ac.tz":true,"co.tz":true,"go.tz":true,"hotel.tz":true,"info.tz":true,"me.tz":true,"mil.tz":true,"mobi.tz":true,"ne.tz":true,"or.tz":true,"sc.tz":true,"tv.tz":true,"ua":true,"com.ua":true,"edu.ua":true,"gov.ua":true,"in.ua":true,"net.ua":true,"org.ua":true,"cherkassy.ua":true,"cherkasy.ua":true,"chernigov.ua":true,"chernihiv.ua":true,"chernivtsi.ua":true,"chernovtsy.ua":true,"ck.ua":true,"cn.ua":true,"cr.ua":true,"crimea.ua":true,"cv.ua":true,"dn.ua":true,"dnepropetrovsk.ua":true,"dnipropetrovsk.ua":true,"dominic.ua":true,"donetsk.ua":true,"dp.ua":true,"if.ua":true,"ivano-frankivsk.ua":true,"kh.ua":true,"kharkiv.ua":true,"kharkov.ua":true,"kherson.ua":true,"khmelnitskiy.ua":true,"khmelnytskyi.ua":true,"kiev.ua":true,"kirovograd.ua":true,"km.ua":true,"kr.ua":true,"krym.ua":true,"ks.ua":true,"kv.ua":true,"kyiv.ua":true,"lg.ua":true,"lt.ua":true,"lugansk.ua":true,"lutsk.ua":true,"lv.ua":true,"lviv.ua":true,"mk.ua":true,"mykolaiv.ua":true,"nikolaev.ua":true,"od.ua":true,"odesa.ua":true,"odessa.ua":true,"pl.ua":true,"poltava.ua":true,"rivne.ua":true,"rovno.ua":true,"rv.ua":true,"sb.ua":true,"sebastopol.ua":true,"sevastopol.ua":true,"sm.ua":true,"sumy.ua":true,"te.ua":true,"ternopil.ua":true,"uz.ua":true,"uzhgorod.ua":true,"vinnica.ua":true,"vinnytsia.ua":true,"vn.ua":true,"volyn.ua":true,"yalta.ua":true,"zaporizhzhe.ua":true,"zaporizhzhia.ua":true,"zhitomir.ua":true,"zhytomyr.ua":true,"zp.ua":true,"zt.ua":true,"ug":true,"co.ug":true,"or.ug":true,"ac.ug":true,"sc.ug":true,"go.ug":true,"ne.ug":true,"com.ug":true,"org.ug":true,"uk":true,"ac.uk":true,"co.uk":true,"gov.uk":true,"ltd.uk":true,"me.uk":true,"net.uk":true,"nhs.uk":true,"org.uk":true,"plc.uk":true,"police.uk":true,"*.sch.uk":true,"us":true,"dni.us":true,"fed.us":true,"isa.us":true,"kids.us":true,"nsn.us":true,"ak.us":true,"al.us":true,"ar.us":true,"as.us":true,"az.us":true,"ca.us":true,"co.us":true,"ct.us":true,"dc.us":true,"de.us":true,"fl.us":true,"ga.us":true,"gu.us":true,"hi.us":true,"ia.us":true,"id.us":true,"il.us":true,"in.us":true,"ks.us":true,"ky.us":true,"la.us":true,"ma.us":true,"md.us":true,"me.us":true,"mi.us":true,"mn.us":true,"mo.us":true,"ms.us":true,"mt.us":true,"nc.us":true,"nd.us":true,"ne.us":true,"nh.us":true,"nj.us":true,"nm.us":true,"nv.us":true,"ny.us":true,"oh.us":true,"ok.us":true,"or.us":true,"pa.us":true,"pr.us":true,"ri.us":true,"sc.us":true,"sd.us":true,"tn.us":true,"tx.us":true,"ut.us":true,"vi.us":true,"vt.us":true,"va.us":true,"wa.us":true,"wi.us":true,"wv.us":true,"wy.us":true,"k12.ak.us":true,"k12.al.us":true,"k12.ar.us":true,"k12.as.us":true,"k12.az.us":true,"k12.ca.us":true,"k12.co.us":true,"k12.ct.us":true,"k12.dc.us":true,"k12.de.us":true,"k12.fl.us":true,"k12.ga.us":true,"k12.gu.us":true,"k12.ia.us":true,"k12.id.us":true,"k12.il.us":true,"k12.in.us":true,"k12.ks.us":true,"k12.ky.us":true,"k12.la.us":true,"k12.ma.us":true,"k12.md.us":true,"k12.me.us":true,"k12.mi.us":true,"k12.mn.us":true,"k12.mo.us":true,"k12.ms.us":true,"k12.mt.us":true,"k12.nc.us":true,"k12.ne.us":true,"k12.nh.us":true,"k12.nj.us":true,"k12.nm.us":true,"k12.nv.us":true,"k12.ny.us":true,"k12.oh.us":true,"k12.ok.us":true,"k12.or.us":true,"k12.pa.us":true,"k12.pr.us":true,"k12.ri.us":true,"k12.sc.us":true,"k12.tn.us":true,"k12.tx.us":true,"k12.ut.us":true,"k12.vi.us":true,"k12.vt.us":true,"k12.va.us":true,"k12.wa.us":true,"k12.wi.us":true,"k12.wy.us":true,"cc.ak.us":true,"cc.al.us":true,"cc.ar.us":true,"cc.as.us":true,"cc.az.us":true,"cc.ca.us":true,"cc.co.us":true,"cc.ct.us":true,"cc.dc.us":true,"cc.de.us":true,"cc.fl.us":true,"cc.ga.us":true,"cc.gu.us":true,"cc.hi.us":true,"cc.ia.us":true,"cc.id.us":true,"cc.il.us":true,"cc.in.us":true,"cc.ks.us":true,"cc.ky.us":true,"cc.la.us":true,"cc.ma.us":true,"cc.md.us":true,"cc.me.us":true,"cc.mi.us":true,"cc.mn.us":true,"cc.mo.us":true,"cc.ms.us":true,"cc.mt.us":true,"cc.nc.us":true,"cc.nd.us":true,"cc.ne.us":true,"cc.nh.us":true,"cc.nj.us":true,"cc.nm.us":true,"cc.nv.us":true,"cc.ny.us":true,"cc.oh.us":true,"cc.ok.us":true,"cc.or.us":true,"cc.pa.us":true,"cc.pr.us":true,"cc.ri.us":true,"cc.sc.us":true,"cc.sd.us":true,"cc.tn.us":true,"cc.tx.us":true,"cc.ut.us":true,"cc.vi.us":true,"cc.vt.us":true,"cc.va.us":true,"cc.wa.us":true,"cc.wi.us":true,"cc.wv.us":true,"cc.wy.us":true,"lib.ak.us":true,"lib.al.us":true,"lib.ar.us":true,"lib.as.us":true,"lib.az.us":true,"lib.ca.us":true,"lib.co.us":true,"lib.ct.us":true,"lib.dc.us":true,"lib.de.us":true,"lib.fl.us":true,"lib.ga.us":true,"lib.gu.us":true,"lib.hi.us":true,"lib.ia.us":true,"lib.id.us":true,"lib.il.us":true,"lib.in.us":true,"lib.ks.us":true,"lib.ky.us":true,"lib.la.us":true,"lib.ma.us":true,"lib.md.us":true,"lib.me.us":true,"lib.mi.us":true,"lib.mn.us":true,"lib.mo.us":true,"lib.ms.us":true,"lib.mt.us":true,"lib.nc.us":true,"lib.nd.us":true,"lib.ne.us":true,"lib.nh.us":true,"lib.nj.us":true,"lib.nm.us":true,"lib.nv.us":true,"lib.ny.us":true,"lib.oh.us":true,"lib.ok.us":true,"lib.or.us":true,"lib.pa.us":true,"lib.pr.us":true,"lib.ri.us":true,"lib.sc.us":true,"lib.sd.us":true,"lib.tn.us":true,"lib.tx.us":true,"lib.ut.us":true,"lib.vi.us":true,"lib.vt.us":true,"lib.va.us":true,"lib.wa.us":true,"lib.wi.us":true,"lib.wy.us":true,"pvt.k12.ma.us":true,"chtr.k12.ma.us":true,"paroch.k12.ma.us":true,"uy":true,"com.uy":true,"edu.uy":true,"gub.uy":true,"mil.uy":true,"net.uy":true,"org.uy":true,"uz":true,"co.uz":true,"com.uz":true,"net.uz":true,"org.uz":true,"va":true,"vc":true,"com.vc":true,"net.vc":true,"org.vc":true,"gov.vc":true,"mil.vc":true,"edu.vc":true,"ve":true,"arts.ve":true,"co.ve":true,"com.ve":true,"e12.ve":true,"edu.ve":true,"firm.ve":true,"gob.ve":true,"gov.ve":true,"info.ve":true,"int.ve":true,"mil.ve":true,"net.ve":true,"org.ve":true,"rec.ve":true,"store.ve":true,"tec.ve":true,"web.ve":true,"vg":true,"vi":true,"co.vi":true,"com.vi":true,"k12.vi":true,"net.vi":true,"org.vi":true,"vn":true,"com.vn":true,"net.vn":true,"org.vn":true,"edu.vn":true,"gov.vn":true,"int.vn":true,"ac.vn":true,"biz.vn":true,"info.vn":true,"name.vn":true,"pro.vn":true,"health.vn":true,"vu":true,"com.vu":true,"edu.vu":true,"net.vu":true,"org.vu":true,"wf":true,"ws":true,"com.ws":true,"net.ws":true,"org.ws":true,"gov.ws":true,"edu.ws":true,"yt":true,"xn--mgbaam7a8h":true,"xn--y9a3aq":true,"xn--54b7fta0cc":true,"xn--90ais":true,"xn--fiqs8s":true,"xn--fiqz9s":true,"xn--lgbbat1ad8j":true,"xn--wgbh1c":true,"xn--node":true,"xn--qxam":true,"xn--j6w193g":true,"xn--h2brj9c":true,"xn--mgbbh1a71e":true,"xn--fpcrj9c3d":true,"xn--gecrj9c":true,"xn--s9brj9c":true,"xn--45brj9c":true,"xn--xkc2dl3a5ee0h":true,"xn--mgba3a4f16a":true,"xn--mgba3a4fra":true,"xn--mgbtx2b":true,"xn--mgbayh7gpa":true,"xn--3e0b707e":true,"xn--80ao21a":true,"xn--fzc2c9e2c":true,"xn--xkc2al3hye2a":true,"xn--mgbc0a9azcg":true,"xn--d1alf":true,"xn--l1acc":true,"xn--mix891f":true,"xn--mix082f":true,"xn--mgbx4cd0ab":true,"xn--mgb9awbf":true,"xn--mgbai9azgqp6j":true,"xn--mgbai9a5eva00b":true,"xn--ygbi2ammx":true,"xn--90a3ac":true,"xn--o1ac.xn--90a3ac":true,"xn--c1avg.xn--90a3ac":true,"xn--90azh.xn--90a3ac":true,"xn--d1at.xn--90a3ac":true,"xn--o1ach.xn--90a3ac":true,"xn--80au.xn--90a3ac":true,"xn--p1ai":true,"xn--wgbl6a":true,"xn--mgberp4a5d4ar":true,"xn--mgberp4a5d4a87g":true,"xn--mgbqly7c0a67fbc":true,"xn--mgbqly7cvafr":true,"xn--mgbpl2fh":true,"xn--yfro4i67o":true,"xn--clchc0ea0b2g2a9gcd":true,"xn--ogbpf8fl":true,"xn--mgbtf8fl":true,"xn--o3cw4h":true,"xn--pgbs0dh":true,"xn--kpry57d":true,"xn--kprw13d":true,"xn--nnx388a":true,"xn--j1amh":true,"xn--mgb2ddes":true,"xxx":true,"*.ye":true,"ac.za":true,"agrica.za":true,"alt.za":true,"co.za":true,"edu.za":true,"gov.za":true,"grondar.za":true,"law.za":true,"mil.za":true,"net.za":true,"ngo.za":true,"nis.za":true,"nom.za":true,"org.za":true,"school.za":true,"tm.za":true,"web.za":true,"*.zm":true,"*.zw":true,"aaa":true,"aarp":true,"abarth":true,"abb":true,"abbott":true,"abbvie":true,"abc":true,"able":true,"abogado":true,"abudhabi":true,"academy":true,"accenture":true,"accountant":true,"accountants":true,"aco":true,"active":true,"actor":true,"adac":true,"ads":true,"adult":true,"aeg":true,"aetna":true,"afamilycompany":true,"afl":true,"africa":true,"africamagic":true,"agakhan":true,"agency":true,"aig":true,"aigo":true,"airbus":true,"airforce":true,"airtel":true,"akdn":true,"alfaromeo":true,"alibaba":true,"alipay":true,"allfinanz":true,"allstate":true,"ally":true,"alsace":true,"alstom":true,"americanexpress":true,"americanfamily":true,"amex":true,"amfam":true,"amica":true,"amsterdam":true,"analytics":true,"android":true,"anquan":true,"anz":true,"aol":true,"apartments":true,"app":true,"apple":true,"aquarelle":true,"aramco":true,"archi":true,"army":true,"arte":true,"asda":true,"associates":true,"athleta":true,"attorney":true,"auction":true,"audi":true,"audible":true,"audio":true,"auspost":true,"author":true,"auto":true,"autos":true,"avianca":true,"aws":true,"axa":true,"azure":true,"baby":true,"baidu":true,"banamex":true,"bananarepublic":true,"band":true,"bank":true,"bar":true,"barcelona":true,"barclaycard":true,"barclays":true,"barefoot":true,"bargains":true,"basketball":true,"bauhaus":true,"bayern":true,"bbc":true,"bbt":true,"bbva":true,"bcg":true,"bcn":true,"beats":true,"beer":true,"bentley":true,"berlin":true,"best":true,"bestbuy":true,"bet":true,"bharti":true,"bible":true,"bid":true,"bike":true,"bing":true,"bingo":true,"bio":true,"black":true,"blackfriday":true,"blanco":true,"blockbuster":true,"blog":true,"bloomberg":true,"blue":true,"bms":true,"bmw":true,"bnl":true,"bnpparibas":true,"boats":true,"boehringer":true,"bofa":true,"bom":true,"bond":true,"boo":true,"book":true,"booking":true,"boots":true,"bosch":true,"bostik":true,"bot":true,"boutique":true,"bradesco":true,"bridgestone":true,"broadway":true,"broker":true,"brother":true,"brussels":true,"budapest":true,"bugatti":true,"build":true,"builders":true,"business":true,"buy":true,"buzz":true,"bzh":true,"cab":true,"cafe":true,"cal":true,"call":true,"calvinklein":true,"camera":true,"camp":true,"cancerresearch":true,"canon":true,"capetown":true,"capital":true,"capitalone":true,"car":true,"caravan":true,"cards":true,"care":true,"career":true,"careers":true,"cars":true,"cartier":true,"casa":true,"case":true,"caseih":true,"cash":true,"casino":true,"catering":true,"cba":true,"cbn":true,"cbre":true,"cbs":true,"ceb":true,"center":true,"ceo":true,"cern":true,"cfa":true,"cfd":true,"chanel":true,"channel":true,"chase":true,"chat":true,"cheap":true,"chintai":true,"chloe":true,"christmas":true,"chrome":true,"chrysler":true,"church":true,"cipriani":true,"circle":true,"cisco":true,"citadel":true,"citi":true,"citic":true,"city":true,"cityeats":true,"claims":true,"cleaning":true,"click":true,"clinic":true,"clothing":true,"cloud":true,"club":true,"clubmed":true,"coach":true,"codes":true,"coffee":true,"college":true,"cologne":true,"comcast":true,"commbank":true,"community":true,"company":true,"computer":true,"comsec":true,"condos":true,"construction":true,"consulting":true,"contact":true,"contractors":true,"cooking":true,"cookingchannel":true,"cool":true,"corsica":true,"country":true,"coupon":true,"coupons":true,"courses":true,"credit":true,"creditcard":true,"creditunion":true,"cricket":true,"crown":true,"crs":true,"cruises":true,"csc":true,"cuisinella":true,"cymru":true,"cyou":true,"dabur":true,"dad":true,"dance":true,"date":true,"dating":true,"datsun":true,"day":true,"dclk":true,"dds":true,"deal":true,"dealer":true,"deals":true,"degree":true,"delivery":true,"dell":true,"deloitte":true,"delta":true,"democrat":true,"dental":true,"dentist":true,"desi":true,"design":true,"dev":true,"dhl":true,"diamonds":true,"diet":true,"digital":true,"direct":true,"directory":true,"discount":true,"discover":true,"dish":true,"dnp":true,"docs":true,"dodge":true,"dog":true,"doha":true,"domains":true,"doosan":true,"dot":true,"download":true,"drive":true,"dstv":true,"dtv":true,"dubai":true,"duck":true,"dunlop":true,"duns":true,"dupont":true,"durban":true,"dvag":true,"dwg":true,"earth":true,"eat":true,"edeka":true,"education":true,"email":true,"emerck":true,"emerson":true,"energy":true,"engineer":true,"engineering":true,"enterprises":true,"epost":true,"epson":true,"equipment":true,"ericsson":true,"erni":true,"esq":true,"estate":true,"esurance":true,"etisalat":true,"eurovision":true,"eus":true,"events":true,"everbank":true,"exchange":true,"expert":true,"exposed":true,"express":true,"extraspace":true,"fage":true,"fail":true,"fairwinds":true,"faith":true,"family":true,"fan":true,"fans":true,"farm":true,"farmers":true,"fashion":true,"fast":true,"fedex":true,"feedback":true,"ferrari":true,"ferrero":true,"fiat":true,"fidelity":true,"fido":true,"film":true,"final":true,"finance":true,"financial":true,"fire":true,"firestone":true,"firmdale":true,"fish":true,"fishing":true,"fit":true,"fitness":true,"flickr":true,"flights":true,"flir":true,"florist":true,"flowers":true,"flsmidth":true,"fly":true,"foo":true,"foodnetwork":true,"football":true,"ford":true,"forex":true,"forsale":true,"forum":true,"foundation":true,"fox":true,"fresenius":true,"frl":true,"frogans":true,"frontdoor":true,"frontier":true,"ftr":true,"fujitsu":true,"fujixerox":true,"fund":true,"furniture":true,"futbol":true,"fyi":true,"gal":true,"gallery":true,"gallo":true,"gallup":true,"game":true,"games":true,"gap":true,"garden":true,"gbiz":true,"gdn":true,"gea":true,"gent":true,"genting":true,"george":true,"ggee":true,"gift":true,"gifts":true,"gives":true,"giving":true,"glade":true,"glass":true,"gle":true,"global":true,"globo":true,"gmail":true,"gmo":true,"gmx":true,"godaddy":true,"gold":true,"goldpoint":true,"golf":true,"goo":true,"goodhands":true,"goodyear":true,"goog":true,"google":true,"gop":true,"got":true,"gotv":true,"grainger":true,"graphics":true,"gratis":true,"green":true,"gripe":true,"group":true,"guardian":true,"gucci":true,"guge":true,"guide":true,"guitars":true,"guru":true,"hamburg":true,"hangout":true,"haus":true,"hbo":true,"hdfc":true,"hdfcbank":true,"health":true,"healthcare":true,"help":true,"helsinki":true,"here":true,"hermes":true,"hgtv":true,"hiphop":true,"hisamitsu":true,"hitachi":true,"hiv":true,"hkt":true,"hockey":true,"holdings":true,"holiday":true,"homedepot":true,"homegoods":true,"homes":true,"homesense":true,"honda":true,"honeywell":true,"horse":true,"host":true,"hosting":true,"hot":true,"hoteles":true,"hotmail":true,"house":true,"how":true,"hsbc":true,"htc":true,"hughes":true,"hyatt":true,"hyundai":true,"ibm":true,"icbc":true,"ice":true,"icu":true,"ieee":true,"ifm":true,"iinet":true,"ikano":true,"imamat":true,"imdb":true,"immo":true,"immobilien":true,"industries":true,"infiniti":true,"ing":true,"ink":true,"institute":true,"insurance":true,"insure":true,"intel":true,"international":true,"intuit":true,"investments":true,"ipiranga":true,"irish":true,"iselect":true,"ismaili":true,"ist":true,"istanbul":true,"itau":true,"itv":true,"iveco":true,"iwc":true,"jaguar":true,"java":true,"jcb":true,"jcp":true,"jeep":true,"jetzt":true,"jewelry":true,"jio":true,"jlc":true,"jll":true,"jmp":true,"jnj":true,"joburg":true,"jot":true,"joy":true,"jpmorgan":true,"jprs":true,"juegos":true,"juniper":true,"kaufen":true,"kddi":true,"kerryhotels":true,"kerrylogistics":true,"kerryproperties":true,"kfh":true,"kia":true,"kim":true,"kinder":true,"kindle":true,"kitchen":true,"kiwi":true,"koeln":true,"komatsu":true,"kosher":true,"kpmg":true,"kpn":true,"krd":true,"kred":true,"kuokgroup":true,"kyknet":true,"kyoto":true,"lacaixa":true,"ladbrokes":true,"lamborghini":true,"lancaster":true,"lancia":true,"lancome":true,"land":true,"landrover":true,"lanxess":true,"lasalle":true,"lat":true,"latino":true,"latrobe":true,"law":true,"lawyer":true,"lds":true,"lease":true,"leclerc":true,"lefrak":true,"legal":true,"lego":true,"lexus":true,"lgbt":true,"liaison":true,"lidl":true,"life":true,"lifeinsurance":true,"lifestyle":true,"lighting":true,"like":true,"lilly":true,"limited":true,"limo":true,"lincoln":true,"linde":true,"link":true,"lipsy":true,"live":true,"living":true,"lixil":true,"loan":true,"loans":true,"locker":true,"locus":true,"loft":true,"lol":true,"london":true,"lotte":true,"lotto":true,"love":true,"lpl":true,"lplfinancial":true,"ltd":true,"ltda":true,"lundbeck":true,"lupin":true,"luxe":true,"luxury":true,"macys":true,"madrid":true,"maif":true,"maison":true,"makeup":true,"man":true,"management":true,"mango":true,"market":true,"marketing":true,"markets":true,"marriott":true,"marshalls":true,"maserati":true,"mattel":true,"mba":true,"mcd":true,"mcdonalds":true,"mckinsey":true,"med":true,"media":true,"meet":true,"melbourne":true,"meme":true,"memorial":true,"men":true,"menu":true,"meo":true,"metlife":true,"miami":true,"microsoft":true,"mini":true,"mint":true,"mit":true,"mitsubishi":true,"mlb":true,"mls":true,"mma":true,"mnet":true,"mobily":true,"moda":true,"moe":true,"moi":true,"mom":true,"monash":true,"money":true,"monster":true,"montblanc":true,"mopar":true,"mormon":true,"mortgage":true,"moscow":true,"moto":true,"motorcycles":true,"mov":true,"movie":true,"movistar":true,"msd":true,"mtn":true,"mtpc":true,"mtr":true,"multichoice":true,"mutual":true,"mutuelle":true,"mzansimagic":true,"nab":true,"nadex":true,"nagoya":true,"naspers":true,"nationwide":true,"natura":true,"navy":true,"nba":true,"nec":true,"netbank":true,"netflix":true,"network":true,"neustar":true,"new":true,"newholland":true,"news":true,"next":true,"nextdirect":true,"nexus":true,"nfl":true,"ngo":true,"nhk":true,"nico":true,"nike":true,"nikon":true,"ninja":true,"nissan":true,"nokia":true,"northwesternmutual":true,"norton":true,"now":true,"nowruz":true,"nowtv":true,"nra":true,"nrw":true,"ntt":true,"nyc":true,"obi":true,"observer":true,"off":true,"office":true,"okinawa":true,"olayan":true,"olayangroup":true,"oldnavy":true,"ollo":true,"omega":true,"one":true,"ong":true,"onl":true,"online":true,"onyourside":true,"ooo":true,"open":true,"oracle":true,"orange":true,"organic":true,"orientexpress":true,"osaka":true,"otsuka":true,"ott":true,"ovh":true,"page":true,"pamperedchef":true,"panasonic":true,"panerai":true,"paris":true,"pars":true,"partners":true,"parts":true,"party":true,"passagens":true,"pay":true,"payu":true,"pccw":true,"pet":true,"pfizer":true,"pharmacy":true,"philips":true,"photo":true,"photography":true,"photos":true,"physio":true,"piaget":true,"pics":true,"pictet":true,"pictures":true,"pid":true,"pin":true,"ping":true,"pink":true,"pioneer":true,"pizza":true,"place":true,"play":true,"playstation":true,"plumbing":true,"plus":true,"pnc":true,"pohl":true,"poker":true,"politie":true,"porn":true,"pramerica":true,"praxi":true,"press":true,"prime":true,"prod":true,"productions":true,"prof":true,"progressive":true,"promo":true,"properties":true,"property":true,"protection":true,"pru":true,"prudential":true,"pub":true,"qpon":true,"quebec":true,"quest":true,"qvc":true,"racing":true,"raid":true,"read":true,"realestate":true,"realtor":true,"realty":true,"recipes":true,"red":true,"redstone":true,"redumbrella":true,"rehab":true,"reise":true,"reisen":true,"reit":true,"reliance":true,"ren":true,"rent":true,"rentals":true,"repair":true,"report":true,"republican":true,"rest":true,"restaurant":true,"review":true,"reviews":true,"rexroth":true,"rich":true,"richardli":true,"ricoh":true,"rightathome":true,"ril":true,"rio":true,"rip":true,"rocher":true,"rocks":true,"rodeo":true,"rogers":true,"room":true,"rsvp":true,"ruhr":true,"run":true,"rwe":true,"ryukyu":true,"saarland":true,"safe":true,"safety":true,"sakura":true,"sale":true,"salon":true,"samsclub":true,"samsung":true,"sandvik":true,"sandvikcoromant":true,"sanofi":true,"sap":true,"sapo":true,"sarl":true,"sas":true,"save":true,"saxo":true,"sbi":true,"sbs":true,"sca":true,"scb":true,"schaeffler":true,"schmidt":true,"scholarships":true,"school":true,"schule":true,"schwarz":true,"science":true,"scjohnson":true,"scor":true,"scot":true,"seat":true,"secure":true,"security":true,"seek":true,"sener":true,"services":true,"ses":true,"seven":true,"sew":true,"sex":true,"sexy":true,"sfr":true,"shangrila":true,"sharp":true,"shaw":true,"shell":true,"shia":true,"shiksha":true,"shoes":true,"shouji":true,"show":true,"showtime":true,"shriram":true,"silk":true,"sina":true,"singles":true,"site":true,"ski":true,"skin":true,"sky":true,"skype":true,"sling":true,"smart":true,"smile":true,"sncf":true,"soccer":true,"social":true,"softbank":true,"software":true,"sohu":true,"solar":true,"solutions":true,"song":true,"sony":true,"soy":true,"space":true,"spiegel":true,"spot":true,"spreadbetting":true,"srl":true,"srt":true,"stada":true,"staples":true,"star":true,"starhub":true,"statebank":true,"statefarm":true,"statoil":true,"stc":true,"stcgroup":true,"stockholm":true,"storage":true,"store":true,"studio":true,"study":true,"style":true,"sucks":true,"supersport":true,"supplies":true,"supply":true,"support":true,"surf":true,"surgery":true,"suzuki":true,"swatch":true,"swiftcover":true,"swiss":true,"sydney":true,"symantec":true,"systems":true,"tab":true,"taipei":true,"talk":true,"taobao":true,"target":true,"tatamotors":true,"tatar":true,"tattoo":true,"tax":true,"taxi":true,"tci":true,"tdk":true,"team":true,"tech":true,"technology":true,"telecity":true,"telefonica":true,"temasek":true,"tennis":true,"teva":true,"thd":true,"theater":true,"theatre":true,"theguardian":true,"tiaa":true,"tickets":true,"tienda":true,"tiffany":true,"tips":true,"tires":true,"tirol":true,"tjmaxx":true,"tjx":true,"tkmaxx":true,"tmall":true,"today":true,"tokyo":true,"tools":true,"top":true,"toray":true,"toshiba":true,"total":true,"tours":true,"town":true,"toyota":true,"toys":true,"trade":true,"trading":true,"training":true,"travelchannel":true,"travelers":true,"travelersinsurance":true,"trust":true,"trv":true,"tube":true,"tui":true,"tunes":true,"tushu":true,"tvs":true,"ubank":true,"ubs":true,"uconnect":true,"university":true,"uno":true,"uol":true,"ups":true,"vacations":true,"vana":true,"vanguard":true,"vegas":true,"ventures":true,"verisign":true,"versicherung":true,"vet":true,"viajes":true,"video":true,"vig":true,"viking":true,"villas":true,"vin":true,"vip":true,"virgin":true,"visa":true,"vision":true,"vista":true,"vistaprint":true,"viva":true,"vivo":true,"vlaanderen":true,"vodka":true,"volkswagen":true,"vote":true,"voting":true,"voto":true,"voyage":true,"vuelos":true,"wales":true,"walmart":true,"walter":true,"wang":true,"wanggou":true,"warman":true,"watch":true,"watches":true,"weather":true,"weatherchannel":true,"webcam":true,"weber":true,"website":true,"wed":true,"wedding":true,"weibo":true,"weir":true,"whoswho":true,"wien":true,"wiki":true,"williamhill":true,"win":true,"windows":true,"wine":true,"winners":true,"wme":true,"wolterskluwer":true,"woodside":true,"work":true,"works":true,"world":true,"wtc":true,"wtf":true,"xbox":true,"xerox":true,"xfinity":true,"xihuan":true,"xin":true,"xn--11b4c3d":true,"xn--1ck2e1b":true,"xn--1qqw23a":true,"xn--30rr7y":true,"xn--3bst00m":true,"xn--3ds443g":true,"xn--3oq18vl8pn36a":true,"xn--3pxu8k":true,"xn--42c2d9a":true,"xn--45q11c":true,"xn--4gbrim":true,"xn--4gq48lf9j":true,"xn--55qw42g":true,"xn--55qx5d":true,"xn--5su34j936bgsg":true,"xn--5tzm5g":true,"xn--6frz82g":true,"xn--6qq986b3xl":true,"xn--80adxhks":true,"xn--80asehdb":true,"xn--80aswg":true,"xn--8y0a063a":true,"xn--9dbq2a":true,"xn--9et52u":true,"xn--9krt00a":true,"xn--b4w605ferd":true,"xn--bck1b9a5dre4c":true,"xn--c1avg":true,"xn--c2br7g":true,"xn--cck2b3b":true,"xn--cg4bki":true,"xn--czr694b":true,"xn--czrs0t":true,"xn--czru2d":true,"xn--d1acj3b":true,"xn--eckvdtc9d":true,"xn--efvy88h":true,"xn--estv75g":true,"xn--fct429k":true,"xn--fhbei":true,"xn--fiq228c5hs":true,"xn--fiq64b":true,"xn--fjq720a":true,"xn--flw351e":true,"xn--fzys8d69uvgm":true,"xn--g2xx48c":true,"xn--gckr3f0f":true,"xn--hxt814e":true,"xn--i1b6b1a6a2e":true,"xn--imr513n":true,"xn--io0a7i":true,"xn--j1aef":true,"xn--jlq61u9w7b":true,"xn--jvr189m":true,"xn--kcrx77d1x4a":true,"xn--kpu716f":true,"xn--kput3i":true,"xn--mgba3a3ejt":true,"xn--mgba7c0bbn0a":true,"xn--mgbaakc7dvf":true,"xn--mgbab2bd":true,"xn--mgbb9fbpob":true,"xn--mgbca7dzdo":true,"xn--mgbt3dhd":true,"xn--mk1bu44c":true,"xn--mxtq1m":true,"xn--ngbc5azd":true,"xn--ngbe9e0a":true,"xn--nqv7f":true,"xn--nqv7fs00ema":true,"xn--nyqy26a":true,"xn--p1acf":true,"xn--pbt977c":true,"xn--pssy2u":true,"xn--q9jyb4c":true,"xn--qcka1pmc":true,"xn--rhqv96g":true,"xn--rovu88b":true,"xn--ses554g":true,"xn--t60b56a":true,"xn--tckwe":true,"xn--unup4y":true,"xn--vermgensberater-ctb":true,"xn--vermgensberatung-pwb":true,"xn--vhquv":true,"xn--vuq861b":true,"xn--w4r85el8fhu5dnra":true,"xn--w4rs40l":true,"xn--xhq521b":true,"xn--zfr164b":true,"xperia":true,"xyz":true,"yachts":true,"yahoo":true,"yamaxun":true,"yandex":true,"yodobashi":true,"yoga":true,"yokohama":true,"you":true,"youtube":true,"yun":true,"zappos":true,"zara":true,"zero":true,"zip":true,"zippo":true,"zone":true,"zuerich":true,"cloudfront.net":true,"ap-northeast-1.compute.amazonaws.com":true,"ap-southeast-1.compute.amazonaws.com":true,"ap-southeast-2.compute.amazonaws.com":true,"cn-north-1.compute.amazonaws.cn":true,"compute.amazonaws.cn":true,"compute.amazonaws.com":true,"compute-1.amazonaws.com":true,"eu-west-1.compute.amazonaws.com":true,"eu-central-1.compute.amazonaws.com":true,"sa-east-1.compute.amazonaws.com":true,"us-east-1.amazonaws.com":true,"us-gov-west-1.compute.amazonaws.com":true,"us-west-1.compute.amazonaws.com":true,"us-west-2.compute.amazonaws.com":true,"z-1.compute-1.amazonaws.com":true,"z-2.compute-1.amazonaws.com":true,"elasticbeanstalk.com":true,"elb.amazonaws.com":true,"s3.amazonaws.com":true,"s3-ap-northeast-1.amazonaws.com":true,"s3-ap-southeast-1.amazonaws.com":true,"s3-ap-southeast-2.amazonaws.com":true,"s3-external-1.amazonaws.com":true,"s3-external-2.amazonaws.com":true,"s3-fips-us-gov-west-1.amazonaws.com":true,"s3-eu-central-1.amazonaws.com":true,"s3-eu-west-1.amazonaws.com":true,"s3-sa-east-1.amazonaws.com":true,"s3-us-gov-west-1.amazonaws.com":true,"s3-us-west-1.amazonaws.com":true,"s3-us-west-2.amazonaws.com":true,"s3.cn-north-1.amazonaws.com.cn":true,"s3.eu-central-1.amazonaws.com":true,"betainabox.com":true,"ae.org":true,"ar.com":true,"br.com":true,"cn.com":true,"com.de":true,"com.se":true,"de.com":true,"eu.com":true,"gb.com":true,"gb.net":true,"hu.com":true,"hu.net":true,"jp.net":true,"jpn.com":true,"kr.com":true,"mex.com":true,"no.com":true,"qc.com":true,"ru.com":true,"sa.com":true,"se.com":true,"se.net":true,"uk.com":true,"uk.net":true,"us.com":true,"uy.com":true,"za.bz":true,"za.com":true,"africa.com":true,"gr.com":true,"in.net":true,"us.org":true,"co.com":true,"c.la":true,"cloudcontrolled.com":true,"cloudcontrolapp.com":true,"co.ca":true,"c.cdn77.org":true,"cdn77-ssl.net":true,"r.cdn77.net":true,"rsc.cdn77.org":true,"ssl.origin.cdn77-secure.org":true,"co.nl":true,"co.no":true,"*.platform.sh":true,"cupcake.is":true,"dreamhosters.com":true,"duckdns.org":true,"dyndns-at-home.com":true,"dyndns-at-work.com":true,"dyndns-blog.com":true,"dyndns-free.com":true,"dyndns-home.com":true,"dyndns-ip.com":true,"dyndns-mail.com":true,"dyndns-office.com":true,"dyndns-pics.com":true,"dyndns-remote.com":true,"dyndns-server.com":true,"dyndns-web.com":true,"dyndns-wiki.com":true,"dyndns-work.com":true,"dyndns.biz":true,"dyndns.info":true,"dyndns.org":true,"dyndns.tv":true,"at-band-camp.net":true,"ath.cx":true,"barrel-of-knowledge.info":true,"barrell-of-knowledge.info":true,"better-than.tv":true,"blogdns.com":true,"blogdns.net":true,"blogdns.org":true,"blogsite.org":true,"boldlygoingnowhere.org":true,"broke-it.net":true,"buyshouses.net":true,"cechire.com":true,"dnsalias.com":true,"dnsalias.net":true,"dnsalias.org":true,"dnsdojo.com":true,"dnsdojo.net":true,"dnsdojo.org":true,"does-it.net":true,"doesntexist.com":true,"doesntexist.org":true,"dontexist.com":true,"dontexist.net":true,"dontexist.org":true,"doomdns.com":true,"doomdns.org":true,"dvrdns.org":true,"dyn-o-saur.com":true,"dynalias.com":true,"dynalias.net":true,"dynalias.org":true,"dynathome.net":true,"dyndns.ws":true,"endofinternet.net":true,"endofinternet.org":true,"endoftheinternet.org":true,"est-a-la-maison.com":true,"est-a-la-masion.com":true,"est-le-patron.com":true,"est-mon-blogueur.com":true,"for-better.biz":true,"for-more.biz":true,"for-our.info":true,"for-some.biz":true,"for-the.biz":true,"forgot.her.name":true,"forgot.his.name":true,"from-ak.com":true,"from-al.com":true,"from-ar.com":true,"from-az.net":true,"from-ca.com":true,"from-co.net":true,"from-ct.com":true,"from-dc.com":true,"from-de.com":true,"from-fl.com":true,"from-ga.com":true,"from-hi.com":true,"from-ia.com":true,"from-id.com":true,"from-il.com":true,"from-in.com":true,"from-ks.com":true,"from-ky.com":true,"from-la.net":true,"from-ma.com":true,"from-md.com":true,"from-me.org":true,"from-mi.com":true,"from-mn.com":true,"from-mo.com":true,"from-ms.com":true,"from-mt.com":true,"from-nc.com":true,"from-nd.com":true,"from-ne.com":true,"from-nh.com":true,"from-nj.com":true,"from-nm.com":true,"from-nv.com":true,"from-ny.net":true,"from-oh.com":true,"from-ok.com":true,"from-or.com":true,"from-pa.com":true,"from-pr.com":true,"from-ri.com":true,"from-sc.com":true,"from-sd.com":true,"from-tn.com":true,"from-tx.com":true,"from-ut.com":true,"from-va.com":true,"from-vt.com":true,"from-wa.com":true,"from-wi.com":true,"from-wv.com":true,"from-wy.com":true,"ftpaccess.cc":true,"fuettertdasnetz.de":true,"game-host.org":true,"game-server.cc":true,"getmyip.com":true,"gets-it.net":true,"go.dyndns.org":true,"gotdns.com":true,"gotdns.org":true,"groks-the.info":true,"groks-this.info":true,"ham-radio-op.net":true,"here-for-more.info":true,"hobby-site.com":true,"hobby-site.org":true,"home.dyndns.org":true,"homedns.org":true,"homeftp.net":true,"homeftp.org":true,"homeip.net":true,"homelinux.com":true,"homelinux.net":true,"homelinux.org":true,"homeunix.com":true,"homeunix.net":true,"homeunix.org":true,"iamallama.com":true,"in-the-band.net":true,"is-a-anarchist.com":true,"is-a-blogger.com":true,"is-a-bookkeeper.com":true,"is-a-bruinsfan.org":true,"is-a-bulls-fan.com":true,"is-a-candidate.org":true,"is-a-caterer.com":true,"is-a-celticsfan.org":true,"is-a-chef.com":true,"is-a-chef.net":true,"is-a-chef.org":true,"is-a-conservative.com":true,"is-a-cpa.com":true,"is-a-cubicle-slave.com":true,"is-a-democrat.com":true,"is-a-designer.com":true,"is-a-doctor.com":true,"is-a-financialadvisor.com":true,"is-a-geek.com":true,"is-a-geek.net":true,"is-a-geek.org":true,"is-a-green.com":true,"is-a-guru.com":true,"is-a-hard-worker.com":true,"is-a-hunter.com":true,"is-a-knight.org":true,"is-a-landscaper.com":true,"is-a-lawyer.com":true,"is-a-liberal.com":true,"is-a-libertarian.com":true,"is-a-linux-user.org":true,"is-a-llama.com":true,"is-a-musician.com":true,"is-a-nascarfan.com":true,"is-a-nurse.com":true,"is-a-painter.com":true,"is-a-patsfan.org":true,"is-a-personaltrainer.com":true,"is-a-photographer.com":true,"is-a-player.com":true,"is-a-republican.com":true,"is-a-rockstar.com":true,"is-a-socialist.com":true,"is-a-soxfan.org":true,"is-a-student.com":true,"is-a-teacher.com":true,"is-a-techie.com":true,"is-a-therapist.com":true,"is-an-accountant.com":true,"is-an-actor.com":true,"is-an-actress.com":true,"is-an-anarchist.com":true,"is-an-artist.com":true,"is-an-engineer.com":true,"is-an-entertainer.com":true,"is-by.us":true,"is-certified.com":true,"is-found.org":true,"is-gone.com":true,"is-into-anime.com":true,"is-into-cars.com":true,"is-into-cartoons.com":true,"is-into-games.com":true,"is-leet.com":true,"is-lost.org":true,"is-not-certified.com":true,"is-saved.org":true,"is-slick.com":true,"is-uberleet.com":true,"is-very-bad.org":true,"is-very-evil.org":true,"is-very-good.org":true,"is-very-nice.org":true,"is-very-sweet.org":true,"is-with-theband.com":true,"isa-geek.com":true,"isa-geek.net":true,"isa-geek.org":true,"isa-hockeynut.com":true,"issmarterthanyou.com":true,"isteingeek.de":true,"istmein.de":true,"kicks-ass.net":true,"kicks-ass.org":true,"knowsitall.info":true,"land-4-sale.us":true,"lebtimnetz.de":true,"leitungsen.de":true,"likes-pie.com":true,"likescandy.com":true,"merseine.nu":true,"mine.nu":true,"misconfused.org":true,"mypets.ws":true,"myphotos.cc":true,"neat-url.com":true,"office-on-the.net":true,"on-the-web.tv":true,"podzone.net":true,"podzone.org":true,"readmyblog.org":true,"saves-the-whales.com":true,"scrapper-site.net":true,"scrapping.cc":true,"selfip.biz":true,"selfip.com":true,"selfip.info":true,"selfip.net":true,"selfip.org":true,"sells-for-less.com":true,"sells-for-u.com":true,"sells-it.net":true,"sellsyourhome.org":true,"servebbs.com":true,"servebbs.net":true,"servebbs.org":true,"serveftp.net":true,"serveftp.org":true,"servegame.org":true,"shacknet.nu":true,"simple-url.com":true,"space-to-rent.com":true,"stuff-4-sale.org":true,"stuff-4-sale.us":true,"teaches-yoga.com":true,"thruhere.net":true,"traeumtgerade.de":true,"webhop.biz":true,"webhop.info":true,"webhop.net":true,"webhop.org":true,"worse-than.tv":true,"writesthisblog.com":true,"eu.org":true,"al.eu.org":true,"asso.eu.org":true,"at.eu.org":true,"au.eu.org":true,"be.eu.org":true,"bg.eu.org":true,"ca.eu.org":true,"cd.eu.org":true,"ch.eu.org":true,"cn.eu.org":true,"cy.eu.org":true,"cz.eu.org":true,"de.eu.org":true,"dk.eu.org":true,"edu.eu.org":true,"ee.eu.org":true,"es.eu.org":true,"fi.eu.org":true,"fr.eu.org":true,"gr.eu.org":true,"hr.eu.org":true,"hu.eu.org":true,"ie.eu.org":true,"il.eu.org":true,"in.eu.org":true,"int.eu.org":true,"is.eu.org":true,"it.eu.org":true,"jp.eu.org":true,"kr.eu.org":true,"lt.eu.org":true,"lu.eu.org":true,"lv.eu.org":true,"mc.eu.org":true,"me.eu.org":true,"mk.eu.org":true,"mt.eu.org":true,"my.eu.org":true,"net.eu.org":true,"ng.eu.org":true,"nl.eu.org":true,"no.eu.org":true,"nz.eu.org":true,"paris.eu.org":true,"pl.eu.org":true,"pt.eu.org":true,"q-a.eu.org":true,"ro.eu.org":true,"ru.eu.org":true,"se.eu.org":true,"si.eu.org":true,"sk.eu.org":true,"tr.eu.org":true,"uk.eu.org":true,"us.eu.org":true,"a.ssl.fastly.net":true,"b.ssl.fastly.net":true,"global.ssl.fastly.net":true,"a.prod.fastly.net":true,"global.prod.fastly.net":true,"firebaseapp.com":true,"flynnhub.com":true,"service.gov.uk":true,"github.io":true,"githubusercontent.com":true,"ro.com":true,"appspot.com":true,"blogspot.ae":true,"blogspot.al":true,"blogspot.am":true,"blogspot.ba":true,"blogspot.be":true,"blogspot.bg":true,"blogspot.bj":true,"blogspot.ca":true,"blogspot.cf":true,"blogspot.ch":true,"blogspot.cl":true,"blogspot.co.at":true,"blogspot.co.id":true,"blogspot.co.il":true,"blogspot.co.ke":true,"blogspot.co.nz":true,"blogspot.co.uk":true,"blogspot.co.za":true,"blogspot.com":true,"blogspot.com.ar":true,"blogspot.com.au":true,"blogspot.com.br":true,"blogspot.com.by":true,"blogspot.com.co":true,"blogspot.com.cy":true,"blogspot.com.ee":true,"blogspot.com.eg":true,"blogspot.com.es":true,"blogspot.com.mt":true,"blogspot.com.ng":true,"blogspot.com.tr":true,"blogspot.com.uy":true,"blogspot.cv":true,"blogspot.cz":true,"blogspot.de":true,"blogspot.dk":true,"blogspot.fi":true,"blogspot.fr":true,"blogspot.gr":true,"blogspot.hk":true,"blogspot.hr":true,"blogspot.hu":true,"blogspot.ie":true,"blogspot.in":true,"blogspot.is":true,"blogspot.it":true,"blogspot.jp":true,"blogspot.kr":true,"blogspot.li":true,"blogspot.lt":true,"blogspot.lu":true,"blogspot.md":true,"blogspot.mk":true,"blogspot.mr":true,"blogspot.mx":true,"blogspot.my":true,"blogspot.nl":true,"blogspot.no":true,"blogspot.pe":true,"blogspot.pt":true,"blogspot.qa":true,"blogspot.re":true,"blogspot.ro":true,"blogspot.rs":true,"blogspot.ru":true,"blogspot.se":true,"blogspot.sg":true,"blogspot.si":true,"blogspot.sk":true,"blogspot.sn":true,"blogspot.td":true,"blogspot.tw":true,"blogspot.ug":true,"blogspot.vn":true,"codespot.com":true,"googleapis.com":true,"googlecode.com":true,"pagespeedmobilizer.com":true,"withgoogle.com":true,"withyoutube.com":true,"herokuapp.com":true,"herokussl.com":true,"iki.fi":true,"biz.at":true,"info.at":true,"co.pl":true,"azurewebsites.net":true,"azure-mobile.net":true,"cloudapp.net":true,"bmoattachments.org":true,"4u.com":true,"nfshost.com":true,"nyc.mn":true,"nid.io":true,"operaunite.com":true,"outsystemscloud.com":true,"art.pl":true,"gliwice.pl":true,"krakow.pl":true,"poznan.pl":true,"wroc.pl":true,"zakopane.pl":true,"pantheon.io":true,"gotpantheon.com":true,"priv.at":true,"qa2.com":true,"rhcloud.com":true,"sandcats.io":true,"biz.ua":true,"co.ua":true,"pp.ua":true,"sinaapp.com":true,"vipsinaapp.com":true,"1kapp.com":true,"gda.pl":true,"gdansk.pl":true,"gdynia.pl":true,"med.pl":true,"sopot.pl":true,"hk.com":true,"hk.org":true,"ltd.hk":true,"inc.hk":true,"yolasite.com":true,"za.net":true,"za.org":true});
+{"ac":true,"com.ac":true,"edu.ac":true,"gov.ac":true,"net.ac":true,"mil.ac":true,"org.ac":true,"ad":true,"nom.ad":true,"ae":true,"co.ae":true,"net.ae":true,"org.ae":true,"sch.ae":true,"ac.ae":true,"gov.ae":true,"mil.ae":true,"aero":true,"accident-investigation.aero":true,"accident-prevention.aero":true,"aerobatic.aero":true,"aeroclub.aero":true,"aerodrome.aero":true,"agents.aero":true,"aircraft.aero":true,"airline.aero":true,"airport.aero":true,"air-surveillance.aero":true,"airtraffic.aero":true,"air-traffic-control.aero":true,"ambulance.aero":true,"amusement.aero":true,"association.aero":true,"author.aero":true,"ballooning.aero":true,"broker.aero":true,"caa.aero":true,"cargo.aero":true,"catering.aero":true,"certification.aero":true,"championship.aero":true,"charter.aero":true,"civilaviation.aero":true,"club.aero":true,"conference.aero":true,"consultant.aero":true,"consulting.aero":true,"control.aero":true,"council.aero":true,"crew.aero":true,"design.aero":true,"dgca.aero":true,"educator.aero":true,"emergency.aero":true,"engine.aero":true,"engineer.aero":true,"entertainment.aero":true,"equipment.aero":true,"exchange.aero":true,"express.aero":true,"federation.aero":true,"flight.aero":true,"freight.aero":true,"fuel.aero":true,"gliding.aero":true,"government.aero":true,"groundhandling.aero":true,"group.aero":true,"hanggliding.aero":true,"homebuilt.aero":true,"insurance.aero":true,"journal.aero":true,"journalist.aero":true,"leasing.aero":true,"logistics.aero":true,"magazine.aero":true,"maintenance.aero":true,"media.aero":true,"microlight.aero":true,"modelling.aero":true,"navigation.aero":true,"parachuting.aero":true,"paragliding.aero":true,"passenger-association.aero":true,"pilot.aero":true,"press.aero":true,"production.aero":true,"recreation.aero":true,"repbody.aero":true,"res.aero":true,"research.aero":true,"rotorcraft.aero":true,"safety.aero":true,"scientist.aero":true,"services.aero":true,"show.aero":true,"skydiving.aero":true,"software.aero":true,"student.aero":true,"trader.aero":true,"trading.aero":true,"trainer.aero":true,"union.aero":true,"workinggroup.aero":true,"works.aero":true,"af":true,"gov.af":true,"com.af":true,"org.af":true,"net.af":true,"edu.af":true,"ag":true,"com.ag":true,"org.ag":true,"net.ag":true,"co.ag":true,"nom.ag":true,"ai":true,"off.ai":true,"com.ai":true,"net.ai":true,"org.ai":true,"al":true,"com.al":true,"edu.al":true,"gov.al":true,"mil.al":true,"net.al":true,"org.al":true,"am":true,"ao":true,"ed.ao":true,"gv.ao":true,"og.ao":true,"co.ao":true,"pb.ao":true,"it.ao":true,"aq":true,"ar":true,"com.ar":true,"edu.ar":true,"gob.ar":true,"gov.ar":true,"int.ar":true,"mil.ar":true,"musica.ar":true,"net.ar":true,"org.ar":true,"tur.ar":true,"arpa":true,"e164.arpa":true,"in-addr.arpa":true,"ip6.arpa":true,"iris.arpa":true,"uri.arpa":true,"urn.arpa":true,"as":true,"gov.as":true,"asia":true,"at":true,"ac.at":true,"co.at":true,"gv.at":true,"or.at":true,"au":true,"com.au":true,"net.au":true,"org.au":true,"edu.au":true,"gov.au":true,"asn.au":true,"id.au":true,"info.au":true,"conf.au":true,"oz.au":true,"act.au":true,"nsw.au":true,"nt.au":true,"qld.au":true,"sa.au":true,"tas.au":true,"vic.au":true,"wa.au":true,"act.edu.au":true,"nsw.edu.au":true,"nt.edu.au":true,"qld.edu.au":true,"sa.edu.au":true,"tas.edu.au":true,"vic.edu.au":true,"wa.edu.au":true,"qld.gov.au":true,"sa.gov.au":true,"tas.gov.au":true,"vic.gov.au":true,"wa.gov.au":true,"aw":true,"com.aw":true,"ax":true,"az":true,"com.az":true,"net.az":true,"int.az":true,"gov.az":true,"org.az":true,"edu.az":true,"info.az":true,"pp.az":true,"mil.az":true,"name.az":true,"pro.az":true,"biz.az":true,"ba":true,"com.ba":true,"edu.ba":true,"gov.ba":true,"mil.ba":true,"net.ba":true,"org.ba":true,"bb":true,"biz.bb":true,"co.bb":true,"com.bb":true,"edu.bb":true,"gov.bb":true,"info.bb":true,"net.bb":true,"org.bb":true,"store.bb":true,"tv.bb":true,"*.bd":true,"be":true,"ac.be":true,"bf":true,"gov.bf":true,"bg":true,"a.bg":true,"b.bg":true,"c.bg":true,"d.bg":true,"e.bg":true,"f.bg":true,"g.bg":true,"h.bg":true,"i.bg":true,"j.bg":true,"k.bg":true,"l.bg":true,"m.bg":true,"n.bg":true,"o.bg":true,"p.bg":true,"q.bg":true,"r.bg":true,"s.bg":true,"t.bg":true,"u.bg":true,"v.bg":true,"w.bg":true,"x.bg":true,"y.bg":true,"z.bg":true,"0.bg":true,"1.bg":true,"2.bg":true,"3.bg":true,"4.bg":true,"5.bg":true,"6.bg":true,"7.bg":true,"8.bg":true,"9.bg":true,"bh":true,"com.bh":true,"edu.bh":true,"net.bh":true,"org.bh":true,"gov.bh":true,"bi":true,"co.bi":true,"com.bi":true,"edu.bi":true,"or.bi":true,"org.bi":true,"biz":true,"bj":true,"asso.bj":true,"barreau.bj":true,"gouv.bj":true,"bm":true,"com.bm":true,"edu.bm":true,"gov.bm":true,"net.bm":true,"org.bm":true,"*.bn":true,"bo":true,"com.bo":true,"edu.bo":true,"gob.bo":true,"int.bo":true,"org.bo":true,"net.bo":true,"mil.bo":true,"tv.bo":true,"web.bo":true,"academia.bo":true,"agro.bo":true,"arte.bo":true,"blog.bo":true,"bolivia.bo":true,"ciencia.bo":true,"cooperativa.bo":true,"democracia.bo":true,"deporte.bo":true,"ecologia.bo":true,"economia.bo":true,"empresa.bo":true,"indigena.bo":true,"industria.bo":true,"info.bo":true,"medicina.bo":true,"movimiento.bo":true,"musica.bo":true,"natural.bo":true,"nombre.bo":true,"noticias.bo":true,"patria.bo":true,"politica.bo":true,"profesional.bo":true,"plurinacional.bo":true,"pueblo.bo":true,"revista.bo":true,"salud.bo":true,"tecnologia.bo":true,"tksat.bo":true,"transporte.bo":true,"wiki.bo":true,"br":true,"9guacu.br":true,"abc.br":true,"adm.br":true,"adv.br":true,"agr.br":true,"aju.br":true,"am.br":true,"anani.br":true,"aparecida.br":true,"arq.br":true,"art.br":true,"ato.br":true,"b.br":true,"belem.br":true,"bhz.br":true,"bio.br":true,"blog.br":true,"bmd.br":true,"boavista.br":true,"bsb.br":true,"campinagrande.br":true,"campinas.br":true,"caxias.br":true,"cim.br":true,"cng.br":true,"cnt.br":true,"com.br":true,"contagem.br":true,"coop.br":true,"cri.br":true,"cuiaba.br":true,"curitiba.br":true,"def.br":true,"ecn.br":true,"eco.br":true,"edu.br":true,"emp.br":true,"eng.br":true,"esp.br":true,"etc.br":true,"eti.br":true,"far.br":true,"feira.br":true,"flog.br":true,"floripa.br":true,"fm.br":true,"fnd.br":true,"fortal.br":true,"fot.br":true,"foz.br":true,"fst.br":true,"g12.br":true,"ggf.br":true,"goiania.br":true,"gov.br":true,"ac.gov.br":true,"al.gov.br":true,"am.gov.br":true,"ap.gov.br":true,"ba.gov.br":true,"ce.gov.br":true,"df.gov.br":true,"es.gov.br":true,"go.gov.br":true,"ma.gov.br":true,"mg.gov.br":true,"ms.gov.br":true,"mt.gov.br":true,"pa.gov.br":true,"pb.gov.br":true,"pe.gov.br":true,"pi.gov.br":true,"pr.gov.br":true,"rj.gov.br":true,"rn.gov.br":true,"ro.gov.br":true,"rr.gov.br":true,"rs.gov.br":true,"sc.gov.br":true,"se.gov.br":true,"sp.gov.br":true,"to.gov.br":true,"gru.br":true,"imb.br":true,"ind.br":true,"inf.br":true,"jab.br":true,"jampa.br":true,"jdf.br":true,"joinville.br":true,"jor.br":true,"jus.br":true,"leg.br":true,"lel.br":true,"londrina.br":true,"macapa.br":true,"maceio.br":true,"manaus.br":true,"maringa.br":true,"mat.br":true,"med.br":true,"mil.br":true,"morena.br":true,"mp.br":true,"mus.br":true,"natal.br":true,"net.br":true,"niteroi.br":true,"*.nom.br":true,"not.br":true,"ntr.br":true,"odo.br":true,"org.br":true,"osasco.br":true,"palmas.br":true,"poa.br":true,"ppg.br":true,"pro.br":true,"psc.br":true,"psi.br":true,"pvh.br":true,"qsl.br":true,"radio.br":true,"rec.br":true,"recife.br":true,"ribeirao.br":true,"rio.br":true,"riobranco.br":true,"riopreto.br":true,"salvador.br":true,"sampa.br":true,"santamaria.br":true,"santoandre.br":true,"saobernardo.br":true,"saogonca.br":true,"sjc.br":true,"slg.br":true,"slz.br":true,"sorocaba.br":true,"srv.br":true,"taxi.br":true,"teo.br":true,"the.br":true,"tmp.br":true,"trd.br":true,"tur.br":true,"tv.br":true,"udi.br":true,"vet.br":true,"vix.br":true,"vlog.br":true,"wiki.br":true,"zlg.br":true,"bs":true,"com.bs":true,"net.bs":true,"org.bs":true,"edu.bs":true,"gov.bs":true,"bt":true,"com.bt":true,"edu.bt":true,"gov.bt":true,"net.bt":true,"org.bt":true,"bv":true,"bw":true,"co.bw":true,"org.bw":true,"by":true,"gov.by":true,"mil.by":true,"com.by":true,"of.by":true,"bz":true,"com.bz":true,"net.bz":true,"org.bz":true,"edu.bz":true,"gov.bz":true,"ca":true,"ab.ca":true,"bc.ca":true,"mb.ca":true,"nb.ca":true,"nf.ca":true,"nl.ca":true,"ns.ca":true,"nt.ca":true,"nu.ca":true,"on.ca":true,"pe.ca":true,"qc.ca":true,"sk.ca":true,"yk.ca":true,"gc.ca":true,"cat":true,"cc":true,"cd":true,"gov.cd":true,"cf":true,"cg":true,"ch":true,"ci":true,"org.ci":true,"or.ci":true,"com.ci":true,"co.ci":true,"edu.ci":true,"ed.ci":true,"ac.ci":true,"net.ci":true,"go.ci":true,"asso.ci":true,"xn--aroport-bya.ci":true,"int.ci":true,"presse.ci":true,"md.ci":true,"gouv.ci":true,"*.ck":true,"www.ck":false,"cl":true,"gov.cl":true,"gob.cl":true,"co.cl":true,"mil.cl":true,"cm":true,"co.cm":true,"com.cm":true,"gov.cm":true,"net.cm":true,"cn":true,"ac.cn":true,"com.cn":true,"edu.cn":true,"gov.cn":true,"net.cn":true,"org.cn":true,"mil.cn":true,"xn--55qx5d.cn":true,"xn--io0a7i.cn":true,"xn--od0alg.cn":true,"ah.cn":true,"bj.cn":true,"cq.cn":true,"fj.cn":true,"gd.cn":true,"gs.cn":true,"gz.cn":true,"gx.cn":true,"ha.cn":true,"hb.cn":true,"he.cn":true,"hi.cn":true,"hl.cn":true,"hn.cn":true,"jl.cn":true,"js.cn":true,"jx.cn":true,"ln.cn":true,"nm.cn":true,"nx.cn":true,"qh.cn":true,"sc.cn":true,"sd.cn":true,"sh.cn":true,"sn.cn":true,"sx.cn":true,"tj.cn":true,"xj.cn":true,"xz.cn":true,"yn.cn":true,"zj.cn":true,"hk.cn":true,"mo.cn":true,"tw.cn":true,"co":true,"arts.co":true,"com.co":true,"edu.co":true,"firm.co":true,"gov.co":true,"info.co":true,"int.co":true,"mil.co":true,"net.co":true,"nom.co":true,"org.co":true,"rec.co":true,"web.co":true,"com":true,"coop":true,"cr":true,"ac.cr":true,"co.cr":true,"ed.cr":true,"fi.cr":true,"go.cr":true,"or.cr":true,"sa.cr":true,"cu":true,"com.cu":true,"edu.cu":true,"org.cu":true,"net.cu":true,"gov.cu":true,"inf.cu":true,"cv":true,"cw":true,"com.cw":true,"edu.cw":true,"net.cw":true,"org.cw":true,"cx":true,"gov.cx":true,"cy":true,"ac.cy":true,"biz.cy":true,"com.cy":true,"ekloges.cy":true,"gov.cy":true,"ltd.cy":true,"name.cy":true,"net.cy":true,"org.cy":true,"parliament.cy":true,"press.cy":true,"pro.cy":true,"tm.cy":true,"cz":true,"de":true,"dj":true,"dk":true,"dm":true,"com.dm":true,"net.dm":true,"org.dm":true,"edu.dm":true,"gov.dm":true,"do":true,"art.do":true,"com.do":true,"edu.do":true,"gob.do":true,"gov.do":true,"mil.do":true,"net.do":true,"org.do":true,"sld.do":true,"web.do":true,"dz":true,"com.dz":true,"org.dz":true,"net.dz":true,"gov.dz":true,"edu.dz":true,"asso.dz":true,"pol.dz":true,"art.dz":true,"ec":true,"com.ec":true,"info.ec":true,"net.ec":true,"fin.ec":true,"k12.ec":true,"med.ec":true,"pro.ec":true,"org.ec":true,"edu.ec":true,"gov.ec":true,"gob.ec":true,"mil.ec":true,"edu":true,"ee":true,"edu.ee":true,"gov.ee":true,"riik.ee":true,"lib.ee":true,"med.ee":true,"com.ee":true,"pri.ee":true,"aip.ee":true,"org.ee":true,"fie.ee":true,"eg":true,"com.eg":true,"edu.eg":true,"eun.eg":true,"gov.eg":true,"mil.eg":true,"name.eg":true,"net.eg":true,"org.eg":true,"sci.eg":true,"*.er":true,"es":true,"com.es":true,"nom.es":true,"org.es":true,"gob.es":true,"edu.es":true,"et":true,"com.et":true,"gov.et":true,"org.et":true,"edu.et":true,"biz.et":true,"name.et":true,"info.et":true,"net.et":true,"eu":true,"fi":true,"aland.fi":true,"*.fj":true,"*.fk":true,"fm":true,"fo":true,"fr":true,"com.fr":true,"asso.fr":true,"nom.fr":true,"prd.fr":true,"presse.fr":true,"tm.fr":true,"aeroport.fr":true,"assedic.fr":true,"avocat.fr":true,"avoues.fr":true,"cci.fr":true,"chambagri.fr":true,"chirurgiens-dentistes.fr":true,"experts-comptables.fr":true,"geometre-expert.fr":true,"gouv.fr":true,"greta.fr":true,"huissier-justice.fr":true,"medecin.fr":true,"notaires.fr":true,"pharmacien.fr":true,"port.fr":true,"veterinaire.fr":true,"ga":true,"gb":true,"gd":true,"ge":true,"com.ge":true,"edu.ge":true,"gov.ge":true,"org.ge":true,"mil.ge":true,"net.ge":true,"pvt.ge":true,"gf":true,"gg":true,"co.gg":true,"net.gg":true,"org.gg":true,"gh":true,"com.gh":true,"edu.gh":true,"gov.gh":true,"org.gh":true,"mil.gh":true,"gi":true,"com.gi":true,"ltd.gi":true,"gov.gi":true,"mod.gi":true,"edu.gi":true,"org.gi":true,"gl":true,"co.gl":true,"com.gl":true,"edu.gl":true,"net.gl":true,"org.gl":true,"gm":true,"gn":true,"ac.gn":true,"com.gn":true,"edu.gn":true,"gov.gn":true,"org.gn":true,"net.gn":true,"gov":true,"gp":true,"com.gp":true,"net.gp":true,"mobi.gp":true,"edu.gp":true,"org.gp":true,"asso.gp":true,"gq":true,"gr":true,"com.gr":true,"edu.gr":true,"net.gr":true,"org.gr":true,"gov.gr":true,"gs":true,"gt":true,"com.gt":true,"edu.gt":true,"gob.gt":true,"ind.gt":true,"mil.gt":true,"net.gt":true,"org.gt":true,"*.gu":true,"gw":true,"gy":true,"co.gy":true,"com.gy":true,"edu.gy":true,"gov.gy":true,"net.gy":true,"org.gy":true,"hk":true,"com.hk":true,"edu.hk":true,"gov.hk":true,"idv.hk":true,"net.hk":true,"org.hk":true,"xn--55qx5d.hk":true,"xn--wcvs22d.hk":true,"xn--lcvr32d.hk":true,"xn--mxtq1m.hk":true,"xn--gmqw5a.hk":true,"xn--ciqpn.hk":true,"xn--gmq050i.hk":true,"xn--zf0avx.hk":true,"xn--io0a7i.hk":true,"xn--mk0axi.hk":true,"xn--od0alg.hk":true,"xn--od0aq3b.hk":true,"xn--tn0ag.hk":true,"xn--uc0atv.hk":true,"xn--uc0ay4a.hk":true,"hm":true,"hn":true,"com.hn":true,"edu.hn":true,"org.hn":true,"net.hn":true,"mil.hn":true,"gob.hn":true,"hr":true,"iz.hr":true,"from.hr":true,"name.hr":true,"com.hr":true,"ht":true,"com.ht":true,"shop.ht":true,"firm.ht":true,"info.ht":true,"adult.ht":true,"net.ht":true,"pro.ht":true,"org.ht":true,"med.ht":true,"art.ht":true,"coop.ht":true,"pol.ht":true,"asso.ht":true,"edu.ht":true,"rel.ht":true,"gouv.ht":true,"perso.ht":true,"hu":true,"co.hu":true,"info.hu":true,"org.hu":true,"priv.hu":true,"sport.hu":true,"tm.hu":true,"2000.hu":true,"agrar.hu":true,"bolt.hu":true,"casino.hu":true,"city.hu":true,"erotica.hu":true,"erotika.hu":true,"film.hu":true,"forum.hu":true,"games.hu":true,"hotel.hu":true,"ingatlan.hu":true,"jogasz.hu":true,"konyvelo.hu":true,"lakas.hu":true,"media.hu":true,"news.hu":true,"reklam.hu":true,"sex.hu":true,"shop.hu":true,"suli.hu":true,"szex.hu":true,"tozsde.hu":true,"utazas.hu":true,"video.hu":true,"id":true,"ac.id":true,"biz.id":true,"co.id":true,"desa.id":true,"go.id":true,"mil.id":true,"my.id":true,"net.id":true,"or.id":true,"sch.id":true,"web.id":true,"ie":true,"gov.ie":true,"il":true,"ac.il":true,"co.il":true,"gov.il":true,"idf.il":true,"k12.il":true,"muni.il":true,"net.il":true,"org.il":true,"im":true,"ac.im":true,"co.im":true,"com.im":true,"ltd.co.im":true,"net.im":true,"org.im":true,"plc.co.im":true,"tt.im":true,"tv.im":true,"in":true,"co.in":true,"firm.in":true,"net.in":true,"org.in":true,"gen.in":true,"ind.in":true,"nic.in":true,"ac.in":true,"edu.in":true,"res.in":true,"gov.in":true,"mil.in":true,"info":true,"int":true,"eu.int":true,"io":true,"com.io":true,"iq":true,"gov.iq":true,"edu.iq":true,"mil.iq":true,"com.iq":true,"org.iq":true,"net.iq":true,"ir":true,"ac.ir":true,"co.ir":true,"gov.ir":true,"id.ir":true,"net.ir":true,"org.ir":true,"sch.ir":true,"xn--mgba3a4f16a.ir":true,"xn--mgba3a4fra.ir":true,"is":true,"net.is":true,"com.is":true,"edu.is":true,"gov.is":true,"org.is":true,"int.is":true,"it":true,"gov.it":true,"edu.it":true,"abr.it":true,"abruzzo.it":true,"aosta-valley.it":true,"aostavalley.it":true,"bas.it":true,"basilicata.it":true,"cal.it":true,"calabria.it":true,"cam.it":true,"campania.it":true,"emilia-romagna.it":true,"emiliaromagna.it":true,"emr.it":true,"friuli-v-giulia.it":true,"friuli-ve-giulia.it":true,"friuli-vegiulia.it":true,"friuli-venezia-giulia.it":true,"friuli-veneziagiulia.it":true,"friuli-vgiulia.it":true,"friuliv-giulia.it":true,"friulive-giulia.it":true,"friulivegiulia.it":true,"friulivenezia-giulia.it":true,"friuliveneziagiulia.it":true,"friulivgiulia.it":true,"fvg.it":true,"laz.it":true,"lazio.it":true,"lig.it":true,"liguria.it":true,"lom.it":true,"lombardia.it":true,"lombardy.it":true,"lucania.it":true,"mar.it":true,"marche.it":true,"mol.it":true,"molise.it":true,"piedmont.it":true,"piemonte.it":true,"pmn.it":true,"pug.it":true,"puglia.it":true,"sar.it":true,"sardegna.it":true,"sardinia.it":true,"sic.it":true,"sicilia.it":true,"sicily.it":true,"taa.it":true,"tos.it":true,"toscana.it":true,"trentino-a-adige.it":true,"trentino-aadige.it":true,"trentino-alto-adige.it":true,"trentino-altoadige.it":true,"trentino-s-tirol.it":true,"trentino-stirol.it":true,"trentino-sud-tirol.it":true,"trentino-sudtirol.it":true,"trentino-sued-tirol.it":true,"trentino-suedtirol.it":true,"trentinoa-adige.it":true,"trentinoaadige.it":true,"trentinoalto-adige.it":true,"trentinoaltoadige.it":true,"trentinos-tirol.it":true,"trentinostirol.it":true,"trentinosud-tirol.it":true,"trentinosudtirol.it":true,"trentinosued-tirol.it":true,"trentinosuedtirol.it":true,"tuscany.it":true,"umb.it":true,"umbria.it":true,"val-d-aosta.it":true,"val-daosta.it":true,"vald-aosta.it":true,"valdaosta.it":true,"valle-aosta.it":true,"valle-d-aosta.it":true,"valle-daosta.it":true,"valleaosta.it":true,"valled-aosta.it":true,"valledaosta.it":true,"vallee-aoste.it":true,"valleeaoste.it":true,"vao.it":true,"vda.it":true,"ven.it":true,"veneto.it":true,"ag.it":true,"agrigento.it":true,"al.it":true,"alessandria.it":true,"alto-adige.it":true,"altoadige.it":true,"an.it":true,"ancona.it":true,"andria-barletta-trani.it":true,"andria-trani-barletta.it":true,"andriabarlettatrani.it":true,"andriatranibarletta.it":true,"ao.it":true,"aosta.it":true,"aoste.it":true,"ap.it":true,"aq.it":true,"aquila.it":true,"ar.it":true,"arezzo.it":true,"ascoli-piceno.it":true,"ascolipiceno.it":true,"asti.it":true,"at.it":true,"av.it":true,"avellino.it":true,"ba.it":true,"balsan.it":true,"bari.it":true,"barletta-trani-andria.it":true,"barlettatraniandria.it":true,"belluno.it":true,"benevento.it":true,"bergamo.it":true,"bg.it":true,"bi.it":true,"biella.it":true,"bl.it":true,"bn.it":true,"bo.it":true,"bologna.it":true,"bolzano.it":true,"bozen.it":true,"br.it":true,"brescia.it":true,"brindisi.it":true,"bs.it":true,"bt.it":true,"bz.it":true,"ca.it":true,"cagliari.it":true,"caltanissetta.it":true,"campidano-medio.it":true,"campidanomedio.it":true,"campobasso.it":true,"carbonia-iglesias.it":true,"carboniaiglesias.it":true,"carrara-massa.it":true,"carraramassa.it":true,"caserta.it":true,"catania.it":true,"catanzaro.it":true,"cb.it":true,"ce.it":true,"cesena-forli.it":true,"cesenaforli.it":true,"ch.it":true,"chieti.it":true,"ci.it":true,"cl.it":true,"cn.it":true,"co.it":true,"como.it":true,"cosenza.it":true,"cr.it":true,"cremona.it":true,"crotone.it":true,"cs.it":true,"ct.it":true,"cuneo.it":true,"cz.it":true,"dell-ogliastra.it":true,"dellogliastra.it":true,"en.it":true,"enna.it":true,"fc.it":true,"fe.it":true,"fermo.it":true,"ferrara.it":true,"fg.it":true,"fi.it":true,"firenze.it":true,"florence.it":true,"fm.it":true,"foggia.it":true,"forli-cesena.it":true,"forlicesena.it":true,"fr.it":true,"frosinone.it":true,"ge.it":true,"genoa.it":true,"genova.it":true,"go.it":true,"gorizia.it":true,"gr.it":true,"grosseto.it":true,"iglesias-carbonia.it":true,"iglesiascarbonia.it":true,"im.it":true,"imperia.it":true,"is.it":true,"isernia.it":true,"kr.it":true,"la-spezia.it":true,"laquila.it":true,"laspezia.it":true,"latina.it":true,"lc.it":true,"le.it":true,"lecce.it":true,"lecco.it":true,"li.it":true,"livorno.it":true,"lo.it":true,"lodi.it":true,"lt.it":true,"lu.it":true,"lucca.it":true,"macerata.it":true,"mantova.it":true,"massa-carrara.it":true,"massacarrara.it":true,"matera.it":true,"mb.it":true,"mc.it":true,"me.it":true,"medio-campidano.it":true,"mediocampidano.it":true,"messina.it":true,"mi.it":true,"milan.it":true,"milano.it":true,"mn.it":true,"mo.it":true,"modena.it":true,"monza-brianza.it":true,"monza-e-della-brianza.it":true,"monza.it":true,"monzabrianza.it":true,"monzaebrianza.it":true,"monzaedellabrianza.it":true,"ms.it":true,"mt.it":true,"na.it":true,"naples.it":true,"napoli.it":true,"no.it":true,"novara.it":true,"nu.it":true,"nuoro.it":true,"og.it":true,"ogliastra.it":true,"olbia-tempio.it":true,"olbiatempio.it":true,"or.it":true,"oristano.it":true,"ot.it":true,"pa.it":true,"padova.it":true,"padua.it":true,"palermo.it":true,"parma.it":true,"pavia.it":true,"pc.it":true,"pd.it":true,"pe.it":true,"perugia.it":true,"pesaro-urbino.it":true,"pesarourbino.it":true,"pescara.it":true,"pg.it":true,"pi.it":true,"piacenza.it":true,"pisa.it":true,"pistoia.it":true,"pn.it":true,"po.it":true,"pordenone.it":true,"potenza.it":true,"pr.it":true,"prato.it":true,"pt.it":true,"pu.it":true,"pv.it":true,"pz.it":true,"ra.it":true,"ragusa.it":true,"ravenna.it":true,"rc.it":true,"re.it":true,"reggio-calabria.it":true,"reggio-emilia.it":true,"reggiocalabria.it":true,"reggioemilia.it":true,"rg.it":true,"ri.it":true,"rieti.it":true,"rimini.it":true,"rm.it":true,"rn.it":true,"ro.it":true,"roma.it":true,"rome.it":true,"rovigo.it":true,"sa.it":true,"salerno.it":true,"sassari.it":true,"savona.it":true,"si.it":true,"siena.it":true,"siracusa.it":true,"so.it":true,"sondrio.it":true,"sp.it":true,"sr.it":true,"ss.it":true,"suedtirol.it":true,"sv.it":true,"ta.it":true,"taranto.it":true,"te.it":true,"tempio-olbia.it":true,"tempioolbia.it":true,"teramo.it":true,"terni.it":true,"tn.it":true,"to.it":true,"torino.it":true,"tp.it":true,"tr.it":true,"trani-andria-barletta.it":true,"trani-barletta-andria.it":true,"traniandriabarletta.it":true,"tranibarlettaandria.it":true,"trapani.it":true,"trentino.it":true,"trento.it":true,"treviso.it":true,"trieste.it":true,"ts.it":true,"turin.it":true,"tv.it":true,"ud.it":true,"udine.it":true,"urbino-pesaro.it":true,"urbinopesaro.it":true,"va.it":true,"varese.it":true,"vb.it":true,"vc.it":true,"ve.it":true,"venezia.it":true,"venice.it":true,"verbania.it":true,"vercelli.it":true,"verona.it":true,"vi.it":true,"vibo-valentia.it":true,"vibovalentia.it":true,"vicenza.it":true,"viterbo.it":true,"vr.it":true,"vs.it":true,"vt.it":true,"vv.it":true,"je":true,"co.je":true,"net.je":true,"org.je":true,"*.jm":true,"jo":true,"com.jo":true,"org.jo":true,"net.jo":true,"edu.jo":true,"sch.jo":true,"gov.jo":true,"mil.jo":true,"name.jo":true,"jobs":true,"jp":true,"ac.jp":true,"ad.jp":true,"co.jp":true,"ed.jp":true,"go.jp":true,"gr.jp":true,"lg.jp":true,"ne.jp":true,"or.jp":true,"aichi.jp":true,"akita.jp":true,"aomori.jp":true,"chiba.jp":true,"ehime.jp":true,"fukui.jp":true,"fukuoka.jp":true,"fukushima.jp":true,"gifu.jp":true,"gunma.jp":true,"hiroshima.jp":true,"hokkaido.jp":true,"hyogo.jp":true,"ibaraki.jp":true,"ishikawa.jp":true,"iwate.jp":true,"kagawa.jp":true,"kagoshima.jp":true,"kanagawa.jp":true,"kochi.jp":true,"kumamoto.jp":true,"kyoto.jp":true,"mie.jp":true,"miyagi.jp":true,"miyazaki.jp":true,"nagano.jp":true,"nagasaki.jp":true,"nara.jp":true,"niigata.jp":true,"oita.jp":true,"okayama.jp":true,"okinawa.jp":true,"osaka.jp":true,"saga.jp":true,"saitama.jp":true,"shiga.jp":true,"shimane.jp":true,"shizuoka.jp":true,"tochigi.jp":true,"tokushima.jp":true,"tokyo.jp":true,"tottori.jp":true,"toyama.jp":true,"wakayama.jp":true,"yamagata.jp":true,"yamaguchi.jp":true,"yamanashi.jp":true,"xn--4pvxs.jp":true,"xn--vgu402c.jp":true,"xn--c3s14m.jp":true,"xn--f6qx53a.jp":true,"xn--8pvr4u.jp":true,"xn--uist22h.jp":true,"xn--djrs72d6uy.jp":true,"xn--mkru45i.jp":true,"xn--0trq7p7nn.jp":true,"xn--8ltr62k.jp":true,"xn--2m4a15e.jp":true,"xn--efvn9s.jp":true,"xn--32vp30h.jp":true,"xn--4it797k.jp":true,"xn--1lqs71d.jp":true,"xn--5rtp49c.jp":true,"xn--5js045d.jp":true,"xn--ehqz56n.jp":true,"xn--1lqs03n.jp":true,"xn--qqqt11m.jp":true,"xn--kbrq7o.jp":true,"xn--pssu33l.jp":true,"xn--ntsq17g.jp":true,"xn--uisz3g.jp":true,"xn--6btw5a.jp":true,"xn--1ctwo.jp":true,"xn--6orx2r.jp":true,"xn--rht61e.jp":true,"xn--rht27z.jp":true,"xn--djty4k.jp":true,"xn--nit225k.jp":true,"xn--rht3d.jp":true,"xn--klty5x.jp":true,"xn--kltx9a.jp":true,"xn--kltp7d.jp":true,"xn--uuwu58a.jp":true,"xn--zbx025d.jp":true,"xn--ntso0iqx3a.jp":true,"xn--elqq16h.jp":true,"xn--4it168d.jp":true,"xn--klt787d.jp":true,"xn--rny31h.jp":true,"xn--7t0a264c.jp":true,"xn--5rtq34k.jp":true,"xn--k7yn95e.jp":true,"xn--tor131o.jp":true,"xn--d5qv7z876c.jp":true,"*.kawasaki.jp":true,"*.kitakyushu.jp":true,"*.kobe.jp":true,"*.nagoya.jp":true,"*.sapporo.jp":true,"*.sendai.jp":true,"*.yokohama.jp":true,"city.kawasaki.jp":false,"city.kitakyushu.jp":false,"city.kobe.jp":false,"city.nagoya.jp":false,"city.sapporo.jp":false,"city.sendai.jp":false,"city.yokohama.jp":false,"aisai.aichi.jp":true,"ama.aichi.jp":true,"anjo.aichi.jp":true,"asuke.aichi.jp":true,"chiryu.aichi.jp":true,"chita.aichi.jp":true,"fuso.aichi.jp":true,"gamagori.aichi.jp":true,"handa.aichi.jp":true,"hazu.aichi.jp":true,"hekinan.aichi.jp":true,"higashiura.aichi.jp":true,"ichinomiya.aichi.jp":true,"inazawa.aichi.jp":true,"inuyama.aichi.jp":true,"isshiki.aichi.jp":true,"iwakura.aichi.jp":true,"kanie.aichi.jp":true,"kariya.aichi.jp":true,"kasugai.aichi.jp":true,"kira.aichi.jp":true,"kiyosu.aichi.jp":true,"komaki.aichi.jp":true,"konan.aichi.jp":true,"kota.aichi.jp":true,"mihama.aichi.jp":true,"miyoshi.aichi.jp":true,"nishio.aichi.jp":true,"nisshin.aichi.jp":true,"obu.aichi.jp":true,"oguchi.aichi.jp":true,"oharu.aichi.jp":true,"okazaki.aichi.jp":true,"owariasahi.aichi.jp":true,"seto.aichi.jp":true,"shikatsu.aichi.jp":true,"shinshiro.aichi.jp":true,"shitara.aichi.jp":true,"tahara.aichi.jp":true,"takahama.aichi.jp":true,"tobishima.aichi.jp":true,"toei.aichi.jp":true,"togo.aichi.jp":true,"tokai.aichi.jp":true,"tokoname.aichi.jp":true,"toyoake.aichi.jp":true,"toyohashi.aichi.jp":true,"toyokawa.aichi.jp":true,"toyone.aichi.jp":true,"toyota.aichi.jp":true,"tsushima.aichi.jp":true,"yatomi.aichi.jp":true,"akita.akita.jp":true,"daisen.akita.jp":true,"fujisato.akita.jp":true,"gojome.akita.jp":true,"hachirogata.akita.jp":true,"happou.akita.jp":true,"higashinaruse.akita.jp":true,"honjo.akita.jp":true,"honjyo.akita.jp":true,"ikawa.akita.jp":true,"kamikoani.akita.jp":true,"kamioka.akita.jp":true,"katagami.akita.jp":true,"kazuno.akita.jp":true,"kitaakita.akita.jp":true,"kosaka.akita.jp":true,"kyowa.akita.jp":true,"misato.akita.jp":true,"mitane.akita.jp":true,"moriyoshi.akita.jp":true,"nikaho.akita.jp":true,"noshiro.akita.jp":true,"odate.akita.jp":true,"oga.akita.jp":true,"ogata.akita.jp":true,"semboku.akita.jp":true,"yokote.akita.jp":true,"yurihonjo.akita.jp":true,"aomori.aomori.jp":true,"gonohe.aomori.jp":true,"hachinohe.aomori.jp":true,"hashikami.aomori.jp":true,"hiranai.aomori.jp":true,"hirosaki.aomori.jp":true,"itayanagi.aomori.jp":true,"kuroishi.aomori.jp":true,"misawa.aomori.jp":true,"mutsu.aomori.jp":true,"nakadomari.aomori.jp":true,"noheji.aomori.jp":true,"oirase.aomori.jp":true,"owani.aomori.jp":true,"rokunohe.aomori.jp":true,"sannohe.aomori.jp":true,"shichinohe.aomori.jp":true,"shingo.aomori.jp":true,"takko.aomori.jp":true,"towada.aomori.jp":true,"tsugaru.aomori.jp":true,"tsuruta.aomori.jp":true,"abiko.chiba.jp":true,"asahi.chiba.jp":true,"chonan.chiba.jp":true,"chosei.chiba.jp":true,"choshi.chiba.jp":true,"chuo.chiba.jp":true,"funabashi.chiba.jp":true,"futtsu.chiba.jp":true,"hanamigawa.chiba.jp":true,"ichihara.chiba.jp":true,"ichikawa.chiba.jp":true,"ichinomiya.chiba.jp":true,"inzai.chiba.jp":true,"isumi.chiba.jp":true,"kamagaya.chiba.jp":true,"kamogawa.chiba.jp":true,"kashiwa.chiba.jp":true,"katori.chiba.jp":true,"katsuura.chiba.jp":true,"kimitsu.chiba.jp":true,"kisarazu.chiba.jp":true,"kozaki.chiba.jp":true,"kujukuri.chiba.jp":true,"kyonan.chiba.jp":true,"matsudo.chiba.jp":true,"midori.chiba.jp":true,"mihama.chiba.jp":true,"minamiboso.chiba.jp":true,"mobara.chiba.jp":true,"mutsuzawa.chiba.jp":true,"nagara.chiba.jp":true,"nagareyama.chiba.jp":true,"narashino.chiba.jp":true,"narita.chiba.jp":true,"noda.chiba.jp":true,"oamishirasato.chiba.jp":true,"omigawa.chiba.jp":true,"onjuku.chiba.jp":true,"otaki.chiba.jp":true,"sakae.chiba.jp":true,"sakura.chiba.jp":true,"shimofusa.chiba.jp":true,"shirako.chiba.jp":true,"shiroi.chiba.jp":true,"shisui.chiba.jp":true,"sodegaura.chiba.jp":true,"sosa.chiba.jp":true,"tako.chiba.jp":true,"tateyama.chiba.jp":true,"togane.chiba.jp":true,"tohnosho.chiba.jp":true,"tomisato.chiba.jp":true,"urayasu.chiba.jp":true,"yachimata.chiba.jp":true,"yachiyo.chiba.jp":true,"yokaichiba.chiba.jp":true,"yokoshibahikari.chiba.jp":true,"yotsukaido.chiba.jp":true,"ainan.ehime.jp":true,"honai.ehime.jp":true,"ikata.ehime.jp":true,"imabari.ehime.jp":true,"iyo.ehime.jp":true,"kamijima.ehime.jp":true,"kihoku.ehime.jp":true,"kumakogen.ehime.jp":true,"masaki.ehime.jp":true,"matsuno.ehime.jp":true,"matsuyama.ehime.jp":true,"namikata.ehime.jp":true,"niihama.ehime.jp":true,"ozu.ehime.jp":true,"saijo.ehime.jp":true,"seiyo.ehime.jp":true,"shikokuchuo.ehime.jp":true,"tobe.ehime.jp":true,"toon.ehime.jp":true,"uchiko.ehime.jp":true,"uwajima.ehime.jp":true,"yawatahama.ehime.jp":true,"echizen.fukui.jp":true,"eiheiji.fukui.jp":true,"fukui.fukui.jp":true,"ikeda.fukui.jp":true,"katsuyama.fukui.jp":true,"mihama.fukui.jp":true,"minamiechizen.fukui.jp":true,"obama.fukui.jp":true,"ohi.fukui.jp":true,"ono.fukui.jp":true,"sabae.fukui.jp":true,"sakai.fukui.jp":true,"takahama.fukui.jp":true,"tsuruga.fukui.jp":true,"wakasa.fukui.jp":true,"ashiya.fukuoka.jp":true,"buzen.fukuoka.jp":true,"chikugo.fukuoka.jp":true,"chikuho.fukuoka.jp":true,"chikujo.fukuoka.jp":true,"chikushino.fukuoka.jp":true,"chikuzen.fukuoka.jp":true,"chuo.fukuoka.jp":true,"dazaifu.fukuoka.jp":true,"fukuchi.fukuoka.jp":true,"hakata.fukuoka.jp":true,"higashi.fukuoka.jp":true,"hirokawa.fukuoka.jp":true,"hisayama.fukuoka.jp":true,"iizuka.fukuoka.jp":true,"inatsuki.fukuoka.jp":true,"kaho.fukuoka.jp":true,"kasuga.fukuoka.jp":true,"kasuya.fukuoka.jp":true,"kawara.fukuoka.jp":true,"keisen.fukuoka.jp":true,"koga.fukuoka.jp":true,"kurate.fukuoka.jp":true,"kurogi.fukuoka.jp":true,"kurume.fukuoka.jp":true,"minami.fukuoka.jp":true,"miyako.fukuoka.jp":true,"miyama.fukuoka.jp":true,"miyawaka.fukuoka.jp":true,"mizumaki.fukuoka.jp":true,"munakata.fukuoka.jp":true,"nakagawa.fukuoka.jp":true,"nakama.fukuoka.jp":true,"nishi.fukuoka.jp":true,"nogata.fukuoka.jp":true,"ogori.fukuoka.jp":true,"okagaki.fukuoka.jp":true,"okawa.fukuoka.jp":true,"oki.fukuoka.jp":true,"omuta.fukuoka.jp":true,"onga.fukuoka.jp":true,"onojo.fukuoka.jp":true,"oto.fukuoka.jp":true,"saigawa.fukuoka.jp":true,"sasaguri.fukuoka.jp":true,"shingu.fukuoka.jp":true,"shinyoshitomi.fukuoka.jp":true,"shonai.fukuoka.jp":true,"soeda.fukuoka.jp":true,"sue.fukuoka.jp":true,"tachiarai.fukuoka.jp":true,"tagawa.fukuoka.jp":true,"takata.fukuoka.jp":true,"toho.fukuoka.jp":true,"toyotsu.fukuoka.jp":true,"tsuiki.fukuoka.jp":true,"ukiha.fukuoka.jp":true,"umi.fukuoka.jp":true,"usui.fukuoka.jp":true,"yamada.fukuoka.jp":true,"yame.fukuoka.jp":true,"yanagawa.fukuoka.jp":true,"yukuhashi.fukuoka.jp":true,"aizubange.fukushima.jp":true,"aizumisato.fukushima.jp":true,"aizuwakamatsu.fukushima.jp":true,"asakawa.fukushima.jp":true,"bandai.fukushima.jp":true,"date.fukushima.jp":true,"fukushima.fukushima.jp":true,"furudono.fukushima.jp":true,"futaba.fukushima.jp":true,"hanawa.fukushima.jp":true,"higashi.fukushima.jp":true,"hirata.fukushima.jp":true,"hirono.fukushima.jp":true,"iitate.fukushima.jp":true,"inawashiro.fukushima.jp":true,"ishikawa.fukushima.jp":true,"iwaki.fukushima.jp":true,"izumizaki.fukushima.jp":true,"kagamiishi.fukushima.jp":true,"kaneyama.fukushima.jp":true,"kawamata.fukushima.jp":true,"kitakata.fukushima.jp":true,"kitashiobara.fukushima.jp":true,"koori.fukushima.jp":true,"koriyama.fukushima.jp":true,"kunimi.fukushima.jp":true,"miharu.fukushima.jp":true,"mishima.fukushima.jp":true,"namie.fukushima.jp":true,"nango.fukushima.jp":true,"nishiaizu.fukushima.jp":true,"nishigo.fukushima.jp":true,"okuma.fukushima.jp":true,"omotego.fukushima.jp":true,"ono.fukushima.jp":true,"otama.fukushima.jp":true,"samegawa.fukushima.jp":true,"shimogo.fukushima.jp":true,"shirakawa.fukushima.jp":true,"showa.fukushima.jp":true,"soma.fukushima.jp":true,"sukagawa.fukushima.jp":true,"taishin.fukushima.jp":true,"tamakawa.fukushima.jp":true,"tanagura.fukushima.jp":true,"tenei.fukushima.jp":true,"yabuki.fukushima.jp":true,"yamato.fukushima.jp":true,"yamatsuri.fukushima.jp":true,"yanaizu.fukushima.jp":true,"yugawa.fukushima.jp":true,"anpachi.gifu.jp":true,"ena.gifu.jp":true,"gifu.gifu.jp":true,"ginan.gifu.jp":true,"godo.gifu.jp":true,"gujo.gifu.jp":true,"hashima.gifu.jp":true,"hichiso.gifu.jp":true,"hida.gifu.jp":true,"higashishirakawa.gifu.jp":true,"ibigawa.gifu.jp":true,"ikeda.gifu.jp":true,"kakamigahara.gifu.jp":true,"kani.gifu.jp":true,"kasahara.gifu.jp":true,"kasamatsu.gifu.jp":true,"kawaue.gifu.jp":true,"kitagata.gifu.jp":true,"mino.gifu.jp":true,"minokamo.gifu.jp":true,"mitake.gifu.jp":true,"mizunami.gifu.jp":true,"motosu.gifu.jp":true,"nakatsugawa.gifu.jp":true,"ogaki.gifu.jp":true,"sakahogi.gifu.jp":true,"seki.gifu.jp":true,"sekigahara.gifu.jp":true,"shirakawa.gifu.jp":true,"tajimi.gifu.jp":true,"takayama.gifu.jp":true,"tarui.gifu.jp":true,"toki.gifu.jp":true,"tomika.gifu.jp":true,"wanouchi.gifu.jp":true,"yamagata.gifu.jp":true,"yaotsu.gifu.jp":true,"yoro.gifu.jp":true,"annaka.gunma.jp":true,"chiyoda.gunma.jp":true,"fujioka.gunma.jp":true,"higashiagatsuma.gunma.jp":true,"isesaki.gunma.jp":true,"itakura.gunma.jp":true,"kanna.gunma.jp":true,"kanra.gunma.jp":true,"katashina.gunma.jp":true,"kawaba.gunma.jp":true,"kiryu.gunma.jp":true,"kusatsu.gunma.jp":true,"maebashi.gunma.jp":true,"meiwa.gunma.jp":true,"midori.gunma.jp":true,"minakami.gunma.jp":true,"naganohara.gunma.jp":true,"nakanojo.gunma.jp":true,"nanmoku.gunma.jp":true,"numata.gunma.jp":true,"oizumi.gunma.jp":true,"ora.gunma.jp":true,"ota.gunma.jp":true,"shibukawa.gunma.jp":true,"shimonita.gunma.jp":true,"shinto.gunma.jp":true,"showa.gunma.jp":true,"takasaki.gunma.jp":true,"takayama.gunma.jp":true,"tamamura.gunma.jp":true,"tatebayashi.gunma.jp":true,"tomioka.gunma.jp":true,"tsukiyono.gunma.jp":true,"tsumagoi.gunma.jp":true,"ueno.gunma.jp":true,"yoshioka.gunma.jp":true,"asaminami.hiroshima.jp":true,"daiwa.hiroshima.jp":true,"etajima.hiroshima.jp":true,"fuchu.hiroshima.jp":true,"fukuyama.hiroshima.jp":true,"hatsukaichi.hiroshima.jp":true,"higashihiroshima.hiroshima.jp":true,"hongo.hiroshima.jp":true,"jinsekikogen.hiroshima.jp":true,"kaita.hiroshima.jp":true,"kui.hiroshima.jp":true,"kumano.hiroshima.jp":true,"kure.hiroshima.jp":true,"mihara.hiroshima.jp":true,"miyoshi.hiroshima.jp":true,"naka.hiroshima.jp":true,"onomichi.hiroshima.jp":true,"osakikamijima.hiroshima.jp":true,"otake.hiroshima.jp":true,"saka.hiroshima.jp":true,"sera.hiroshima.jp":true,"seranishi.hiroshima.jp":true,"shinichi.hiroshima.jp":true,"shobara.hiroshima.jp":true,"takehara.hiroshima.jp":true,"abashiri.hokkaido.jp":true,"abira.hokkaido.jp":true,"aibetsu.hokkaido.jp":true,"akabira.hokkaido.jp":true,"akkeshi.hokkaido.jp":true,"asahikawa.hokkaido.jp":true,"ashibetsu.hokkaido.jp":true,"ashoro.hokkaido.jp":true,"assabu.hokkaido.jp":true,"atsuma.hokkaido.jp":true,"bibai.hokkaido.jp":true,"biei.hokkaido.jp":true,"bifuka.hokkaido.jp":true,"bihoro.hokkaido.jp":true,"biratori.hokkaido.jp":true,"chippubetsu.hokkaido.jp":true,"chitose.hokkaido.jp":true,"date.hokkaido.jp":true,"ebetsu.hokkaido.jp":true,"embetsu.hokkaido.jp":true,"eniwa.hokkaido.jp":true,"erimo.hokkaido.jp":true,"esan.hokkaido.jp":true,"esashi.hokkaido.jp":true,"fukagawa.hokkaido.jp":true,"fukushima.hokkaido.jp":true,"furano.hokkaido.jp":true,"furubira.hokkaido.jp":true,"haboro.hokkaido.jp":true,"hakodate.hokkaido.jp":true,"hamatonbetsu.hokkaido.jp":true,"hidaka.hokkaido.jp":true,"higashikagura.hokkaido.jp":true,"higashikawa.hokkaido.jp":true,"hiroo.hokkaido.jp":true,"hokuryu.hokkaido.jp":true,"hokuto.hokkaido.jp":true,"honbetsu.hokkaido.jp":true,"horokanai.hokkaido.jp":true,"horonobe.hokkaido.jp":true,"ikeda.hokkaido.jp":true,"imakane.hokkaido.jp":true,"ishikari.hokkaido.jp":true,"iwamizawa.hokkaido.jp":true,"iwanai.hokkaido.jp":true,"kamifurano.hokkaido.jp":true,"kamikawa.hokkaido.jp":true,"kamishihoro.hokkaido.jp":true,"kamisunagawa.hokkaido.jp":true,"kamoenai.hokkaido.jp":true,"kayabe.hokkaido.jp":true,"kembuchi.hokkaido.jp":true,"kikonai.hokkaido.jp":true,"kimobetsu.hokkaido.jp":true,"kitahiroshima.hokkaido.jp":true,"kitami.hokkaido.jp":true,"kiyosato.hokkaido.jp":true,"koshimizu.hokkaido.jp":true,"kunneppu.hokkaido.jp":true,"kuriyama.hokkaido.jp":true,"kuromatsunai.hokkaido.jp":true,"kushiro.hokkaido.jp":true,"kutchan.hokkaido.jp":true,"kyowa.hokkaido.jp":true,"mashike.hokkaido.jp":true,"matsumae.hokkaido.jp":true,"mikasa.hokkaido.jp":true,"minamifurano.hokkaido.jp":true,"mombetsu.hokkaido.jp":true,"moseushi.hokkaido.jp":true,"mukawa.hokkaido.jp":true,"muroran.hokkaido.jp":true,"naie.hokkaido.jp":true,"nakagawa.hokkaido.jp":true,"nakasatsunai.hokkaido.jp":true,"nakatombetsu.hokkaido.jp":true,"nanae.hokkaido.jp":true,"nanporo.hokkaido.jp":true,"nayoro.hokkaido.jp":true,"nemuro.hokkaido.jp":true,"niikappu.hokkaido.jp":true,"niki.hokkaido.jp":true,"nishiokoppe.hokkaido.jp":true,"noboribetsu.hokkaido.jp":true,"numata.hokkaido.jp":true,"obihiro.hokkaido.jp":true,"obira.hokkaido.jp":true,"oketo.hokkaido.jp":true,"okoppe.hokkaido.jp":true,"otaru.hokkaido.jp":true,"otobe.hokkaido.jp":true,"otofuke.hokkaido.jp":true,"otoineppu.hokkaido.jp":true,"oumu.hokkaido.jp":true,"ozora.hokkaido.jp":true,"pippu.hokkaido.jp":true,"rankoshi.hokkaido.jp":true,"rebun.hokkaido.jp":true,"rikubetsu.hokkaido.jp":true,"rishiri.hokkaido.jp":true,"rishirifuji.hokkaido.jp":true,"saroma.hokkaido.jp":true,"sarufutsu.hokkaido.jp":true,"shakotan.hokkaido.jp":true,"shari.hokkaido.jp":true,"shibecha.hokkaido.jp":true,"shibetsu.hokkaido.jp":true,"shikabe.hokkaido.jp":true,"shikaoi.hokkaido.jp":true,"shimamaki.hokkaido.jp":true,"shimizu.hokkaido.jp":true,"shimokawa.hokkaido.jp":true,"shinshinotsu.hokkaido.jp":true,"shintoku.hokkaido.jp":true,"shiranuka.hokkaido.jp":true,"shiraoi.hokkaido.jp":true,"shiriuchi.hokkaido.jp":true,"sobetsu.hokkaido.jp":true,"sunagawa.hokkaido.jp":true,"taiki.hokkaido.jp":true,"takasu.hokkaido.jp":true,"takikawa.hokkaido.jp":true,"takinoue.hokkaido.jp":true,"teshikaga.hokkaido.jp":true,"tobetsu.hokkaido.jp":true,"tohma.hokkaido.jp":true,"tomakomai.hokkaido.jp":true,"tomari.hokkaido.jp":true,"toya.hokkaido.jp":true,"toyako.hokkaido.jp":true,"toyotomi.hokkaido.jp":true,"toyoura.hokkaido.jp":true,"tsubetsu.hokkaido.jp":true,"tsukigata.hokkaido.jp":true,"urakawa.hokkaido.jp":true,"urausu.hokkaido.jp":true,"uryu.hokkaido.jp":true,"utashinai.hokkaido.jp":true,"wakkanai.hokkaido.jp":true,"wassamu.hokkaido.jp":true,"yakumo.hokkaido.jp":true,"yoichi.hokkaido.jp":true,"aioi.hyogo.jp":true,"akashi.hyogo.jp":true,"ako.hyogo.jp":true,"amagasaki.hyogo.jp":true,"aogaki.hyogo.jp":true,"asago.hyogo.jp":true,"ashiya.hyogo.jp":true,"awaji.hyogo.jp":true,"fukusaki.hyogo.jp":true,"goshiki.hyogo.jp":true,"harima.hyogo.jp":true,"himeji.hyogo.jp":true,"ichikawa.hyogo.jp":true,"inagawa.hyogo.jp":true,"itami.hyogo.jp":true,"kakogawa.hyogo.jp":true,"kamigori.hyogo.jp":true,"kamikawa.hyogo.jp":true,"kasai.hyogo.jp":true,"kasuga.hyogo.jp":true,"kawanishi.hyogo.jp":true,"miki.hyogo.jp":true,"minamiawaji.hyogo.jp":true,"nishinomiya.hyogo.jp":true,"nishiwaki.hyogo.jp":true,"ono.hyogo.jp":true,"sanda.hyogo.jp":true,"sannan.hyogo.jp":true,"sasayama.hyogo.jp":true,"sayo.hyogo.jp":true,"shingu.hyogo.jp":true,"shinonsen.hyogo.jp":true,"shiso.hyogo.jp":true,"sumoto.hyogo.jp":true,"taishi.hyogo.jp":true,"taka.hyogo.jp":true,"takarazuka.hyogo.jp":true,"takasago.hyogo.jp":true,"takino.hyogo.jp":true,"tamba.hyogo.jp":true,"tatsuno.hyogo.jp":true,"toyooka.hyogo.jp":true,"yabu.hyogo.jp":true,"yashiro.hyogo.jp":true,"yoka.hyogo.jp":true,"yokawa.hyogo.jp":true,"ami.ibaraki.jp":true,"asahi.ibaraki.jp":true,"bando.ibaraki.jp":true,"chikusei.ibaraki.jp":true,"daigo.ibaraki.jp":true,"fujishiro.ibaraki.jp":true,"hitachi.ibaraki.jp":true,"hitachinaka.ibaraki.jp":true,"hitachiomiya.ibaraki.jp":true,"hitachiota.ibaraki.jp":true,"ibaraki.ibaraki.jp":true,"ina.ibaraki.jp":true,"inashiki.ibaraki.jp":true,"itako.ibaraki.jp":true,"iwama.ibaraki.jp":true,"joso.ibaraki.jp":true,"kamisu.ibaraki.jp":true,"kasama.ibaraki.jp":true,"kashima.ibaraki.jp":true,"kasumigaura.ibaraki.jp":true,"koga.ibaraki.jp":true,"miho.ibaraki.jp":true,"mito.ibaraki.jp":true,"moriya.ibaraki.jp":true,"naka.ibaraki.jp":true,"namegata.ibaraki.jp":true,"oarai.ibaraki.jp":true,"ogawa.ibaraki.jp":true,"omitama.ibaraki.jp":true,"ryugasaki.ibaraki.jp":true,"sakai.ibaraki.jp":true,"sakuragawa.ibaraki.jp":true,"shimodate.ibaraki.jp":true,"shimotsuma.ibaraki.jp":true,"shirosato.ibaraki.jp":true,"sowa.ibaraki.jp":true,"suifu.ibaraki.jp":true,"takahagi.ibaraki.jp":true,"tamatsukuri.ibaraki.jp":true,"tokai.ibaraki.jp":true,"tomobe.ibaraki.jp":true,"tone.ibaraki.jp":true,"toride.ibaraki.jp":true,"tsuchiura.ibaraki.jp":true,"tsukuba.ibaraki.jp":true,"uchihara.ibaraki.jp":true,"ushiku.ibaraki.jp":true,"yachiyo.ibaraki.jp":true,"yamagata.ibaraki.jp":true,"yawara.ibaraki.jp":true,"yuki.ibaraki.jp":true,"anamizu.ishikawa.jp":true,"hakui.ishikawa.jp":true,"hakusan.ishikawa.jp":true,"kaga.ishikawa.jp":true,"kahoku.ishikawa.jp":true,"kanazawa.ishikawa.jp":true,"kawakita.ishikawa.jp":true,"komatsu.ishikawa.jp":true,"nakanoto.ishikawa.jp":true,"nanao.ishikawa.jp":true,"nomi.ishikawa.jp":true,"nonoichi.ishikawa.jp":true,"noto.ishikawa.jp":true,"shika.ishikawa.jp":true,"suzu.ishikawa.jp":true,"tsubata.ishikawa.jp":true,"tsurugi.ishikawa.jp":true,"uchinada.ishikawa.jp":true,"wajima.ishikawa.jp":true,"fudai.iwate.jp":true,"fujisawa.iwate.jp":true,"hanamaki.iwate.jp":true,"hiraizumi.iwate.jp":true,"hirono.iwate.jp":true,"ichinohe.iwate.jp":true,"ichinoseki.iwate.jp":true,"iwaizumi.iwate.jp":true,"iwate.iwate.jp":true,"joboji.iwate.jp":true,"kamaishi.iwate.jp":true,"kanegasaki.iwate.jp":true,"karumai.iwate.jp":true,"kawai.iwate.jp":true,"kitakami.iwate.jp":true,"kuji.iwate.jp":true,"kunohe.iwate.jp":true,"kuzumaki.iwate.jp":true,"miyako.iwate.jp":true,"mizusawa.iwate.jp":true,"morioka.iwate.jp":true,"ninohe.iwate.jp":true,"noda.iwate.jp":true,"ofunato.iwate.jp":true,"oshu.iwate.jp":true,"otsuchi.iwate.jp":true,"rikuzentakata.iwate.jp":true,"shiwa.iwate.jp":true,"shizukuishi.iwate.jp":true,"sumita.iwate.jp":true,"tanohata.iwate.jp":true,"tono.iwate.jp":true,"yahaba.iwate.jp":true,"yamada.iwate.jp":true,"ayagawa.kagawa.jp":true,"higashikagawa.kagawa.jp":true,"kanonji.kagawa.jp":true,"kotohira.kagawa.jp":true,"manno.kagawa.jp":true,"marugame.kagawa.jp":true,"mitoyo.kagawa.jp":true,"naoshima.kagawa.jp":true,"sanuki.kagawa.jp":true,"tadotsu.kagawa.jp":true,"takamatsu.kagawa.jp":true,"tonosho.kagawa.jp":true,"uchinomi.kagawa.jp":true,"utazu.kagawa.jp":true,"zentsuji.kagawa.jp":true,"akune.kagoshima.jp":true,"amami.kagoshima.jp":true,"hioki.kagoshima.jp":true,"isa.kagoshima.jp":true,"isen.kagoshima.jp":true,"izumi.kagoshima.jp":true,"kagoshima.kagoshima.jp":true,"kanoya.kagoshima.jp":true,"kawanabe.kagoshima.jp":true,"kinko.kagoshima.jp":true,"kouyama.kagoshima.jp":true,"makurazaki.kagoshima.jp":true,"matsumoto.kagoshima.jp":true,"minamitane.kagoshima.jp":true,"nakatane.kagoshima.jp":true,"nishinoomote.kagoshima.jp":true,"satsumasendai.kagoshima.jp":true,"soo.kagoshima.jp":true,"tarumizu.kagoshima.jp":true,"yusui.kagoshima.jp":true,"aikawa.kanagawa.jp":true,"atsugi.kanagawa.jp":true,"ayase.kanagawa.jp":true,"chigasaki.kanagawa.jp":true,"ebina.kanagawa.jp":true,"fujisawa.kanagawa.jp":true,"hadano.kanagawa.jp":true,"hakone.kanagawa.jp":true,"hiratsuka.kanagawa.jp":true,"isehara.kanagawa.jp":true,"kaisei.kanagawa.jp":true,"kamakura.kanagawa.jp":true,"kiyokawa.kanagawa.jp":true,"matsuda.kanagawa.jp":true,"minamiashigara.kanagawa.jp":true,"miura.kanagawa.jp":true,"nakai.kanagawa.jp":true,"ninomiya.kanagawa.jp":true,"odawara.kanagawa.jp":true,"oi.kanagawa.jp":true,"oiso.kanagawa.jp":true,"sagamihara.kanagawa.jp":true,"samukawa.kanagawa.jp":true,"tsukui.kanagawa.jp":true,"yamakita.kanagawa.jp":true,"yamato.kanagawa.jp":true,"yokosuka.kanagawa.jp":true,"yugawara.kanagawa.jp":true,"zama.kanagawa.jp":true,"zushi.kanagawa.jp":true,"aki.kochi.jp":true,"geisei.kochi.jp":true,"hidaka.kochi.jp":true,"higashitsuno.kochi.jp":true,"ino.kochi.jp":true,"kagami.kochi.jp":true,"kami.kochi.jp":true,"kitagawa.kochi.jp":true,"kochi.kochi.jp":true,"mihara.kochi.jp":true,"motoyama.kochi.jp":true,"muroto.kochi.jp":true,"nahari.kochi.jp":true,"nakamura.kochi.jp":true,"nankoku.kochi.jp":true,"nishitosa.kochi.jp":true,"niyodogawa.kochi.jp":true,"ochi.kochi.jp":true,"okawa.kochi.jp":true,"otoyo.kochi.jp":true,"otsuki.kochi.jp":true,"sakawa.kochi.jp":true,"sukumo.kochi.jp":true,"susaki.kochi.jp":true,"tosa.kochi.jp":true,"tosashimizu.kochi.jp":true,"toyo.kochi.jp":true,"tsuno.kochi.jp":true,"umaji.kochi.jp":true,"yasuda.kochi.jp":true,"yusuhara.kochi.jp":true,"amakusa.kumamoto.jp":true,"arao.kumamoto.jp":true,"aso.kumamoto.jp":true,"choyo.kumamoto.jp":true,"gyokuto.kumamoto.jp":true,"kamiamakusa.kumamoto.jp":true,"kikuchi.kumamoto.jp":true,"kumamoto.kumamoto.jp":true,"mashiki.kumamoto.jp":true,"mifune.kumamoto.jp":true,"minamata.kumamoto.jp":true,"minamioguni.kumamoto.jp":true,"nagasu.kumamoto.jp":true,"nishihara.kumamoto.jp":true,"oguni.kumamoto.jp":true,"ozu.kumamoto.jp":true,"sumoto.kumamoto.jp":true,"takamori.kumamoto.jp":true,"uki.kumamoto.jp":true,"uto.kumamoto.jp":true,"yamaga.kumamoto.jp":true,"yamato.kumamoto.jp":true,"yatsushiro.kumamoto.jp":true,"ayabe.kyoto.jp":true,"fukuchiyama.kyoto.jp":true,"higashiyama.kyoto.jp":true,"ide.kyoto.jp":true,"ine.kyoto.jp":true,"joyo.kyoto.jp":true,"kameoka.kyoto.jp":true,"kamo.kyoto.jp":true,"kita.kyoto.jp":true,"kizu.kyoto.jp":true,"kumiyama.kyoto.jp":true,"kyotamba.kyoto.jp":true,"kyotanabe.kyoto.jp":true,"kyotango.kyoto.jp":true,"maizuru.kyoto.jp":true,"minami.kyoto.jp":true,"minamiyamashiro.kyoto.jp":true,"miyazu.kyoto.jp":true,"muko.kyoto.jp":true,"nagaokakyo.kyoto.jp":true,"nakagyo.kyoto.jp":true,"nantan.kyoto.jp":true,"oyamazaki.kyoto.jp":true,"sakyo.kyoto.jp":true,"seika.kyoto.jp":true,"tanabe.kyoto.jp":true,"uji.kyoto.jp":true,"ujitawara.kyoto.jp":true,"wazuka.kyoto.jp":true,"yamashina.kyoto.jp":true,"yawata.kyoto.jp":true,"asahi.mie.jp":true,"inabe.mie.jp":true,"ise.mie.jp":true,"kameyama.mie.jp":true,"kawagoe.mie.jp":true,"kiho.mie.jp":true,"kisosaki.mie.jp":true,"kiwa.mie.jp":true,"komono.mie.jp":true,"kumano.mie.jp":true,"kuwana.mie.jp":true,"matsusaka.mie.jp":true,"meiwa.mie.jp":true,"mihama.mie.jp":true,"minamiise.mie.jp":true,"misugi.mie.jp":true,"miyama.mie.jp":true,"nabari.mie.jp":true,"shima.mie.jp":true,"suzuka.mie.jp":true,"tado.mie.jp":true,"taiki.mie.jp":true,"taki.mie.jp":true,"tamaki.mie.jp":true,"toba.mie.jp":true,"tsu.mie.jp":true,"udono.mie.jp":true,"ureshino.mie.jp":true,"watarai.mie.jp":true,"yokkaichi.mie.jp":true,"furukawa.miyagi.jp":true,"higashimatsushima.miyagi.jp":true,"ishinomaki.miyagi.jp":true,"iwanuma.miyagi.jp":true,"kakuda.miyagi.jp":true,"kami.miyagi.jp":true,"kawasaki.miyagi.jp":true,"marumori.miyagi.jp":true,"matsushima.miyagi.jp":true,"minamisanriku.miyagi.jp":true,"misato.miyagi.jp":true,"murata.miyagi.jp":true,"natori.miyagi.jp":true,"ogawara.miyagi.jp":true,"ohira.miyagi.jp":true,"onagawa.miyagi.jp":true,"osaki.miyagi.jp":true,"rifu.miyagi.jp":true,"semine.miyagi.jp":true,"shibata.miyagi.jp":true,"shichikashuku.miyagi.jp":true,"shikama.miyagi.jp":true,"shiogama.miyagi.jp":true,"shiroishi.miyagi.jp":true,"tagajo.miyagi.jp":true,"taiwa.miyagi.jp":true,"tome.miyagi.jp":true,"tomiya.miyagi.jp":true,"wakuya.miyagi.jp":true,"watari.miyagi.jp":true,"yamamoto.miyagi.jp":true,"zao.miyagi.jp":true,"aya.miyazaki.jp":true,"ebino.miyazaki.jp":true,"gokase.miyazaki.jp":true,"hyuga.miyazaki.jp":true,"kadogawa.miyazaki.jp":true,"kawaminami.miyazaki.jp":true,"kijo.miyazaki.jp":true,"kitagawa.miyazaki.jp":true,"kitakata.miyazaki.jp":true,"kitaura.miyazaki.jp":true,"kobayashi.miyazaki.jp":true,"kunitomi.miyazaki.jp":true,"kushima.miyazaki.jp":true,"mimata.miyazaki.jp":true,"miyakonojo.miyazaki.jp":true,"miyazaki.miyazaki.jp":true,"morotsuka.miyazaki.jp":true,"nichinan.miyazaki.jp":true,"nishimera.miyazaki.jp":true,"nobeoka.miyazaki.jp":true,"saito.miyazaki.jp":true,"shiiba.miyazaki.jp":true,"shintomi.miyazaki.jp":true,"takaharu.miyazaki.jp":true,"takanabe.miyazaki.jp":true,"takazaki.miyazaki.jp":true,"tsuno.miyazaki.jp":true,"achi.nagano.jp":true,"agematsu.nagano.jp":true,"anan.nagano.jp":true,"aoki.nagano.jp":true,"asahi.nagano.jp":true,"azumino.nagano.jp":true,"chikuhoku.nagano.jp":true,"chikuma.nagano.jp":true,"chino.nagano.jp":true,"fujimi.nagano.jp":true,"hakuba.nagano.jp":true,"hara.nagano.jp":true,"hiraya.nagano.jp":true,"iida.nagano.jp":true,"iijima.nagano.jp":true,"iiyama.nagano.jp":true,"iizuna.nagano.jp":true,"ikeda.nagano.jp":true,"ikusaka.nagano.jp":true,"ina.nagano.jp":true,"karuizawa.nagano.jp":true,"kawakami.nagano.jp":true,"kiso.nagano.jp":true,"kisofukushima.nagano.jp":true,"kitaaiki.nagano.jp":true,"komagane.nagano.jp":true,"komoro.nagano.jp":true,"matsukawa.nagano.jp":true,"matsumoto.nagano.jp":true,"miasa.nagano.jp":true,"minamiaiki.nagano.jp":true,"minamimaki.nagano.jp":true,"minamiminowa.nagano.jp":true,"minowa.nagano.jp":true,"miyada.nagano.jp":true,"miyota.nagano.jp":true,"mochizuki.nagano.jp":true,"nagano.nagano.jp":true,"nagawa.nagano.jp":true,"nagiso.nagano.jp":true,"nakagawa.nagano.jp":true,"nakano.nagano.jp":true,"nozawaonsen.nagano.jp":true,"obuse.nagano.jp":true,"ogawa.nagano.jp":true,"okaya.nagano.jp":true,"omachi.nagano.jp":true,"omi.nagano.jp":true,"ookuwa.nagano.jp":true,"ooshika.nagano.jp":true,"otaki.nagano.jp":true,"otari.nagano.jp":true,"sakae.nagano.jp":true,"sakaki.nagano.jp":true,"saku.nagano.jp":true,"sakuho.nagano.jp":true,"shimosuwa.nagano.jp":true,"shinanomachi.nagano.jp":true,"shiojiri.nagano.jp":true,"suwa.nagano.jp":true,"suzaka.nagano.jp":true,"takagi.nagano.jp":true,"takamori.nagano.jp":true,"takayama.nagano.jp":true,"tateshina.nagano.jp":true,"tatsuno.nagano.jp":true,"togakushi.nagano.jp":true,"togura.nagano.jp":true,"tomi.nagano.jp":true,"ueda.nagano.jp":true,"wada.nagano.jp":true,"yamagata.nagano.jp":true,"yamanouchi.nagano.jp":true,"yasaka.nagano.jp":true,"yasuoka.nagano.jp":true,"chijiwa.nagasaki.jp":true,"futsu.nagasaki.jp":true,"goto.nagasaki.jp":true,"hasami.nagasaki.jp":true,"hirado.nagasaki.jp":true,"iki.nagasaki.jp":true,"isahaya.nagasaki.jp":true,"kawatana.nagasaki.jp":true,"kuchinotsu.nagasaki.jp":true,"matsuura.nagasaki.jp":true,"nagasaki.nagasaki.jp":true,"obama.nagasaki.jp":true,"omura.nagasaki.jp":true,"oseto.nagasaki.jp":true,"saikai.nagasaki.jp":true,"sasebo.nagasaki.jp":true,"seihi.nagasaki.jp":true,"shimabara.nagasaki.jp":true,"shinkamigoto.nagasaki.jp":true,"togitsu.nagasaki.jp":true,"tsushima.nagasaki.jp":true,"unzen.nagasaki.jp":true,"ando.nara.jp":true,"gose.nara.jp":true,"heguri.nara.jp":true,"higashiyoshino.nara.jp":true,"ikaruga.nara.jp":true,"ikoma.nara.jp":true,"kamikitayama.nara.jp":true,"kanmaki.nara.jp":true,"kashiba.nara.jp":true,"kashihara.nara.jp":true,"katsuragi.nara.jp":true,"kawai.nara.jp":true,"kawakami.nara.jp":true,"kawanishi.nara.jp":true,"koryo.nara.jp":true,"kurotaki.nara.jp":true,"mitsue.nara.jp":true,"miyake.nara.jp":true,"nara.nara.jp":true,"nosegawa.nara.jp":true,"oji.nara.jp":true,"ouda.nara.jp":true,"oyodo.nara.jp":true,"sakurai.nara.jp":true,"sango.nara.jp":true,"shimoichi.nara.jp":true,"shimokitayama.nara.jp":true,"shinjo.nara.jp":true,"soni.nara.jp":true,"takatori.nara.jp":true,"tawaramoto.nara.jp":true,"tenkawa.nara.jp":true,"tenri.nara.jp":true,"uda.nara.jp":true,"yamatokoriyama.nara.jp":true,"yamatotakada.nara.jp":true,"yamazoe.nara.jp":true,"yoshino.nara.jp":true,"aga.niigata.jp":true,"agano.niigata.jp":true,"gosen.niigata.jp":true,"itoigawa.niigata.jp":true,"izumozaki.niigata.jp":true,"joetsu.niigata.jp":true,"kamo.niigata.jp":true,"kariwa.niigata.jp":true,"kashiwazaki.niigata.jp":true,"minamiuonuma.niigata.jp":true,"mitsuke.niigata.jp":true,"muika.niigata.jp":true,"murakami.niigata.jp":true,"myoko.niigata.jp":true,"nagaoka.niigata.jp":true,"niigata.niigata.jp":true,"ojiya.niigata.jp":true,"omi.niigata.jp":true,"sado.niigata.jp":true,"sanjo.niigata.jp":true,"seiro.niigata.jp":true,"seirou.niigata.jp":true,"sekikawa.niigata.jp":true,"shibata.niigata.jp":true,"tagami.niigata.jp":true,"tainai.niigata.jp":true,"tochio.niigata.jp":true,"tokamachi.niigata.jp":true,"tsubame.niigata.jp":true,"tsunan.niigata.jp":true,"uonuma.niigata.jp":true,"yahiko.niigata.jp":true,"yoita.niigata.jp":true,"yuzawa.niigata.jp":true,"beppu.oita.jp":true,"bungoono.oita.jp":true,"bungotakada.oita.jp":true,"hasama.oita.jp":true,"hiji.oita.jp":true,"himeshima.oita.jp":true,"hita.oita.jp":true,"kamitsue.oita.jp":true,"kokonoe.oita.jp":true,"kuju.oita.jp":true,"kunisaki.oita.jp":true,"kusu.oita.jp":true,"oita.oita.jp":true,"saiki.oita.jp":true,"taketa.oita.jp":true,"tsukumi.oita.jp":true,"usa.oita.jp":true,"usuki.oita.jp":true,"yufu.oita.jp":true,"akaiwa.okayama.jp":true,"asakuchi.okayama.jp":true,"bizen.okayama.jp":true,"hayashima.okayama.jp":true,"ibara.okayama.jp":true,"kagamino.okayama.jp":true,"kasaoka.okayama.jp":true,"kibichuo.okayama.jp":true,"kumenan.okayama.jp":true,"kurashiki.okayama.jp":true,"maniwa.okayama.jp":true,"misaki.okayama.jp":true,"nagi.okayama.jp":true,"niimi.okayama.jp":true,"nishiawakura.okayama.jp":true,"okayama.okayama.jp":true,"satosho.okayama.jp":true,"setouchi.okayama.jp":true,"shinjo.okayama.jp":true,"shoo.okayama.jp":true,"soja.okayama.jp":true,"takahashi.okayama.jp":true,"tamano.okayama.jp":true,"tsuyama.okayama.jp":true,"wake.okayama.jp":true,"yakage.okayama.jp":true,"aguni.okinawa.jp":true,"ginowan.okinawa.jp":true,"ginoza.okinawa.jp":true,"gushikami.okinawa.jp":true,"haebaru.okinawa.jp":true,"higashi.okinawa.jp":true,"hirara.okinawa.jp":true,"iheya.okinawa.jp":true,"ishigaki.okinawa.jp":true,"ishikawa.okinawa.jp":true,"itoman.okinawa.jp":true,"izena.okinawa.jp":true,"kadena.okinawa.jp":true,"kin.okinawa.jp":true,"kitadaito.okinawa.jp":true,"kitanakagusuku.okinawa.jp":true,"kumejima.okinawa.jp":true,"kunigami.okinawa.jp":true,"minamidaito.okinawa.jp":true,"motobu.okinawa.jp":true,"nago.okinawa.jp":true,"naha.okinawa.jp":true,"nakagusuku.okinawa.jp":true,"nakijin.okinawa.jp":true,"nanjo.okinawa.jp":true,"nishihara.okinawa.jp":true,"ogimi.okinawa.jp":true,"okinawa.okinawa.jp":true,"onna.okinawa.jp":true,"shimoji.okinawa.jp":true,"taketomi.okinawa.jp":true,"tarama.okinawa.jp":true,"tokashiki.okinawa.jp":true,"tomigusuku.okinawa.jp":true,"tonaki.okinawa.jp":true,"urasoe.okinawa.jp":true,"uruma.okinawa.jp":true,"yaese.okinawa.jp":true,"yomitan.okinawa.jp":true,"yonabaru.okinawa.jp":true,"yonaguni.okinawa.jp":true,"zamami.okinawa.jp":true,"abeno.osaka.jp":true,"chihayaakasaka.osaka.jp":true,"chuo.osaka.jp":true,"daito.osaka.jp":true,"fujiidera.osaka.jp":true,"habikino.osaka.jp":true,"hannan.osaka.jp":true,"higashiosaka.osaka.jp":true,"higashisumiyoshi.osaka.jp":true,"higashiyodogawa.osaka.jp":true,"hirakata.osaka.jp":true,"ibaraki.osaka.jp":true,"ikeda.osaka.jp":true,"izumi.osaka.jp":true,"izumiotsu.osaka.jp":true,"izumisano.osaka.jp":true,"kadoma.osaka.jp":true,"kaizuka.osaka.jp":true,"kanan.osaka.jp":true,"kashiwara.osaka.jp":true,"katano.osaka.jp":true,"kawachinagano.osaka.jp":true,"kishiwada.osaka.jp":true,"kita.osaka.jp":true,"kumatori.osaka.jp":true,"matsubara.osaka.jp":true,"minato.osaka.jp":true,"minoh.osaka.jp":true,"misaki.osaka.jp":true,"moriguchi.osaka.jp":true,"neyagawa.osaka.jp":true,"nishi.osaka.jp":true,"nose.osaka.jp":true,"osakasayama.osaka.jp":true,"sakai.osaka.jp":true,"sayama.osaka.jp":true,"sennan.osaka.jp":true,"settsu.osaka.jp":true,"shijonawate.osaka.jp":true,"shimamoto.osaka.jp":true,"suita.osaka.jp":true,"tadaoka.osaka.jp":true,"taishi.osaka.jp":true,"tajiri.osaka.jp":true,"takaishi.osaka.jp":true,"takatsuki.osaka.jp":true,"tondabayashi.osaka.jp":true,"toyonaka.osaka.jp":true,"toyono.osaka.jp":true,"yao.osaka.jp":true,"ariake.saga.jp":true,"arita.saga.jp":true,"fukudomi.saga.jp":true,"genkai.saga.jp":true,"hamatama.saga.jp":true,"hizen.saga.jp":true,"imari.saga.jp":true,"kamimine.saga.jp":true,"kanzaki.saga.jp":true,"karatsu.saga.jp":true,"kashima.saga.jp":true,"kitagata.saga.jp":true,"kitahata.saga.jp":true,"kiyama.saga.jp":true,"kouhoku.saga.jp":true,"kyuragi.saga.jp":true,"nishiarita.saga.jp":true,"ogi.saga.jp":true,"omachi.saga.jp":true,"ouchi.saga.jp":true,"saga.saga.jp":true,"shiroishi.saga.jp":true,"taku.saga.jp":true,"tara.saga.jp":true,"tosu.saga.jp":true,"yoshinogari.saga.jp":true,"arakawa.saitama.jp":true,"asaka.saitama.jp":true,"chichibu.saitama.jp":true,"fujimi.saitama.jp":true,"fujimino.saitama.jp":true,"fukaya.saitama.jp":true,"hanno.saitama.jp":true,"hanyu.saitama.jp":true,"hasuda.saitama.jp":true,"hatogaya.saitama.jp":true,"hatoyama.saitama.jp":true,"hidaka.saitama.jp":true,"higashichichibu.saitama.jp":true,"higashimatsuyama.saitama.jp":true,"honjo.saitama.jp":true,"ina.saitama.jp":true,"iruma.saitama.jp":true,"iwatsuki.saitama.jp":true,"kamiizumi.saitama.jp":true,"kamikawa.saitama.jp":true,"kamisato.saitama.jp":true,"kasukabe.saitama.jp":true,"kawagoe.saitama.jp":true,"kawaguchi.saitama.jp":true,"kawajima.saitama.jp":true,"kazo.saitama.jp":true,"kitamoto.saitama.jp":true,"koshigaya.saitama.jp":true,"kounosu.saitama.jp":true,"kuki.saitama.jp":true,"kumagaya.saitama.jp":true,"matsubushi.saitama.jp":true,"minano.saitama.jp":true,"misato.saitama.jp":true,"miyashiro.saitama.jp":true,"miyoshi.saitama.jp":true,"moroyama.saitama.jp":true,"nagatoro.saitama.jp":true,"namegawa.saitama.jp":true,"niiza.saitama.jp":true,"ogano.saitama.jp":true,"ogawa.saitama.jp":true,"ogose.saitama.jp":true,"okegawa.saitama.jp":true,"omiya.saitama.jp":true,"otaki.saitama.jp":true,"ranzan.saitama.jp":true,"ryokami.saitama.jp":true,"saitama.saitama.jp":true,"sakado.saitama.jp":true,"satte.saitama.jp":true,"sayama.saitama.jp":true,"shiki.saitama.jp":true,"shiraoka.saitama.jp":true,"soka.saitama.jp":true,"sugito.saitama.jp":true,"toda.saitama.jp":true,"tokigawa.saitama.jp":true,"tokorozawa.saitama.jp":true,"tsurugashima.saitama.jp":true,"urawa.saitama.jp":true,"warabi.saitama.jp":true,"yashio.saitama.jp":true,"yokoze.saitama.jp":true,"yono.saitama.jp":true,"yorii.saitama.jp":true,"yoshida.saitama.jp":true,"yoshikawa.saitama.jp":true,"yoshimi.saitama.jp":true,"aisho.shiga.jp":true,"gamo.shiga.jp":true,"higashiomi.shiga.jp":true,"hikone.shiga.jp":true,"koka.shiga.jp":true,"konan.shiga.jp":true,"kosei.shiga.jp":true,"koto.shiga.jp":true,"kusatsu.shiga.jp":true,"maibara.shiga.jp":true,"moriyama.shiga.jp":true,"nagahama.shiga.jp":true,"nishiazai.shiga.jp":true,"notogawa.shiga.jp":true,"omihachiman.shiga.jp":true,"otsu.shiga.jp":true,"ritto.shiga.jp":true,"ryuoh.shiga.jp":true,"takashima.shiga.jp":true,"takatsuki.shiga.jp":true,"torahime.shiga.jp":true,"toyosato.shiga.jp":true,"yasu.shiga.jp":true,"akagi.shimane.jp":true,"ama.shimane.jp":true,"gotsu.shimane.jp":true,"hamada.shimane.jp":true,"higashiizumo.shimane.jp":true,"hikawa.shimane.jp":true,"hikimi.shimane.jp":true,"izumo.shimane.jp":true,"kakinoki.shimane.jp":true,"masuda.shimane.jp":true,"matsue.shimane.jp":true,"misato.shimane.jp":true,"nishinoshima.shimane.jp":true,"ohda.shimane.jp":true,"okinoshima.shimane.jp":true,"okuizumo.shimane.jp":true,"shimane.shimane.jp":true,"tamayu.shimane.jp":true,"tsuwano.shimane.jp":true,"unnan.shimane.jp":true,"yakumo.shimane.jp":true,"yasugi.shimane.jp":true,"yatsuka.shimane.jp":true,"arai.shizuoka.jp":true,"atami.shizuoka.jp":true,"fuji.shizuoka.jp":true,"fujieda.shizuoka.jp":true,"fujikawa.shizuoka.jp":true,"fujinomiya.shizuoka.jp":true,"fukuroi.shizuoka.jp":true,"gotemba.shizuoka.jp":true,"haibara.shizuoka.jp":true,"hamamatsu.shizuoka.jp":true,"higashiizu.shizuoka.jp":true,"ito.shizuoka.jp":true,"iwata.shizuoka.jp":true,"izu.shizuoka.jp":true,"izunokuni.shizuoka.jp":true,"kakegawa.shizuoka.jp":true,"kannami.shizuoka.jp":true,"kawanehon.shizuoka.jp":true,"kawazu.shizuoka.jp":true,"kikugawa.shizuoka.jp":true,"kosai.shizuoka.jp":true,"makinohara.shizuoka.jp":true,"matsuzaki.shizuoka.jp":true,"minamiizu.shizuoka.jp":true,"mishima.shizuoka.jp":true,"morimachi.shizuoka.jp":true,"nishiizu.shizuoka.jp":true,"numazu.shizuoka.jp":true,"omaezaki.shizuoka.jp":true,"shimada.shizuoka.jp":true,"shimizu.shizuoka.jp":true,"shimoda.shizuoka.jp":true,"shizuoka.shizuoka.jp":true,"susono.shizuoka.jp":true,"yaizu.shizuoka.jp":true,"yoshida.shizuoka.jp":true,"ashikaga.tochigi.jp":true,"bato.tochigi.jp":true,"haga.tochigi.jp":true,"ichikai.tochigi.jp":true,"iwafune.tochigi.jp":true,"kaminokawa.tochigi.jp":true,"kanuma.tochigi.jp":true,"karasuyama.tochigi.jp":true,"kuroiso.tochigi.jp":true,"mashiko.tochigi.jp":true,"mibu.tochigi.jp":true,"moka.tochigi.jp":true,"motegi.tochigi.jp":true,"nasu.tochigi.jp":true,"nasushiobara.tochigi.jp":true,"nikko.tochigi.jp":true,"nishikata.tochigi.jp":true,"nogi.tochigi.jp":true,"ohira.tochigi.jp":true,"ohtawara.tochigi.jp":true,"oyama.tochigi.jp":true,"sakura.tochigi.jp":true,"sano.tochigi.jp":true,"shimotsuke.tochigi.jp":true,"shioya.tochigi.jp":true,"takanezawa.tochigi.jp":true,"tochigi.tochigi.jp":true,"tsuga.tochigi.jp":true,"ujiie.tochigi.jp":true,"utsunomiya.tochigi.jp":true,"yaita.tochigi.jp":true,"aizumi.tokushima.jp":true,"anan.tokushima.jp":true,"ichiba.tokushima.jp":true,"itano.tokushima.jp":true,"kainan.tokushima.jp":true,"komatsushima.tokushima.jp":true,"matsushige.tokushima.jp":true,"mima.tokushima.jp":true,"minami.tokushima.jp":true,"miyoshi.tokushima.jp":true,"mugi.tokushima.jp":true,"nakagawa.tokushima.jp":true,"naruto.tokushima.jp":true,"sanagochi.tokushima.jp":true,"shishikui.tokushima.jp":true,"tokushima.tokushima.jp":true,"wajiki.tokushima.jp":true,"adachi.tokyo.jp":true,"akiruno.tokyo.jp":true,"akishima.tokyo.jp":true,"aogashima.tokyo.jp":true,"arakawa.tokyo.jp":true,"bunkyo.tokyo.jp":true,"chiyoda.tokyo.jp":true,"chofu.tokyo.jp":true,"chuo.tokyo.jp":true,"edogawa.tokyo.jp":true,"fuchu.tokyo.jp":true,"fussa.tokyo.jp":true,"hachijo.tokyo.jp":true,"hachioji.tokyo.jp":true,"hamura.tokyo.jp":true,"higashikurume.tokyo.jp":true,"higashimurayama.tokyo.jp":true,"higashiyamato.tokyo.jp":true,"hino.tokyo.jp":true,"hinode.tokyo.jp":true,"hinohara.tokyo.jp":true,"inagi.tokyo.jp":true,"itabashi.tokyo.jp":true,"katsushika.tokyo.jp":true,"kita.tokyo.jp":true,"kiyose.tokyo.jp":true,"kodaira.tokyo.jp":true,"koganei.tokyo.jp":true,"kokubunji.tokyo.jp":true,"komae.tokyo.jp":true,"koto.tokyo.jp":true,"kouzushima.tokyo.jp":true,"kunitachi.tokyo.jp":true,"machida.tokyo.jp":true,"meguro.tokyo.jp":true,"minato.tokyo.jp":true,"mitaka.tokyo.jp":true,"mizuho.tokyo.jp":true,"musashimurayama.tokyo.jp":true,"musashino.tokyo.jp":true,"nakano.tokyo.jp":true,"nerima.tokyo.jp":true,"ogasawara.tokyo.jp":true,"okutama.tokyo.jp":true,"ome.tokyo.jp":true,"oshima.tokyo.jp":true,"ota.tokyo.jp":true,"setagaya.tokyo.jp":true,"shibuya.tokyo.jp":true,"shinagawa.tokyo.jp":true,"shinjuku.tokyo.jp":true,"suginami.tokyo.jp":true,"sumida.tokyo.jp":true,"tachikawa.tokyo.jp":true,"taito.tokyo.jp":true,"tama.tokyo.jp":true,"toshima.tokyo.jp":true,"chizu.tottori.jp":true,"hino.tottori.jp":true,"kawahara.tottori.jp":true,"koge.tottori.jp":true,"kotoura.tottori.jp":true,"misasa.tottori.jp":true,"nanbu.tottori.jp":true,"nichinan.tottori.jp":true,"sakaiminato.tottori.jp":true,"tottori.tottori.jp":true,"wakasa.tottori.jp":true,"yazu.tottori.jp":true,"yonago.tottori.jp":true,"asahi.toyama.jp":true,"fuchu.toyama.jp":true,"fukumitsu.toyama.jp":true,"funahashi.toyama.jp":true,"himi.toyama.jp":true,"imizu.toyama.jp":true,"inami.toyama.jp":true,"johana.toyama.jp":true,"kamiichi.toyama.jp":true,"kurobe.toyama.jp":true,"nakaniikawa.toyama.jp":true,"namerikawa.toyama.jp":true,"nanto.toyama.jp":true,"nyuzen.toyama.jp":true,"oyabe.toyama.jp":true,"taira.toyama.jp":true,"takaoka.toyama.jp":true,"tateyama.toyama.jp":true,"toga.toyama.jp":true,"tonami.toyama.jp":true,"toyama.toyama.jp":true,"unazuki.toyama.jp":true,"uozu.toyama.jp":true,"yamada.toyama.jp":true,"arida.wakayama.jp":true,"aridagawa.wakayama.jp":true,"gobo.wakayama.jp":true,"hashimoto.wakayama.jp":true,"hidaka.wakayama.jp":true,"hirogawa.wakayama.jp":true,"inami.wakayama.jp":true,"iwade.wakayama.jp":true,"kainan.wakayama.jp":true,"kamitonda.wakayama.jp":true,"katsuragi.wakayama.jp":true,"kimino.wakayama.jp":true,"kinokawa.wakayama.jp":true,"kitayama.wakayama.jp":true,"koya.wakayama.jp":true,"koza.wakayama.jp":true,"kozagawa.wakayama.jp":true,"kudoyama.wakayama.jp":true,"kushimoto.wakayama.jp":true,"mihama.wakayama.jp":true,"misato.wakayama.jp":true,"nachikatsuura.wakayama.jp":true,"shingu.wakayama.jp":true,"shirahama.wakayama.jp":true,"taiji.wakayama.jp":true,"tanabe.wakayama.jp":true,"wakayama.wakayama.jp":true,"yuasa.wakayama.jp":true,"yura.wakayama.jp":true,"asahi.yamagata.jp":true,"funagata.yamagata.jp":true,"higashine.yamagata.jp":true,"iide.yamagata.jp":true,"kahoku.yamagata.jp":true,"kaminoyama.yamagata.jp":true,"kaneyama.yamagata.jp":true,"kawanishi.yamagata.jp":true,"mamurogawa.yamagata.jp":true,"mikawa.yamagata.jp":true,"murayama.yamagata.jp":true,"nagai.yamagata.jp":true,"nakayama.yamagata.jp":true,"nanyo.yamagata.jp":true,"nishikawa.yamagata.jp":true,"obanazawa.yamagata.jp":true,"oe.yamagata.jp":true,"oguni.yamagata.jp":true,"ohkura.yamagata.jp":true,"oishida.yamagata.jp":true,"sagae.yamagata.jp":true,"sakata.yamagata.jp":true,"sakegawa.yamagata.jp":true,"shinjo.yamagata.jp":true,"shirataka.yamagata.jp":true,"shonai.yamagata.jp":true,"takahata.yamagata.jp":true,"tendo.yamagata.jp":true,"tozawa.yamagata.jp":true,"tsuruoka.yamagata.jp":true,"yamagata.yamagata.jp":true,"yamanobe.yamagata.jp":true,"yonezawa.yamagata.jp":true,"yuza.yamagata.jp":true,"abu.yamaguchi.jp":true,"hagi.yamaguchi.jp":true,"hikari.yamaguchi.jp":true,"hofu.yamaguchi.jp":true,"iwakuni.yamaguchi.jp":true,"kudamatsu.yamaguchi.jp":true,"mitou.yamaguchi.jp":true,"nagato.yamaguchi.jp":true,"oshima.yamaguchi.jp":true,"shimonoseki.yamaguchi.jp":true,"shunan.yamaguchi.jp":true,"tabuse.yamaguchi.jp":true,"tokuyama.yamaguchi.jp":true,"toyota.yamaguchi.jp":true,"ube.yamaguchi.jp":true,"yuu.yamaguchi.jp":true,"chuo.yamanashi.jp":true,"doshi.yamanashi.jp":true,"fuefuki.yamanashi.jp":true,"fujikawa.yamanashi.jp":true,"fujikawaguchiko.yamanashi.jp":true,"fujiyoshida.yamanashi.jp":true,"hayakawa.yamanashi.jp":true,"hokuto.yamanashi.jp":true,"ichikawamisato.yamanashi.jp":true,"kai.yamanashi.jp":true,"kofu.yamanashi.jp":true,"koshu.yamanashi.jp":true,"kosuge.yamanashi.jp":true,"minami-alps.yamanashi.jp":true,"minobu.yamanashi.jp":true,"nakamichi.yamanashi.jp":true,"nanbu.yamanashi.jp":true,"narusawa.yamanashi.jp":true,"nirasaki.yamanashi.jp":true,"nishikatsura.yamanashi.jp":true,"oshino.yamanashi.jp":true,"otsuki.yamanashi.jp":true,"showa.yamanashi.jp":true,"tabayama.yamanashi.jp":true,"tsuru.yamanashi.jp":true,"uenohara.yamanashi.jp":true,"yamanakako.yamanashi.jp":true,"yamanashi.yamanashi.jp":true,"ke":true,"ac.ke":true,"co.ke":true,"go.ke":true,"info.ke":true,"me.ke":true,"mobi.ke":true,"ne.ke":true,"or.ke":true,"sc.ke":true,"kg":true,"org.kg":true,"net.kg":true,"com.kg":true,"edu.kg":true,"gov.kg":true,"mil.kg":true,"*.kh":true,"ki":true,"edu.ki":true,"biz.ki":true,"net.ki":true,"org.ki":true,"gov.ki":true,"info.ki":true,"com.ki":true,"km":true,"org.km":true,"nom.km":true,"gov.km":true,"prd.km":true,"tm.km":true,"edu.km":true,"mil.km":true,"ass.km":true,"com.km":true,"coop.km":true,"asso.km":true,"presse.km":true,"medecin.km":true,"notaires.km":true,"pharmaciens.km":true,"veterinaire.km":true,"gouv.km":true,"kn":true,"net.kn":true,"org.kn":true,"edu.kn":true,"gov.kn":true,"kp":true,"com.kp":true,"edu.kp":true,"gov.kp":true,"org.kp":true,"rep.kp":true,"tra.kp":true,"kr":true,"ac.kr":true,"co.kr":true,"es.kr":true,"go.kr":true,"hs.kr":true,"kg.kr":true,"mil.kr":true,"ms.kr":true,"ne.kr":true,"or.kr":true,"pe.kr":true,"re.kr":true,"sc.kr":true,"busan.kr":true,"chungbuk.kr":true,"chungnam.kr":true,"daegu.kr":true,"daejeon.kr":true,"gangwon.kr":true,"gwangju.kr":true,"gyeongbuk.kr":true,"gyeonggi.kr":true,"gyeongnam.kr":true,"incheon.kr":true,"jeju.kr":true,"jeonbuk.kr":true,"jeonnam.kr":true,"seoul.kr":true,"ulsan.kr":true,"*.kw":true,"ky":true,"edu.ky":true,"gov.ky":true,"com.ky":true,"org.ky":true,"net.ky":true,"kz":true,"org.kz":true,"edu.kz":true,"net.kz":true,"gov.kz":true,"mil.kz":true,"com.kz":true,"la":true,"int.la":true,"net.la":true,"info.la":true,"edu.la":true,"gov.la":true,"per.la":true,"com.la":true,"org.la":true,"lb":true,"com.lb":true,"edu.lb":true,"gov.lb":true,"net.lb":true,"org.lb":true,"lc":true,"com.lc":true,"net.lc":true,"co.lc":true,"org.lc":true,"edu.lc":true,"gov.lc":true,"li":true,"lk":true,"gov.lk":true,"sch.lk":true,"net.lk":true,"int.lk":true,"com.lk":true,"org.lk":true,"edu.lk":true,"ngo.lk":true,"soc.lk":true,"web.lk":true,"ltd.lk":true,"assn.lk":true,"grp.lk":true,"hotel.lk":true,"ac.lk":true,"lr":true,"com.lr":true,"edu.lr":true,"gov.lr":true,"org.lr":true,"net.lr":true,"ls":true,"co.ls":true,"org.ls":true,"lt":true,"gov.lt":true,"lu":true,"lv":true,"com.lv":true,"edu.lv":true,"gov.lv":true,"org.lv":true,"mil.lv":true,"id.lv":true,"net.lv":true,"asn.lv":true,"conf.lv":true,"ly":true,"com.ly":true,"net.ly":true,"gov.ly":true,"plc.ly":true,"edu.ly":true,"sch.ly":true,"med.ly":true,"org.ly":true,"id.ly":true,"ma":true,"co.ma":true,"net.ma":true,"gov.ma":true,"org.ma":true,"ac.ma":true,"press.ma":true,"mc":true,"tm.mc":true,"asso.mc":true,"md":true,"me":true,"co.me":true,"net.me":true,"org.me":true,"edu.me":true,"ac.me":true,"gov.me":true,"its.me":true,"priv.me":true,"mg":true,"org.mg":true,"nom.mg":true,"gov.mg":true,"prd.mg":true,"tm.mg":true,"edu.mg":true,"mil.mg":true,"com.mg":true,"co.mg":true,"mh":true,"mil":true,"mk":true,"com.mk":true,"org.mk":true,"net.mk":true,"edu.mk":true,"gov.mk":true,"inf.mk":true,"name.mk":true,"ml":true,"com.ml":true,"edu.ml":true,"gouv.ml":true,"gov.ml":true,"net.ml":true,"org.ml":true,"presse.ml":true,"*.mm":true,"mn":true,"gov.mn":true,"edu.mn":true,"org.mn":true,"mo":true,"com.mo":true,"net.mo":true,"org.mo":true,"edu.mo":true,"gov.mo":true,"mobi":true,"mp":true,"mq":true,"mr":true,"gov.mr":true,"ms":true,"com.ms":true,"edu.ms":true,"gov.ms":true,"net.ms":true,"org.ms":true,"mt":true,"com.mt":true,"edu.mt":true,"net.mt":true,"org.mt":true,"mu":true,"com.mu":true,"net.mu":true,"org.mu":true,"gov.mu":true,"ac.mu":true,"co.mu":true,"or.mu":true,"museum":true,"academy.museum":true,"agriculture.museum":true,"air.museum":true,"airguard.museum":true,"alabama.museum":true,"alaska.museum":true,"amber.museum":true,"ambulance.museum":true,"american.museum":true,"americana.museum":true,"americanantiques.museum":true,"americanart.museum":true,"amsterdam.museum":true,"and.museum":true,"annefrank.museum":true,"anthro.museum":true,"anthropology.museum":true,"antiques.museum":true,"aquarium.museum":true,"arboretum.museum":true,"archaeological.museum":true,"archaeology.museum":true,"architecture.museum":true,"art.museum":true,"artanddesign.museum":true,"artcenter.museum":true,"artdeco.museum":true,"arteducation.museum":true,"artgallery.museum":true,"arts.museum":true,"artsandcrafts.museum":true,"asmatart.museum":true,"assassination.museum":true,"assisi.museum":true,"association.museum":true,"astronomy.museum":true,"atlanta.museum":true,"austin.museum":true,"australia.museum":true,"automotive.museum":true,"aviation.museum":true,"axis.museum":true,"badajoz.museum":true,"baghdad.museum":true,"bahn.museum":true,"bale.museum":true,"baltimore.museum":true,"barcelona.museum":true,"baseball.museum":true,"basel.museum":true,"baths.museum":true,"bauern.museum":true,"beauxarts.museum":true,"beeldengeluid.museum":true,"bellevue.museum":true,"bergbau.museum":true,"berkeley.museum":true,"berlin.museum":true,"bern.museum":true,"bible.museum":true,"bilbao.museum":true,"bill.museum":true,"birdart.museum":true,"birthplace.museum":true,"bonn.museum":true,"boston.museum":true,"botanical.museum":true,"botanicalgarden.museum":true,"botanicgarden.museum":true,"botany.museum":true,"brandywinevalley.museum":true,"brasil.museum":true,"bristol.museum":true,"british.museum":true,"britishcolumbia.museum":true,"broadcast.museum":true,"brunel.museum":true,"brussel.museum":true,"brussels.museum":true,"bruxelles.museum":true,"building.museum":true,"burghof.museum":true,"bus.museum":true,"bushey.museum":true,"cadaques.museum":true,"california.museum":true,"cambridge.museum":true,"can.museum":true,"canada.museum":true,"capebreton.museum":true,"carrier.museum":true,"cartoonart.museum":true,"casadelamoneda.museum":true,"castle.museum":true,"castres.museum":true,"celtic.museum":true,"center.museum":true,"chattanooga.museum":true,"cheltenham.museum":true,"chesapeakebay.museum":true,"chicago.museum":true,"children.museum":true,"childrens.museum":true,"childrensgarden.museum":true,"chiropractic.museum":true,"chocolate.museum":true,"christiansburg.museum":true,"cincinnati.museum":true,"cinema.museum":true,"circus.museum":true,"civilisation.museum":true,"civilization.museum":true,"civilwar.museum":true,"clinton.museum":true,"clock.museum":true,"coal.museum":true,"coastaldefence.museum":true,"cody.museum":true,"coldwar.museum":true,"collection.museum":true,"colonialwilliamsburg.museum":true,"coloradoplateau.museum":true,"columbia.museum":true,"columbus.museum":true,"communication.museum":true,"communications.museum":true,"community.museum":true,"computer.museum":true,"computerhistory.museum":true,"xn--comunicaes-v6a2o.museum":true,"contemporary.museum":true,"contemporaryart.museum":true,"convent.museum":true,"copenhagen.museum":true,"corporation.museum":true,"xn--correios-e-telecomunicaes-ghc29a.museum":true,"corvette.museum":true,"costume.museum":true,"countryestate.museum":true,"county.museum":true,"crafts.museum":true,"cranbrook.museum":true,"creation.museum":true,"cultural.museum":true,"culturalcenter.museum":true,"culture.museum":true,"cyber.museum":true,"cymru.museum":true,"dali.museum":true,"dallas.museum":true,"database.museum":true,"ddr.museum":true,"decorativearts.museum":true,"delaware.museum":true,"delmenhorst.museum":true,"denmark.museum":true,"depot.museum":true,"design.museum":true,"detroit.museum":true,"dinosaur.museum":true,"discovery.museum":true,"dolls.museum":true,"donostia.museum":true,"durham.museum":true,"eastafrica.museum":true,"eastcoast.museum":true,"education.museum":true,"educational.museum":true,"egyptian.museum":true,"eisenbahn.museum":true,"elburg.museum":true,"elvendrell.museum":true,"embroidery.museum":true,"encyclopedic.museum":true,"england.museum":true,"entomology.museum":true,"environment.museum":true,"environmentalconservation.museum":true,"epilepsy.museum":true,"essex.museum":true,"estate.museum":true,"ethnology.museum":true,"exeter.museum":true,"exhibition.museum":true,"family.museum":true,"farm.museum":true,"farmequipment.museum":true,"farmers.museum":true,"farmstead.museum":true,"field.museum":true,"figueres.museum":true,"filatelia.museum":true,"film.museum":true,"fineart.museum":true,"finearts.museum":true,"finland.museum":true,"flanders.museum":true,"florida.museum":true,"force.museum":true,"fortmissoula.museum":true,"fortworth.museum":true,"foundation.museum":true,"francaise.museum":true,"frankfurt.museum":true,"franziskaner.museum":true,"freemasonry.museum":true,"freiburg.museum":true,"fribourg.museum":true,"frog.museum":true,"fundacio.museum":true,"furniture.museum":true,"gallery.museum":true,"garden.museum":true,"gateway.museum":true,"geelvinck.museum":true,"gemological.museum":true,"geology.museum":true,"georgia.museum":true,"giessen.museum":true,"glas.museum":true,"glass.museum":true,"gorge.museum":true,"grandrapids.museum":true,"graz.museum":true,"guernsey.museum":true,"halloffame.museum":true,"hamburg.museum":true,"handson.museum":true,"harvestcelebration.museum":true,"hawaii.museum":true,"health.museum":true,"heimatunduhren.museum":true,"hellas.museum":true,"helsinki.museum":true,"hembygdsforbund.museum":true,"heritage.museum":true,"histoire.museum":true,"historical.museum":true,"historicalsociety.museum":true,"historichouses.museum":true,"historisch.museum":true,"historisches.museum":true,"history.museum":true,"historyofscience.museum":true,"horology.museum":true,"house.museum":true,"humanities.museum":true,"illustration.museum":true,"imageandsound.museum":true,"indian.museum":true,"indiana.museum":true,"indianapolis.museum":true,"indianmarket.museum":true,"intelligence.museum":true,"interactive.museum":true,"iraq.museum":true,"iron.museum":true,"isleofman.museum":true,"jamison.museum":true,"jefferson.museum":true,"jerusalem.museum":true,"jewelry.museum":true,"jewish.museum":true,"jewishart.museum":true,"jfk.museum":true,"journalism.museum":true,"judaica.museum":true,"judygarland.museum":true,"juedisches.museum":true,"juif.museum":true,"karate.museum":true,"karikatur.museum":true,"kids.museum":true,"koebenhavn.museum":true,"koeln.museum":true,"kunst.museum":true,"kunstsammlung.museum":true,"kunstunddesign.museum":true,"labor.museum":true,"labour.museum":true,"lajolla.museum":true,"lancashire.museum":true,"landes.museum":true,"lans.museum":true,"xn--lns-qla.museum":true,"larsson.museum":true,"lewismiller.museum":true,"lincoln.museum":true,"linz.museum":true,"living.museum":true,"livinghistory.museum":true,"localhistory.museum":true,"london.museum":true,"losangeles.museum":true,"louvre.museum":true,"loyalist.museum":true,"lucerne.museum":true,"luxembourg.museum":true,"luzern.museum":true,"mad.museum":true,"madrid.museum":true,"mallorca.museum":true,"manchester.museum":true,"mansion.museum":true,"mansions.museum":true,"manx.museum":true,"marburg.museum":true,"maritime.museum":true,"maritimo.museum":true,"maryland.museum":true,"marylhurst.museum":true,"media.museum":true,"medical.museum":true,"medizinhistorisches.museum":true,"meeres.museum":true,"memorial.museum":true,"mesaverde.museum":true,"michigan.museum":true,"midatlantic.museum":true,"military.museum":true,"mill.museum":true,"miners.museum":true,"mining.museum":true,"minnesota.museum":true,"missile.museum":true,"missoula.museum":true,"modern.museum":true,"moma.museum":true,"money.museum":true,"monmouth.museum":true,"monticello.museum":true,"montreal.museum":true,"moscow.museum":true,"motorcycle.museum":true,"muenchen.museum":true,"muenster.museum":true,"mulhouse.museum":true,"muncie.museum":true,"museet.museum":true,"museumcenter.museum":true,"museumvereniging.museum":true,"music.museum":true,"national.museum":true,"nationalfirearms.museum":true,"nationalheritage.museum":true,"nativeamerican.museum":true,"naturalhistory.museum":true,"naturalhistorymuseum.museum":true,"naturalsciences.museum":true,"nature.museum":true,"naturhistorisches.museum":true,"natuurwetenschappen.museum":true,"naumburg.museum":true,"naval.museum":true,"nebraska.museum":true,"neues.museum":true,"newhampshire.museum":true,"newjersey.museum":true,"newmexico.museum":true,"newport.museum":true,"newspaper.museum":true,"newyork.museum":true,"niepce.museum":true,"norfolk.museum":true,"north.museum":true,"nrw.museum":true,"nuernberg.museum":true,"nuremberg.museum":true,"nyc.museum":true,"nyny.museum":true,"oceanographic.museum":true,"oceanographique.museum":true,"omaha.museum":true,"online.museum":true,"ontario.museum":true,"openair.museum":true,"oregon.museum":true,"oregontrail.museum":true,"otago.museum":true,"oxford.museum":true,"pacific.museum":true,"paderborn.museum":true,"palace.museum":true,"paleo.museum":true,"palmsprings.museum":true,"panama.museum":true,"paris.museum":true,"pasadena.museum":true,"pharmacy.museum":true,"philadelphia.museum":true,"philadelphiaarea.museum":true,"philately.museum":true,"phoenix.museum":true,"photography.museum":true,"pilots.museum":true,"pittsburgh.museum":true,"planetarium.museum":true,"plantation.museum":true,"plants.museum":true,"plaza.museum":true,"portal.museum":true,"portland.museum":true,"portlligat.museum":true,"posts-and-telecommunications.museum":true,"preservation.museum":true,"presidio.museum":true,"press.museum":true,"project.museum":true,"public.museum":true,"pubol.museum":true,"quebec.museum":true,"railroad.museum":true,"railway.museum":true,"research.museum":true,"resistance.museum":true,"riodejaneiro.museum":true,"rochester.museum":true,"rockart.museum":true,"roma.museum":true,"russia.museum":true,"saintlouis.museum":true,"salem.museum":true,"salvadordali.museum":true,"salzburg.museum":true,"sandiego.museum":true,"sanfrancisco.museum":true,"santabarbara.museum":true,"santacruz.museum":true,"santafe.museum":true,"saskatchewan.museum":true,"satx.museum":true,"savannahga.museum":true,"schlesisches.museum":true,"schoenbrunn.museum":true,"schokoladen.museum":true,"school.museum":true,"schweiz.museum":true,"science.museum":true,"scienceandhistory.museum":true,"scienceandindustry.museum":true,"sciencecenter.museum":true,"sciencecenters.museum":true,"science-fiction.museum":true,"sciencehistory.museum":true,"sciences.museum":true,"sciencesnaturelles.museum":true,"scotland.museum":true,"seaport.museum":true,"settlement.museum":true,"settlers.museum":true,"shell.museum":true,"sherbrooke.museum":true,"sibenik.museum":true,"silk.museum":true,"ski.museum":true,"skole.museum":true,"society.museum":true,"sologne.museum":true,"soundandvision.museum":true,"southcarolina.museum":true,"southwest.museum":true,"space.museum":true,"spy.museum":true,"square.museum":true,"stadt.museum":true,"stalbans.museum":true,"starnberg.museum":true,"state.museum":true,"stateofdelaware.museum":true,"station.museum":true,"steam.museum":true,"steiermark.museum":true,"stjohn.museum":true,"stockholm.museum":true,"stpetersburg.museum":true,"stuttgart.museum":true,"suisse.museum":true,"surgeonshall.museum":true,"surrey.museum":true,"svizzera.museum":true,"sweden.museum":true,"sydney.museum":true,"tank.museum":true,"tcm.museum":true,"technology.museum":true,"telekommunikation.museum":true,"television.museum":true,"texas.museum":true,"textile.museum":true,"theater.museum":true,"time.museum":true,"timekeeping.museum":true,"topology.museum":true,"torino.museum":true,"touch.museum":true,"town.museum":true,"transport.museum":true,"tree.museum":true,"trolley.museum":true,"trust.museum":true,"trustee.museum":true,"uhren.museum":true,"ulm.museum":true,"undersea.museum":true,"university.museum":true,"usa.museum":true,"usantiques.museum":true,"usarts.museum":true,"uscountryestate.museum":true,"usculture.museum":true,"usdecorativearts.museum":true,"usgarden.museum":true,"ushistory.museum":true,"ushuaia.museum":true,"uslivinghistory.museum":true,"utah.museum":true,"uvic.museum":true,"valley.museum":true,"vantaa.museum":true,"versailles.museum":true,"viking.museum":true,"village.museum":true,"virginia.museum":true,"virtual.museum":true,"virtuel.museum":true,"vlaanderen.museum":true,"volkenkunde.museum":true,"wales.museum":true,"wallonie.museum":true,"war.museum":true,"washingtondc.museum":true,"watchandclock.museum":true,"watch-and-clock.museum":true,"western.museum":true,"westfalen.museum":true,"whaling.museum":true,"wildlife.museum":true,"williamsburg.museum":true,"windmill.museum":true,"workshop.museum":true,"york.museum":true,"yorkshire.museum":true,"yosemite.museum":true,"youth.museum":true,"zoological.museum":true,"zoology.museum":true,"xn--9dbhblg6di.museum":true,"xn--h1aegh.museum":true,"mv":true,"aero.mv":true,"biz.mv":true,"com.mv":true,"coop.mv":true,"edu.mv":true,"gov.mv":true,"info.mv":true,"int.mv":true,"mil.mv":true,"museum.mv":true,"name.mv":true,"net.mv":true,"org.mv":true,"pro.mv":true,"mw":true,"ac.mw":true,"biz.mw":true,"co.mw":true,"com.mw":true,"coop.mw":true,"edu.mw":true,"gov.mw":true,"int.mw":true,"museum.mw":true,"net.mw":true,"org.mw":true,"mx":true,"com.mx":true,"org.mx":true,"gob.mx":true,"edu.mx":true,"net.mx":true,"my":true,"com.my":true,"net.my":true,"org.my":true,"gov.my":true,"edu.my":true,"mil.my":true,"name.my":true,"mz":true,"ac.mz":true,"adv.mz":true,"co.mz":true,"edu.mz":true,"gov.mz":true,"mil.mz":true,"net.mz":true,"org.mz":true,"na":true,"info.na":true,"pro.na":true,"name.na":true,"school.na":true,"or.na":true,"dr.na":true,"us.na":true,"mx.na":true,"ca.na":true,"in.na":true,"cc.na":true,"tv.na":true,"ws.na":true,"mobi.na":true,"co.na":true,"com.na":true,"org.na":true,"name":true,"nc":true,"asso.nc":true,"nom.nc":true,"ne":true,"net":true,"nf":true,"com.nf":true,"net.nf":true,"per.nf":true,"rec.nf":true,"web.nf":true,"arts.nf":true,"firm.nf":true,"info.nf":true,"other.nf":true,"store.nf":true,"ng":true,"com.ng":true,"edu.ng":true,"gov.ng":true,"i.ng":true,"mil.ng":true,"mobi.ng":true,"name.ng":true,"net.ng":true,"org.ng":true,"sch.ng":true,"ni":true,"ac.ni":true,"biz.ni":true,"co.ni":true,"com.ni":true,"edu.ni":true,"gob.ni":true,"in.ni":true,"info.ni":true,"int.ni":true,"mil.ni":true,"net.ni":true,"nom.ni":true,"org.ni":true,"web.ni":true,"nl":true,"bv.nl":true,"no":true,"fhs.no":true,"vgs.no":true,"fylkesbibl.no":true,"folkebibl.no":true,"museum.no":true,"idrett.no":true,"priv.no":true,"mil.no":true,"stat.no":true,"dep.no":true,"kommune.no":true,"herad.no":true,"aa.no":true,"ah.no":true,"bu.no":true,"fm.no":true,"hl.no":true,"hm.no":true,"jan-mayen.no":true,"mr.no":true,"nl.no":true,"nt.no":true,"of.no":true,"ol.no":true,"oslo.no":true,"rl.no":true,"sf.no":true,"st.no":true,"svalbard.no":true,"tm.no":true,"tr.no":true,"va.no":true,"vf.no":true,"gs.aa.no":true,"gs.ah.no":true,"gs.bu.no":true,"gs.fm.no":true,"gs.hl.no":true,"gs.hm.no":true,"gs.jan-mayen.no":true,"gs.mr.no":true,"gs.nl.no":true,"gs.nt.no":true,"gs.of.no":true,"gs.ol.no":true,"gs.oslo.no":true,"gs.rl.no":true,"gs.sf.no":true,"gs.st.no":true,"gs.svalbard.no":true,"gs.tm.no":true,"gs.tr.no":true,"gs.va.no":true,"gs.vf.no":true,"akrehamn.no":true,"xn--krehamn-dxa.no":true,"algard.no":true,"xn--lgrd-poac.no":true,"arna.no":true,"brumunddal.no":true,"bryne.no":true,"bronnoysund.no":true,"xn--brnnysund-m8ac.no":true,"drobak.no":true,"xn--drbak-wua.no":true,"egersund.no":true,"fetsund.no":true,"floro.no":true,"xn--flor-jra.no":true,"fredrikstad.no":true,"hokksund.no":true,"honefoss.no":true,"xn--hnefoss-q1a.no":true,"jessheim.no":true,"jorpeland.no":true,"xn--jrpeland-54a.no":true,"kirkenes.no":true,"kopervik.no":true,"krokstadelva.no":true,"langevag.no":true,"xn--langevg-jxa.no":true,"leirvik.no":true,"mjondalen.no":true,"xn--mjndalen-64a.no":true,"mo-i-rana.no":true,"mosjoen.no":true,"xn--mosjen-eya.no":true,"nesoddtangen.no":true,"orkanger.no":true,"osoyro.no":true,"xn--osyro-wua.no":true,"raholt.no":true,"xn--rholt-mra.no":true,"sandnessjoen.no":true,"xn--sandnessjen-ogb.no":true,"skedsmokorset.no":true,"slattum.no":true,"spjelkavik.no":true,"stathelle.no":true,"stavern.no":true,"stjordalshalsen.no":true,"xn--stjrdalshalsen-sqb.no":true,"tananger.no":true,"tranby.no":true,"vossevangen.no":true,"afjord.no":true,"xn--fjord-lra.no":true,"agdenes.no":true,"al.no":true,"xn--l-1fa.no":true,"alesund.no":true,"xn--lesund-hua.no":true,"alstahaug.no":true,"alta.no":true,"xn--lt-liac.no":true,"alaheadju.no":true,"xn--laheadju-7ya.no":true,"alvdal.no":true,"amli.no":true,"xn--mli-tla.no":true,"amot.no":true,"xn--mot-tla.no":true,"andebu.no":true,"andoy.no":true,"xn--andy-ira.no":true,"andasuolo.no":true,"ardal.no":true,"xn--rdal-poa.no":true,"aremark.no":true,"arendal.no":true,"xn--s-1fa.no":true,"aseral.no":true,"xn--seral-lra.no":true,"asker.no":true,"askim.no":true,"askvoll.no":true,"askoy.no":true,"xn--asky-ira.no":true,"asnes.no":true,"xn--snes-poa.no":true,"audnedaln.no":true,"aukra.no":true,"aure.no":true,"aurland.no":true,"aurskog-holand.no":true,"xn--aurskog-hland-jnb.no":true,"austevoll.no":true,"austrheim.no":true,"averoy.no":true,"xn--avery-yua.no":true,"balestrand.no":true,"ballangen.no":true,"balat.no":true,"xn--blt-elab.no":true,"balsfjord.no":true,"bahccavuotna.no":true,"xn--bhccavuotna-k7a.no":true,"bamble.no":true,"bardu.no":true,"beardu.no":true,"beiarn.no":true,"bajddar.no":true,"xn--bjddar-pta.no":true,"baidar.no":true,"xn--bidr-5nac.no":true,"berg.no":true,"bergen.no":true,"berlevag.no":true,"xn--berlevg-jxa.no":true,"bearalvahki.no":true,"xn--bearalvhki-y4a.no":true,"bindal.no":true,"birkenes.no":true,"bjarkoy.no":true,"xn--bjarky-fya.no":true,"bjerkreim.no":true,"bjugn.no":true,"bodo.no":true,"xn--bod-2na.no":true,"badaddja.no":true,"xn--bdddj-mrabd.no":true,"budejju.no":true,"bokn.no":true,"bremanger.no":true,"bronnoy.no":true,"xn--brnny-wuac.no":true,"bygland.no":true,"bykle.no":true,"barum.no":true,"xn--brum-voa.no":true,"bo.telemark.no":true,"xn--b-5ga.telemark.no":true,"bo.nordland.no":true,"xn--b-5ga.nordland.no":true,"bievat.no":true,"xn--bievt-0qa.no":true,"bomlo.no":true,"xn--bmlo-gra.no":true,"batsfjord.no":true,"xn--btsfjord-9za.no":true,"bahcavuotna.no":true,"xn--bhcavuotna-s4a.no":true,"dovre.no":true,"drammen.no":true,"drangedal.no":true,"dyroy.no":true,"xn--dyry-ira.no":true,"donna.no":true,"xn--dnna-gra.no":true,"eid.no":true,"eidfjord.no":true,"eidsberg.no":true,"eidskog.no":true,"eidsvoll.no":true,"eigersund.no":true,"elverum.no":true,"enebakk.no":true,"engerdal.no":true,"etne.no":true,"etnedal.no":true,"evenes.no":true,"evenassi.no":true,"xn--eveni-0qa01ga.no":true,"evje-og-hornnes.no":true,"farsund.no":true,"fauske.no":true,"fuossko.no":true,"fuoisku.no":true,"fedje.no":true,"fet.no":true,"finnoy.no":true,"xn--finny-yua.no":true,"fitjar.no":true,"fjaler.no":true,"fjell.no":true,"flakstad.no":true,"flatanger.no":true,"flekkefjord.no":true,"flesberg.no":true,"flora.no":true,"fla.no":true,"xn--fl-zia.no":true,"folldal.no":true,"forsand.no":true,"fosnes.no":true,"frei.no":true,"frogn.no":true,"froland.no":true,"frosta.no":true,"frana.no":true,"xn--frna-woa.no":true,"froya.no":true,"xn--frya-hra.no":true,"fusa.no":true,"fyresdal.no":true,"forde.no":true,"xn--frde-gra.no":true,"gamvik.no":true,"gangaviika.no":true,"xn--ggaviika-8ya47h.no":true,"gaular.no":true,"gausdal.no":true,"gildeskal.no":true,"xn--gildeskl-g0a.no":true,"giske.no":true,"gjemnes.no":true,"gjerdrum.no":true,"gjerstad.no":true,"gjesdal.no":true,"gjovik.no":true,"xn--gjvik-wua.no":true,"gloppen.no":true,"gol.no":true,"gran.no":true,"grane.no":true,"granvin.no":true,"gratangen.no":true,"grimstad.no":true,"grong.no":true,"kraanghke.no":true,"xn--kranghke-b0a.no":true,"grue.no":true,"gulen.no":true,"hadsel.no":true,"halden.no":true,"halsa.no":true,"hamar.no":true,"hamaroy.no":true,"habmer.no":true,"xn--hbmer-xqa.no":true,"hapmir.no":true,"xn--hpmir-xqa.no":true,"hammerfest.no":true,"hammarfeasta.no":true,"xn--hmmrfeasta-s4ac.no":true,"haram.no":true,"hareid.no":true,"harstad.no":true,"hasvik.no":true,"aknoluokta.no":true,"xn--koluokta-7ya57h.no":true,"hattfjelldal.no":true,"aarborte.no":true,"haugesund.no":true,"hemne.no":true,"hemnes.no":true,"hemsedal.no":true,"heroy.more-og-romsdal.no":true,"xn--hery-ira.xn--mre-og-romsdal-qqb.no":true,"heroy.nordland.no":true,"xn--hery-ira.nordland.no":true,"hitra.no":true,"hjartdal.no":true,"hjelmeland.no":true,"hobol.no":true,"xn--hobl-ira.no":true,"hof.no":true,"hol.no":true,"hole.no":true,"holmestrand.no":true,"holtalen.no":true,"xn--holtlen-hxa.no":true,"hornindal.no":true,"horten.no":true,"hurdal.no":true,"hurum.no":true,"hvaler.no":true,"hyllestad.no":true,"hagebostad.no":true,"xn--hgebostad-g3a.no":true,"hoyanger.no":true,"xn--hyanger-q1a.no":true,"hoylandet.no":true,"xn--hylandet-54a.no":true,"ha.no":true,"xn--h-2fa.no":true,"ibestad.no":true,"inderoy.no":true,"xn--indery-fya.no":true,"iveland.no":true,"jevnaker.no":true,"jondal.no":true,"jolster.no":true,"xn--jlster-bya.no":true,"karasjok.no":true,"karasjohka.no":true,"xn--krjohka-hwab49j.no":true,"karlsoy.no":true,"galsa.no":true,"xn--gls-elac.no":true,"karmoy.no":true,"xn--karmy-yua.no":true,"kautokeino.no":true,"guovdageaidnu.no":true,"klepp.no":true,"klabu.no":true,"xn--klbu-woa.no":true,"kongsberg.no":true,"kongsvinger.no":true,"kragero.no":true,"xn--krager-gya.no":true,"kristiansand.no":true,"kristiansund.no":true,"krodsherad.no":true,"xn--krdsherad-m8a.no":true,"kvalsund.no":true,"rahkkeravju.no":true,"xn--rhkkervju-01af.no":true,"kvam.no":true,"kvinesdal.no":true,"kvinnherad.no":true,"kviteseid.no":true,"kvitsoy.no":true,"xn--kvitsy-fya.no":true,"kvafjord.no":true,"xn--kvfjord-nxa.no":true,"giehtavuoatna.no":true,"kvanangen.no":true,"xn--kvnangen-k0a.no":true,"navuotna.no":true,"xn--nvuotna-hwa.no":true,"kafjord.no":true,"xn--kfjord-iua.no":true,"gaivuotna.no":true,"xn--givuotna-8ya.no":true,"larvik.no":true,"lavangen.no":true,"lavagis.no":true,"loabat.no":true,"xn--loabt-0qa.no":true,"lebesby.no":true,"davvesiida.no":true,"leikanger.no":true,"leirfjord.no":true,"leka.no":true,"leksvik.no":true,"lenvik.no":true,"leangaviika.no":true,"xn--leagaviika-52b.no":true,"lesja.no":true,"levanger.no":true,"lier.no":true,"lierne.no":true,"lillehammer.no":true,"lillesand.no":true,"lindesnes.no":true,"lindas.no":true,"xn--linds-pra.no":true,"lom.no":true,"loppa.no":true,"lahppi.no":true,"xn--lhppi-xqa.no":true,"lund.no":true,"lunner.no":true,"luroy.no":true,"xn--lury-ira.no":true,"luster.no":true,"lyngdal.no":true,"lyngen.no":true,"ivgu.no":true,"lardal.no":true,"lerdal.no":true,"xn--lrdal-sra.no":true,"lodingen.no":true,"xn--ldingen-q1a.no":true,"lorenskog.no":true,"xn--lrenskog-54a.no":true,"loten.no":true,"xn--lten-gra.no":true,"malvik.no":true,"masoy.no":true,"xn--msy-ula0h.no":true,"muosat.no":true,"xn--muost-0qa.no":true,"mandal.no":true,"marker.no":true,"marnardal.no":true,"masfjorden.no":true,"meland.no":true,"meldal.no":true,"melhus.no":true,"meloy.no":true,"xn--mely-ira.no":true,"meraker.no":true,"xn--merker-kua.no":true,"moareke.no":true,"xn--moreke-jua.no":true,"midsund.no":true,"midtre-gauldal.no":true,"modalen.no":true,"modum.no":true,"molde.no":true,"moskenes.no":true,"moss.no":true,"mosvik.no":true,"malselv.no":true,"xn--mlselv-iua.no":true,"malatvuopmi.no":true,"xn--mlatvuopmi-s4a.no":true,"namdalseid.no":true,"aejrie.no":true,"namsos.no":true,"namsskogan.no":true,"naamesjevuemie.no":true,"xn--nmesjevuemie-tcba.no":true,"laakesvuemie.no":true,"nannestad.no":true,"narvik.no":true,"narviika.no":true,"naustdal.no":true,"nedre-eiker.no":true,"nes.akershus.no":true,"nes.buskerud.no":true,"nesna.no":true,"nesodden.no":true,"nesseby.no":true,"unjarga.no":true,"xn--unjrga-rta.no":true,"nesset.no":true,"nissedal.no":true,"nittedal.no":true,"nord-aurdal.no":true,"nord-fron.no":true,"nord-odal.no":true,"norddal.no":true,"nordkapp.no":true,"davvenjarga.no":true,"xn--davvenjrga-y4a.no":true,"nordre-land.no":true,"nordreisa.no":true,"raisa.no":true,"xn--risa-5na.no":true,"nore-og-uvdal.no":true,"notodden.no":true,"naroy.no":true,"xn--nry-yla5g.no":true,"notteroy.no":true,"xn--nttery-byae.no":true,"odda.no":true,"oksnes.no":true,"xn--ksnes-uua.no":true,"oppdal.no":true,"oppegard.no":true,"xn--oppegrd-ixa.no":true,"orkdal.no":true,"orland.no":true,"xn--rland-uua.no":true,"orskog.no":true,"xn--rskog-uua.no":true,"orsta.no":true,"xn--rsta-fra.no":true,"os.hedmark.no":true,"os.hordaland.no":true,"osen.no":true,"osteroy.no":true,"xn--ostery-fya.no":true,"ostre-toten.no":true,"xn--stre-toten-zcb.no":true,"overhalla.no":true,"ovre-eiker.no":true,"xn--vre-eiker-k8a.no":true,"oyer.no":true,"xn--yer-zna.no":true,"oygarden.no":true,"xn--ygarden-p1a.no":true,"oystre-slidre.no":true,"xn--ystre-slidre-ujb.no":true,"porsanger.no":true,"porsangu.no":true,"xn--porsgu-sta26f.no":true,"porsgrunn.no":true,"radoy.no":true,"xn--rady-ira.no":true,"rakkestad.no":true,"rana.no":true,"ruovat.no":true,"randaberg.no":true,"rauma.no":true,"rendalen.no":true,"rennebu.no":true,"rennesoy.no":true,"xn--rennesy-v1a.no":true,"rindal.no":true,"ringebu.no":true,"ringerike.no":true,"ringsaker.no":true,"rissa.no":true,"risor.no":true,"xn--risr-ira.no":true,"roan.no":true,"rollag.no":true,"rygge.no":true,"ralingen.no":true,"xn--rlingen-mxa.no":true,"rodoy.no":true,"xn--rdy-0nab.no":true,"romskog.no":true,"xn--rmskog-bya.no":true,"roros.no":true,"xn--rros-gra.no":true,"rost.no":true,"xn--rst-0na.no":true,"royken.no":true,"xn--ryken-vua.no":true,"royrvik.no":true,"xn--ryrvik-bya.no":true,"rade.no":true,"xn--rde-ula.no":true,"salangen.no":true,"siellak.no":true,"saltdal.no":true,"salat.no":true,"xn--slt-elab.no":true,"xn--slat-5na.no":true,"samnanger.no":true,"sande.more-og-romsdal.no":true,"sande.xn--mre-og-romsdal-qqb.no":true,"sande.vestfold.no":true,"sandefjord.no":true,"sandnes.no":true,"sandoy.no":true,"xn--sandy-yua.no":true,"sarpsborg.no":true,"sauda.no":true,"sauherad.no":true,"sel.no":true,"selbu.no":true,"selje.no":true,"seljord.no":true,"sigdal.no":true,"siljan.no":true,"sirdal.no":true,"skaun.no":true,"skedsmo.no":true,"ski.no":true,"skien.no":true,"skiptvet.no":true,"skjervoy.no":true,"xn--skjervy-v1a.no":true,"skierva.no":true,"xn--skierv-uta.no":true,"skjak.no":true,"xn--skjk-soa.no":true,"skodje.no":true,"skanland.no":true,"xn--sknland-fxa.no":true,"skanit.no":true,"xn--sknit-yqa.no":true,"smola.no":true,"xn--smla-hra.no":true,"snillfjord.no":true,"snasa.no":true,"xn--snsa-roa.no":true,"snoasa.no":true,"snaase.no":true,"xn--snase-nra.no":true,"sogndal.no":true,"sokndal.no":true,"sola.no":true,"solund.no":true,"songdalen.no":true,"sortland.no":true,"spydeberg.no":true,"stange.no":true,"stavanger.no":true,"steigen.no":true,"steinkjer.no":true,"stjordal.no":true,"xn--stjrdal-s1a.no":true,"stokke.no":true,"stor-elvdal.no":true,"stord.no":true,"stordal.no":true,"storfjord.no":true,"omasvuotna.no":true,"strand.no":true,"stranda.no":true,"stryn.no":true,"sula.no":true,"suldal.no":true,"sund.no":true,"sunndal.no":true,"surnadal.no":true,"sveio.no":true,"svelvik.no":true,"sykkylven.no":true,"sogne.no":true,"xn--sgne-gra.no":true,"somna.no":true,"xn--smna-gra.no":true,"sondre-land.no":true,"xn--sndre-land-0cb.no":true,"sor-aurdal.no":true,"xn--sr-aurdal-l8a.no":true,"sor-fron.no":true,"xn--sr-fron-q1a.no":true,"sor-odal.no":true,"xn--sr-odal-q1a.no":true,"sor-varanger.no":true,"xn--sr-varanger-ggb.no":true,"matta-varjjat.no":true,"xn--mtta-vrjjat-k7af.no":true,"sorfold.no":true,"xn--srfold-bya.no":true,"sorreisa.no":true,"xn--srreisa-q1a.no":true,"sorum.no":true,"xn--srum-gra.no":true,"tana.no":true,"deatnu.no":true,"time.no":true,"tingvoll.no":true,"tinn.no":true,"tjeldsund.no":true,"dielddanuorri.no":true,"tjome.no":true,"xn--tjme-hra.no":true,"tokke.no":true,"tolga.no":true,"torsken.no":true,"tranoy.no":true,"xn--trany-yua.no":true,"tromso.no":true,"xn--troms-zua.no":true,"tromsa.no":true,"romsa.no":true,"trondheim.no":true,"troandin.no":true,"trysil.no":true,"trana.no":true,"xn--trna-woa.no":true,"trogstad.no":true,"xn--trgstad-r1a.no":true,"tvedestrand.no":true,"tydal.no":true,"tynset.no":true,"tysfjord.no":true,"divtasvuodna.no":true,"divttasvuotna.no":true,"tysnes.no":true,"tysvar.no":true,"xn--tysvr-vra.no":true,"tonsberg.no":true,"xn--tnsberg-q1a.no":true,"ullensaker.no":true,"ullensvang.no":true,"ulvik.no":true,"utsira.no":true,"vadso.no":true,"xn--vads-jra.no":true,"cahcesuolo.no":true,"xn--hcesuolo-7ya35b.no":true,"vaksdal.no":true,"valle.no":true,"vang.no":true,"vanylven.no":true,"vardo.no":true,"xn--vard-jra.no":true,"varggat.no":true,"xn--vrggt-xqad.no":true,"vefsn.no":true,"vaapste.no":true,"vega.no":true,"vegarshei.no":true,"xn--vegrshei-c0a.no":true,"vennesla.no":true,"verdal.no":true,"verran.no":true,"vestby.no":true,"vestnes.no":true,"vestre-slidre.no":true,"vestre-toten.no":true,"vestvagoy.no":true,"xn--vestvgy-ixa6o.no":true,"vevelstad.no":true,"vik.no":true,"vikna.no":true,"vindafjord.no":true,"volda.no":true,"voss.no":true,"varoy.no":true,"xn--vry-yla5g.no":true,"vagan.no":true,"xn--vgan-qoa.no":true,"voagat.no":true,"vagsoy.no":true,"xn--vgsy-qoa0j.no":true,"vaga.no":true,"xn--vg-yiab.no":true,"valer.ostfold.no":true,"xn--vler-qoa.xn--stfold-9xa.no":true,"valer.hedmark.no":true,"xn--vler-qoa.hedmark.no":true,"*.np":true,"nr":true,"biz.nr":true,"info.nr":true,"gov.nr":true,"edu.nr":true,"org.nr":true,"net.nr":true,"com.nr":true,"nu":true,"nz":true,"ac.nz":true,"co.nz":true,"cri.nz":true,"geek.nz":true,"gen.nz":true,"govt.nz":true,"health.nz":true,"iwi.nz":true,"kiwi.nz":true,"maori.nz":true,"mil.nz":true,"xn--mori-qsa.nz":true,"net.nz":true,"org.nz":true,"parliament.nz":true,"school.nz":true,"om":true,"co.om":true,"com.om":true,"edu.om":true,"gov.om":true,"med.om":true,"museum.om":true,"net.om":true,"org.om":true,"pro.om":true,"onion":true,"org":true,"pa":true,"ac.pa":true,"gob.pa":true,"com.pa":true,"org.pa":true,"sld.pa":true,"edu.pa":true,"net.pa":true,"ing.pa":true,"abo.pa":true,"med.pa":true,"nom.pa":true,"pe":true,"edu.pe":true,"gob.pe":true,"nom.pe":true,"mil.pe":true,"org.pe":true,"com.pe":true,"net.pe":true,"pf":true,"com.pf":true,"org.pf":true,"edu.pf":true,"*.pg":true,"ph":true,"com.ph":true,"net.ph":true,"org.ph":true,"gov.ph":true,"edu.ph":true,"ngo.ph":true,"mil.ph":true,"i.ph":true,"pk":true,"com.pk":true,"net.pk":true,"edu.pk":true,"org.pk":true,"fam.pk":true,"biz.pk":true,"web.pk":true,"gov.pk":true,"gob.pk":true,"gok.pk":true,"gon.pk":true,"gop.pk":true,"gos.pk":true,"info.pk":true,"pl":true,"com.pl":true,"net.pl":true,"org.pl":true,"aid.pl":true,"agro.pl":true,"atm.pl":true,"auto.pl":true,"biz.pl":true,"edu.pl":true,"gmina.pl":true,"gsm.pl":true,"info.pl":true,"mail.pl":true,"miasta.pl":true,"media.pl":true,"mil.pl":true,"nieruchomosci.pl":true,"nom.pl":true,"pc.pl":true,"powiat.pl":true,"priv.pl":true,"realestate.pl":true,"rel.pl":true,"sex.pl":true,"shop.pl":true,"sklep.pl":true,"sos.pl":true,"szkola.pl":true,"targi.pl":true,"tm.pl":true,"tourism.pl":true,"travel.pl":true,"turystyka.pl":true,"gov.pl":true,"ap.gov.pl":true,"ic.gov.pl":true,"is.gov.pl":true,"us.gov.pl":true,"kmpsp.gov.pl":true,"kppsp.gov.pl":true,"kwpsp.gov.pl":true,"psp.gov.pl":true,"wskr.gov.pl":true,"kwp.gov.pl":true,"mw.gov.pl":true,"ug.gov.pl":true,"um.gov.pl":true,"umig.gov.pl":true,"ugim.gov.pl":true,"upow.gov.pl":true,"uw.gov.pl":true,"starostwo.gov.pl":true,"pa.gov.pl":true,"po.gov.pl":true,"psse.gov.pl":true,"pup.gov.pl":true,"rzgw.gov.pl":true,"sa.gov.pl":true,"so.gov.pl":true,"sr.gov.pl":true,"wsa.gov.pl":true,"sko.gov.pl":true,"uzs.gov.pl":true,"wiih.gov.pl":true,"winb.gov.pl":true,"pinb.gov.pl":true,"wios.gov.pl":true,"witd.gov.pl":true,"wzmiuw.gov.pl":true,"piw.gov.pl":true,"wiw.gov.pl":true,"griw.gov.pl":true,"wif.gov.pl":true,"oum.gov.pl":true,"sdn.gov.pl":true,"zp.gov.pl":true,"uppo.gov.pl":true,"mup.gov.pl":true,"wuoz.gov.pl":true,"konsulat.gov.pl":true,"oirm.gov.pl":true,"augustow.pl":true,"babia-gora.pl":true,"bedzin.pl":true,"beskidy.pl":true,"bialowieza.pl":true,"bialystok.pl":true,"bielawa.pl":true,"bieszczady.pl":true,"boleslawiec.pl":true,"bydgoszcz.pl":true,"bytom.pl":true,"cieszyn.pl":true,"czeladz.pl":true,"czest.pl":true,"dlugoleka.pl":true,"elblag.pl":true,"elk.pl":true,"glogow.pl":true,"gniezno.pl":true,"gorlice.pl":true,"grajewo.pl":true,"ilawa.pl":true,"jaworzno.pl":true,"jelenia-gora.pl":true,"jgora.pl":true,"kalisz.pl":true,"kazimierz-dolny.pl":true,"karpacz.pl":true,"kartuzy.pl":true,"kaszuby.pl":true,"katowice.pl":true,"kepno.pl":true,"ketrzyn.pl":true,"klodzko.pl":true,"kobierzyce.pl":true,"kolobrzeg.pl":true,"konin.pl":true,"konskowola.pl":true,"kutno.pl":true,"lapy.pl":true,"lebork.pl":true,"legnica.pl":true,"lezajsk.pl":true,"limanowa.pl":true,"lomza.pl":true,"lowicz.pl":true,"lubin.pl":true,"lukow.pl":true,"malbork.pl":true,"malopolska.pl":true,"mazowsze.pl":true,"mazury.pl":true,"mielec.pl":true,"mielno.pl":true,"mragowo.pl":true,"naklo.pl":true,"nowaruda.pl":true,"nysa.pl":true,"olawa.pl":true,"olecko.pl":true,"olkusz.pl":true,"olsztyn.pl":true,"opoczno.pl":true,"opole.pl":true,"ostroda.pl":true,"ostroleka.pl":true,"ostrowiec.pl":true,"ostrowwlkp.pl":true,"pila.pl":true,"pisz.pl":true,"podhale.pl":true,"podlasie.pl":true,"polkowice.pl":true,"pomorze.pl":true,"pomorskie.pl":true,"prochowice.pl":true,"pruszkow.pl":true,"przeworsk.pl":true,"pulawy.pl":true,"radom.pl":true,"rawa-maz.pl":true,"rybnik.pl":true,"rzeszow.pl":true,"sanok.pl":true,"sejny.pl":true,"slask.pl":true,"slupsk.pl":true,"sosnowiec.pl":true,"stalowa-wola.pl":true,"skoczow.pl":true,"starachowice.pl":true,"stargard.pl":true,"suwalki.pl":true,"swidnica.pl":true,"swiebodzin.pl":true,"swinoujscie.pl":true,"szczecin.pl":true,"szczytno.pl":true,"tarnobrzeg.pl":true,"tgory.pl":true,"turek.pl":true,"tychy.pl":true,"ustka.pl":true,"walbrzych.pl":true,"warmia.pl":true,"warszawa.pl":true,"waw.pl":true,"wegrow.pl":true,"wielun.pl":true,"wlocl.pl":true,"wloclawek.pl":true,"wodzislaw.pl":true,"wolomin.pl":true,"wroclaw.pl":true,"zachpomor.pl":true,"zagan.pl":true,"zarow.pl":true,"zgora.pl":true,"zgorzelec.pl":true,"pm":true,"pn":true,"gov.pn":true,"co.pn":true,"org.pn":true,"edu.pn":true,"net.pn":true,"post":true,"pr":true,"com.pr":true,"net.pr":true,"org.pr":true,"gov.pr":true,"edu.pr":true,"isla.pr":true,"pro.pr":true,"biz.pr":true,"info.pr":true,"name.pr":true,"est.pr":true,"prof.pr":true,"ac.pr":true,"pro":true,"aaa.pro":true,"aca.pro":true,"acct.pro":true,"avocat.pro":true,"bar.pro":true,"cpa.pro":true,"eng.pro":true,"jur.pro":true,"law.pro":true,"med.pro":true,"recht.pro":true,"ps":true,"edu.ps":true,"gov.ps":true,"sec.ps":true,"plo.ps":true,"com.ps":true,"org.ps":true,"net.ps":true,"pt":true,"net.pt":true,"gov.pt":true,"org.pt":true,"edu.pt":true,"int.pt":true,"publ.pt":true,"com.pt":true,"nome.pt":true,"pw":true,"co.pw":true,"ne.pw":true,"or.pw":true,"ed.pw":true,"go.pw":true,"belau.pw":true,"py":true,"com.py":true,"coop.py":true,"edu.py":true,"gov.py":true,"mil.py":true,"net.py":true,"org.py":true,"qa":true,"com.qa":true,"edu.qa":true,"gov.qa":true,"mil.qa":true,"name.qa":true,"net.qa":true,"org.qa":true,"sch.qa":true,"re":true,"asso.re":true,"com.re":true,"nom.re":true,"ro":true,"arts.ro":true,"com.ro":true,"firm.ro":true,"info.ro":true,"nom.ro":true,"nt.ro":true,"org.ro":true,"rec.ro":true,"store.ro":true,"tm.ro":true,"www.ro":true,"rs":true,"ac.rs":true,"co.rs":true,"edu.rs":true,"gov.rs":true,"in.rs":true,"org.rs":true,"ru":true,"ac.ru":true,"edu.ru":true,"gov.ru":true,"int.ru":true,"mil.ru":true,"test.ru":true,"rw":true,"gov.rw":true,"net.rw":true,"edu.rw":true,"ac.rw":true,"com.rw":true,"co.rw":true,"int.rw":true,"mil.rw":true,"gouv.rw":true,"sa":true,"com.sa":true,"net.sa":true,"org.sa":true,"gov.sa":true,"med.sa":true,"pub.sa":true,"edu.sa":true,"sch.sa":true,"sb":true,"com.sb":true,"edu.sb":true,"gov.sb":true,"net.sb":true,"org.sb":true,"sc":true,"com.sc":true,"gov.sc":true,"net.sc":true,"org.sc":true,"edu.sc":true,"sd":true,"com.sd":true,"net.sd":true,"org.sd":true,"edu.sd":true,"med.sd":true,"tv.sd":true,"gov.sd":true,"info.sd":true,"se":true,"a.se":true,"ac.se":true,"b.se":true,"bd.se":true,"brand.se":true,"c.se":true,"d.se":true,"e.se":true,"f.se":true,"fh.se":true,"fhsk.se":true,"fhv.se":true,"g.se":true,"h.se":true,"i.se":true,"k.se":true,"komforb.se":true,"kommunalforbund.se":true,"komvux.se":true,"l.se":true,"lanbib.se":true,"m.se":true,"n.se":true,"naturbruksgymn.se":true,"o.se":true,"org.se":true,"p.se":true,"parti.se":true,"pp.se":true,"press.se":true,"r.se":true,"s.se":true,"t.se":true,"tm.se":true,"u.se":true,"w.se":true,"x.se":true,"y.se":true,"z.se":true,"sg":true,"com.sg":true,"net.sg":true,"org.sg":true,"gov.sg":true,"edu.sg":true,"per.sg":true,"sh":true,"com.sh":true,"net.sh":true,"gov.sh":true,"org.sh":true,"mil.sh":true,"si":true,"sj":true,"sk":true,"sl":true,"com.sl":true,"net.sl":true,"edu.sl":true,"gov.sl":true,"org.sl":true,"sm":true,"sn":true,"art.sn":true,"com.sn":true,"edu.sn":true,"gouv.sn":true,"org.sn":true,"perso.sn":true,"univ.sn":true,"so":true,"com.so":true,"net.so":true,"org.so":true,"sr":true,"st":true,"co.st":true,"com.st":true,"consulado.st":true,"edu.st":true,"embaixada.st":true,"gov.st":true,"mil.st":true,"net.st":true,"org.st":true,"principe.st":true,"saotome.st":true,"store.st":true,"su":true,"sv":true,"com.sv":true,"edu.sv":true,"gob.sv":true,"org.sv":true,"red.sv":true,"sx":true,"gov.sx":true,"sy":true,"edu.sy":true,"gov.sy":true,"net.sy":true,"mil.sy":true,"com.sy":true,"org.sy":true,"sz":true,"co.sz":true,"ac.sz":true,"org.sz":true,"tc":true,"td":true,"tel":true,"tf":true,"tg":true,"th":true,"ac.th":true,"co.th":true,"go.th":true,"in.th":true,"mi.th":true,"net.th":true,"or.th":true,"tj":true,"ac.tj":true,"biz.tj":true,"co.tj":true,"com.tj":true,"edu.tj":true,"go.tj":true,"gov.tj":true,"int.tj":true,"mil.tj":true,"name.tj":true,"net.tj":true,"nic.tj":true,"org.tj":true,"test.tj":true,"web.tj":true,"tk":true,"tl":true,"gov.tl":true,"tm":true,"com.tm":true,"co.tm":true,"org.tm":true,"net.tm":true,"nom.tm":true,"gov.tm":true,"mil.tm":true,"edu.tm":true,"tn":true,"com.tn":true,"ens.tn":true,"fin.tn":true,"gov.tn":true,"ind.tn":true,"intl.tn":true,"nat.tn":true,"net.tn":true,"org.tn":true,"info.tn":true,"perso.tn":true,"tourism.tn":true,"edunet.tn":true,"rnrt.tn":true,"rns.tn":true,"rnu.tn":true,"mincom.tn":true,"agrinet.tn":true,"defense.tn":true,"turen.tn":true,"to":true,"com.to":true,"gov.to":true,"net.to":true,"org.to":true,"edu.to":true,"mil.to":true,"tr":true,"com.tr":true,"info.tr":true,"biz.tr":true,"net.tr":true,"org.tr":true,"web.tr":true,"gen.tr":true,"tv.tr":true,"av.tr":true,"dr.tr":true,"bbs.tr":true,"name.tr":true,"tel.tr":true,"gov.tr":true,"bel.tr":true,"pol.tr":true,"mil.tr":true,"k12.tr":true,"edu.tr":true,"kep.tr":true,"nc.tr":true,"gov.nc.tr":true,"travel":true,"tt":true,"co.tt":true,"com.tt":true,"org.tt":true,"net.tt":true,"biz.tt":true,"info.tt":true,"pro.tt":true,"int.tt":true,"coop.tt":true,"jobs.tt":true,"mobi.tt":true,"travel.tt":true,"museum.tt":true,"aero.tt":true,"name.tt":true,"gov.tt":true,"edu.tt":true,"tv":true,"tw":true,"edu.tw":true,"gov.tw":true,"mil.tw":true,"com.tw":true,"net.tw":true,"org.tw":true,"idv.tw":true,"game.tw":true,"ebiz.tw":true,"club.tw":true,"xn--zf0ao64a.tw":true,"xn--uc0atv.tw":true,"xn--czrw28b.tw":true,"tz":true,"ac.tz":true,"co.tz":true,"go.tz":true,"hotel.tz":true,"info.tz":true,"me.tz":true,"mil.tz":true,"mobi.tz":true,"ne.tz":true,"or.tz":true,"sc.tz":true,"tv.tz":true,"ua":true,"com.ua":true,"edu.ua":true,"gov.ua":true,"in.ua":true,"net.ua":true,"org.ua":true,"cherkassy.ua":true,"cherkasy.ua":true,"chernigov.ua":true,"chernihiv.ua":true,"chernivtsi.ua":true,"chernovtsy.ua":true,"ck.ua":true,"cn.ua":true,"cr.ua":true,"crimea.ua":true,"cv.ua":true,"dn.ua":true,"dnepropetrovsk.ua":true,"dnipropetrovsk.ua":true,"dominic.ua":true,"donetsk.ua":true,"dp.ua":true,"if.ua":true,"ivano-frankivsk.ua":true,"kh.ua":true,"kharkiv.ua":true,"kharkov.ua":true,"kherson.ua":true,"khmelnitskiy.ua":true,"khmelnytskyi.ua":true,"kiev.ua":true,"kirovograd.ua":true,"km.ua":true,"kr.ua":true,"krym.ua":true,"ks.ua":true,"kv.ua":true,"kyiv.ua":true,"lg.ua":true,"lt.ua":true,"lugansk.ua":true,"lutsk.ua":true,"lv.ua":true,"lviv.ua":true,"mk.ua":true,"mykolaiv.ua":true,"nikolaev.ua":true,"od.ua":true,"odesa.ua":true,"odessa.ua":true,"pl.ua":true,"poltava.ua":true,"rivne.ua":true,"rovno.ua":true,"rv.ua":true,"sb.ua":true,"sebastopol.ua":true,"sevastopol.ua":true,"sm.ua":true,"sumy.ua":true,"te.ua":true,"ternopil.ua":true,"uz.ua":true,"uzhgorod.ua":true,"vinnica.ua":true,"vinnytsia.ua":true,"vn.ua":true,"volyn.ua":true,"yalta.ua":true,"zaporizhzhe.ua":true,"zaporizhzhia.ua":true,"zhitomir.ua":true,"zhytomyr.ua":true,"zp.ua":true,"zt.ua":true,"ug":true,"co.ug":true,"or.ug":true,"ac.ug":true,"sc.ug":true,"go.ug":true,"ne.ug":true,"com.ug":true,"org.ug":true,"uk":true,"ac.uk":true,"co.uk":true,"gov.uk":true,"ltd.uk":true,"me.uk":true,"net.uk":true,"nhs.uk":true,"org.uk":true,"plc.uk":true,"police.uk":true,"*.sch.uk":true,"us":true,"dni.us":true,"fed.us":true,"isa.us":true,"kids.us":true,"nsn.us":true,"ak.us":true,"al.us":true,"ar.us":true,"as.us":true,"az.us":true,"ca.us":true,"co.us":true,"ct.us":true,"dc.us":true,"de.us":true,"fl.us":true,"ga.us":true,"gu.us":true,"hi.us":true,"ia.us":true,"id.us":true,"il.us":true,"in.us":true,"ks.us":true,"ky.us":true,"la.us":true,"ma.us":true,"md.us":true,"me.us":true,"mi.us":true,"mn.us":true,"mo.us":true,"ms.us":true,"mt.us":true,"nc.us":true,"nd.us":true,"ne.us":true,"nh.us":true,"nj.us":true,"nm.us":true,"nv.us":true,"ny.us":true,"oh.us":true,"ok.us":true,"or.us":true,"pa.us":true,"pr.us":true,"ri.us":true,"sc.us":true,"sd.us":true,"tn.us":true,"tx.us":true,"ut.us":true,"vi.us":true,"vt.us":true,"va.us":true,"wa.us":true,"wi.us":true,"wv.us":true,"wy.us":true,"k12.ak.us":true,"k12.al.us":true,"k12.ar.us":true,"k12.as.us":true,"k12.az.us":true,"k12.ca.us":true,"k12.co.us":true,"k12.ct.us":true,"k12.dc.us":true,"k12.de.us":true,"k12.fl.us":true,"k12.ga.us":true,"k12.gu.us":true,"k12.ia.us":true,"k12.id.us":true,"k12.il.us":true,"k12.in.us":true,"k12.ks.us":true,"k12.ky.us":true,"k12.la.us":true,"k12.ma.us":true,"k12.md.us":true,"k12.me.us":true,"k12.mi.us":true,"k12.mn.us":true,"k12.mo.us":true,"k12.ms.us":true,"k12.mt.us":true,"k12.nc.us":true,"k12.ne.us":true,"k12.nh.us":true,"k12.nj.us":true,"k12.nm.us":true,"k12.nv.us":true,"k12.ny.us":true,"k12.oh.us":true,"k12.ok.us":true,"k12.or.us":true,"k12.pa.us":true,"k12.pr.us":true,"k12.ri.us":true,"k12.sc.us":true,"k12.tn.us":true,"k12.tx.us":true,"k12.ut.us":true,"k12.vi.us":true,"k12.vt.us":true,"k12.va.us":true,"k12.wa.us":true,"k12.wi.us":true,"k12.wy.us":true,"cc.ak.us":true,"cc.al.us":true,"cc.ar.us":true,"cc.as.us":true,"cc.az.us":true,"cc.ca.us":true,"cc.co.us":true,"cc.ct.us":true,"cc.dc.us":true,"cc.de.us":true,"cc.fl.us":true,"cc.ga.us":true,"cc.gu.us":true,"cc.hi.us":true,"cc.ia.us":true,"cc.id.us":true,"cc.il.us":true,"cc.in.us":true,"cc.ks.us":true,"cc.ky.us":true,"cc.la.us":true,"cc.ma.us":true,"cc.md.us":true,"cc.me.us":true,"cc.mi.us":true,"cc.mn.us":true,"cc.mo.us":true,"cc.ms.us":true,"cc.mt.us":true,"cc.nc.us":true,"cc.nd.us":true,"cc.ne.us":true,"cc.nh.us":true,"cc.nj.us":true,"cc.nm.us":true,"cc.nv.us":true,"cc.ny.us":true,"cc.oh.us":true,"cc.ok.us":true,"cc.or.us":true,"cc.pa.us":true,"cc.pr.us":true,"cc.ri.us":true,"cc.sc.us":true,"cc.sd.us":true,"cc.tn.us":true,"cc.tx.us":true,"cc.ut.us":true,"cc.vi.us":true,"cc.vt.us":true,"cc.va.us":true,"cc.wa.us":true,"cc.wi.us":true,"cc.wv.us":true,"cc.wy.us":true,"lib.ak.us":true,"lib.al.us":true,"lib.ar.us":true,"lib.as.us":true,"lib.az.us":true,"lib.ca.us":true,"lib.co.us":true,"lib.ct.us":true,"lib.dc.us":true,"lib.fl.us":true,"lib.ga.us":true,"lib.gu.us":true,"lib.hi.us":true,"lib.ia.us":true,"lib.id.us":true,"lib.il.us":true,"lib.in.us":true,"lib.ks.us":true,"lib.ky.us":true,"lib.la.us":true,"lib.ma.us":true,"lib.md.us":true,"lib.me.us":true,"lib.mi.us":true,"lib.mn.us":true,"lib.mo.us":true,"lib.ms.us":true,"lib.mt.us":true,"lib.nc.us":true,"lib.nd.us":true,"lib.ne.us":true,"lib.nh.us":true,"lib.nj.us":true,"lib.nm.us":true,"lib.nv.us":true,"lib.ny.us":true,"lib.oh.us":true,"lib.ok.us":true,"lib.or.us":true,"lib.pa.us":true,"lib.pr.us":true,"lib.ri.us":true,"lib.sc.us":true,"lib.sd.us":true,"lib.tn.us":true,"lib.tx.us":true,"lib.ut.us":true,"lib.vi.us":true,"lib.vt.us":true,"lib.va.us":true,"lib.wa.us":true,"lib.wi.us":true,"lib.wy.us":true,"pvt.k12.ma.us":true,"chtr.k12.ma.us":true,"paroch.k12.ma.us":true,"ann-arbor.mi.us":true,"cog.mi.us":true,"dst.mi.us":true,"eaton.mi.us":true,"gen.mi.us":true,"mus.mi.us":true,"tec.mi.us":true,"washtenaw.mi.us":true,"uy":true,"com.uy":true,"edu.uy":true,"gub.uy":true,"mil.uy":true,"net.uy":true,"org.uy":true,"uz":true,"co.uz":true,"com.uz":true,"net.uz":true,"org.uz":true,"va":true,"vc":true,"com.vc":true,"net.vc":true,"org.vc":true,"gov.vc":true,"mil.vc":true,"edu.vc":true,"ve":true,"arts.ve":true,"co.ve":true,"com.ve":true,"e12.ve":true,"edu.ve":true,"firm.ve":true,"gob.ve":true,"gov.ve":true,"info.ve":true,"int.ve":true,"mil.ve":true,"net.ve":true,"org.ve":true,"rec.ve":true,"store.ve":true,"tec.ve":true,"web.ve":true,"vg":true,"vi":true,"co.vi":true,"com.vi":true,"k12.vi":true,"net.vi":true,"org.vi":true,"vn":true,"com.vn":true,"net.vn":true,"org.vn":true,"edu.vn":true,"gov.vn":true,"int.vn":true,"ac.vn":true,"biz.vn":true,"info.vn":true,"name.vn":true,"pro.vn":true,"health.vn":true,"vu":true,"com.vu":true,"edu.vu":true,"net.vu":true,"org.vu":true,"wf":true,"ws":true,"com.ws":true,"net.ws":true,"org.ws":true,"gov.ws":true,"edu.ws":true,"yt":true,"xn--mgbaam7a8h":true,"xn--y9a3aq":true,"xn--54b7fta0cc":true,"xn--90ae":true,"xn--90ais":true,"xn--fiqs8s":true,"xn--fiqz9s":true,"xn--lgbbat1ad8j":true,"xn--wgbh1c":true,"xn--e1a4c":true,"xn--node":true,"xn--qxam":true,"xn--j6w193g":true,"xn--2scrj9c":true,"xn--3hcrj9c":true,"xn--45br5cyl":true,"xn--h2breg3eve":true,"xn--h2brj9c8c":true,"xn--mgbgu82a":true,"xn--rvc1e0am3e":true,"xn--h2brj9c":true,"xn--mgbbh1a71e":true,"xn--fpcrj9c3d":true,"xn--gecrj9c":true,"xn--s9brj9c":true,"xn--45brj9c":true,"xn--xkc2dl3a5ee0h":true,"xn--mgba3a4f16a":true,"xn--mgba3a4fra":true,"xn--mgbtx2b":true,"xn--mgbayh7gpa":true,"xn--3e0b707e":true,"xn--80ao21a":true,"xn--fzc2c9e2c":true,"xn--xkc2al3hye2a":true,"xn--mgbc0a9azcg":true,"xn--d1alf":true,"xn--l1acc":true,"xn--mix891f":true,"xn--mix082f":true,"xn--mgbx4cd0ab":true,"xn--mgb9awbf":true,"xn--mgbai9azgqp6j":true,"xn--mgbai9a5eva00b":true,"xn--ygbi2ammx":true,"xn--90a3ac":true,"xn--o1ac.xn--90a3ac":true,"xn--c1avg.xn--90a3ac":true,"xn--90azh.xn--90a3ac":true,"xn--d1at.xn--90a3ac":true,"xn--o1ach.xn--90a3ac":true,"xn--80au.xn--90a3ac":true,"xn--p1ai":true,"xn--wgbl6a":true,"xn--mgberp4a5d4ar":true,"xn--mgberp4a5d4a87g":true,"xn--mgbqly7c0a67fbc":true,"xn--mgbqly7cvafr":true,"xn--mgbpl2fh":true,"xn--yfro4i67o":true,"xn--clchc0ea0b2g2a9gcd":true,"xn--ogbpf8fl":true,"xn--mgbtf8fl":true,"xn--o3cw4h":true,"xn--12c1fe0br.xn--o3cw4h":true,"xn--12co0c3b4eva.xn--o3cw4h":true,"xn--h3cuzk1di.xn--o3cw4h":true,"xn--o3cyx2a.xn--o3cw4h":true,"xn--m3ch0j3a.xn--o3cw4h":true,"xn--12cfi8ixb8l.xn--o3cw4h":true,"xn--pgbs0dh":true,"xn--kpry57d":true,"xn--kprw13d":true,"xn--nnx388a":true,"xn--j1amh":true,"xn--mgb2ddes":true,"xxx":true,"*.ye":true,"ac.za":true,"agric.za":true,"alt.za":true,"co.za":true,"edu.za":true,"gov.za":true,"grondar.za":true,"law.za":true,"mil.za":true,"net.za":true,"ngo.za":true,"nis.za":true,"nom.za":true,"org.za":true,"school.za":true,"tm.za":true,"web.za":true,"zm":true,"ac.zm":true,"biz.zm":true,"co.zm":true,"com.zm":true,"edu.zm":true,"gov.zm":true,"info.zm":true,"mil.zm":true,"net.zm":true,"org.zm":true,"sch.zm":true,"zw":true,"ac.zw":true,"co.zw":true,"gov.zw":true,"mil.zw":true,"org.zw":true,"aaa":true,"aarp":true,"abarth":true,"abb":true,"abbott":true,"abbvie":true,"abc":true,"able":true,"abogado":true,"abudhabi":true,"academy":true,"accenture":true,"accountant":true,"accountants":true,"aco":true,"active":true,"actor":true,"adac":true,"ads":true,"adult":true,"aeg":true,"aetna":true,"afamilycompany":true,"afl":true,"africa":true,"agakhan":true,"agency":true,"aig":true,"aigo":true,"airbus":true,"airforce":true,"airtel":true,"akdn":true,"alfaromeo":true,"alibaba":true,"alipay":true,"allfinanz":true,"allstate":true,"ally":true,"alsace":true,"alstom":true,"americanexpress":true,"americanfamily":true,"amex":true,"amfam":true,"amica":true,"amsterdam":true,"analytics":true,"android":true,"anquan":true,"anz":true,"aol":true,"apartments":true,"app":true,"apple":true,"aquarelle":true,"arab":true,"aramco":true,"archi":true,"army":true,"art":true,"arte":true,"asda":true,"associates":true,"athleta":true,"attorney":true,"auction":true,"audi":true,"audible":true,"audio":true,"auspost":true,"author":true,"auto":true,"autos":true,"avianca":true,"aws":true,"axa":true,"azure":true,"baby":true,"baidu":true,"banamex":true,"bananarepublic":true,"band":true,"bank":true,"bar":true,"barcelona":true,"barclaycard":true,"barclays":true,"barefoot":true,"bargains":true,"baseball":true,"basketball":true,"bauhaus":true,"bayern":true,"bbc":true,"bbt":true,"bbva":true,"bcg":true,"bcn":true,"beats":true,"beauty":true,"beer":true,"bentley":true,"berlin":true,"best":true,"bestbuy":true,"bet":true,"bharti":true,"bible":true,"bid":true,"bike":true,"bing":true,"bingo":true,"bio":true,"black":true,"blackfriday":true,"blanco":true,"blockbuster":true,"blog":true,"bloomberg":true,"blue":true,"bms":true,"bmw":true,"bnl":true,"bnpparibas":true,"boats":true,"boehringer":true,"bofa":true,"bom":true,"bond":true,"boo":true,"book":true,"booking":true,"boots":true,"bosch":true,"bostik":true,"boston":true,"bot":true,"boutique":true,"box":true,"bradesco":true,"bridgestone":true,"broadway":true,"broker":true,"brother":true,"brussels":true,"budapest":true,"bugatti":true,"build":true,"builders":true,"business":true,"buy":true,"buzz":true,"bzh":true,"cab":true,"cafe":true,"cal":true,"call":true,"calvinklein":true,"cam":true,"camera":true,"camp":true,"cancerresearch":true,"canon":true,"capetown":true,"capital":true,"capitalone":true,"car":true,"caravan":true,"cards":true,"care":true,"career":true,"careers":true,"cars":true,"cartier":true,"casa":true,"case":true,"caseih":true,"cash":true,"casino":true,"catering":true,"catholic":true,"cba":true,"cbn":true,"cbre":true,"cbs":true,"ceb":true,"center":true,"ceo":true,"cern":true,"cfa":true,"cfd":true,"chanel":true,"channel":true,"chase":true,"chat":true,"cheap":true,"chintai":true,"christmas":true,"chrome":true,"chrysler":true,"church":true,"cipriani":true,"circle":true,"cisco":true,"citadel":true,"citi":true,"citic":true,"city":true,"cityeats":true,"claims":true,"cleaning":true,"click":true,"clinic":true,"clinique":true,"clothing":true,"cloud":true,"club":true,"clubmed":true,"coach":true,"codes":true,"coffee":true,"college":true,"cologne":true,"comcast":true,"commbank":true,"community":true,"company":true,"compare":true,"computer":true,"comsec":true,"condos":true,"construction":true,"consulting":true,"contact":true,"contractors":true,"cooking":true,"cookingchannel":true,"cool":true,"corsica":true,"country":true,"coupon":true,"coupons":true,"courses":true,"credit":true,"creditcard":true,"creditunion":true,"cricket":true,"crown":true,"crs":true,"cruise":true,"cruises":true,"csc":true,"cuisinella":true,"cymru":true,"cyou":true,"dabur":true,"dad":true,"dance":true,"data":true,"date":true,"dating":true,"datsun":true,"day":true,"dclk":true,"dds":true,"deal":true,"dealer":true,"deals":true,"degree":true,"delivery":true,"dell":true,"deloitte":true,"delta":true,"democrat":true,"dental":true,"dentist":true,"desi":true,"design":true,"dev":true,"dhl":true,"diamonds":true,"diet":true,"digital":true,"direct":true,"directory":true,"discount":true,"discover":true,"dish":true,"diy":true,"dnp":true,"docs":true,"doctor":true,"dodge":true,"dog":true,"doha":true,"domains":true,"dot":true,"download":true,"drive":true,"dtv":true,"dubai":true,"duck":true,"dunlop":true,"duns":true,"dupont":true,"durban":true,"dvag":true,"dvr":true,"earth":true,"eat":true,"eco":true,"edeka":true,"education":true,"email":true,"emerck":true,"energy":true,"engineer":true,"engineering":true,"enterprises":true,"epost":true,"epson":true,"equipment":true,"ericsson":true,"erni":true,"esq":true,"estate":true,"esurance":true,"etisalat":true,"eurovision":true,"eus":true,"events":true,"everbank":true,"exchange":true,"expert":true,"exposed":true,"express":true,"extraspace":true,"fage":true,"fail":true,"fairwinds":true,"faith":true,"family":true,"fan":true,"fans":true,"farm":true,"farmers":true,"fashion":true,"fast":true,"fedex":true,"feedback":true,"ferrari":true,"ferrero":true,"fiat":true,"fidelity":true,"fido":true,"film":true,"final":true,"finance":true,"financial":true,"fire":true,"firestone":true,"firmdale":true,"fish":true,"fishing":true,"fit":true,"fitness":true,"flickr":true,"flights":true,"flir":true,"florist":true,"flowers":true,"fly":true,"foo":true,"food":true,"foodnetwork":true,"football":true,"ford":true,"forex":true,"forsale":true,"forum":true,"foundation":true,"fox":true,"free":true,"fresenius":true,"frl":true,"frogans":true,"frontdoor":true,"frontier":true,"ftr":true,"fujitsu":true,"fujixerox":true,"fun":true,"fund":true,"furniture":true,"futbol":true,"fyi":true,"gal":true,"gallery":true,"gallo":true,"gallup":true,"game":true,"games":true,"gap":true,"garden":true,"gbiz":true,"gdn":true,"gea":true,"gent":true,"genting":true,"george":true,"ggee":true,"gift":true,"gifts":true,"gives":true,"giving":true,"glade":true,"glass":true,"gle":true,"global":true,"globo":true,"gmail":true,"gmbh":true,"gmo":true,"gmx":true,"godaddy":true,"gold":true,"goldpoint":true,"golf":true,"goo":true,"goodhands":true,"goodyear":true,"goog":true,"google":true,"gop":true,"got":true,"grainger":true,"graphics":true,"gratis":true,"green":true,"gripe":true,"grocery":true,"group":true,"guardian":true,"gucci":true,"guge":true,"guide":true,"guitars":true,"guru":true,"hair":true,"hamburg":true,"hangout":true,"haus":true,"hbo":true,"hdfc":true,"hdfcbank":true,"health":true,"healthcare":true,"help":true,"helsinki":true,"here":true,"hermes":true,"hgtv":true,"hiphop":true,"hisamitsu":true,"hitachi":true,"hiv":true,"hkt":true,"hockey":true,"holdings":true,"holiday":true,"homedepot":true,"homegoods":true,"homes":true,"homesense":true,"honda":true,"honeywell":true,"horse":true,"hospital":true,"host":true,"hosting":true,"hot":true,"hoteles":true,"hotels":true,"hotmail":true,"house":true,"how":true,"hsbc":true,"hughes":true,"hyatt":true,"hyundai":true,"ibm":true,"icbc":true,"ice":true,"icu":true,"ieee":true,"ifm":true,"ikano":true,"imamat":true,"imdb":true,"immo":true,"immobilien":true,"industries":true,"infiniti":true,"ing":true,"ink":true,"institute":true,"insurance":true,"insure":true,"intel":true,"international":true,"intuit":true,"investments":true,"ipiranga":true,"irish":true,"iselect":true,"ismaili":true,"ist":true,"istanbul":true,"itau":true,"itv":true,"iveco":true,"iwc":true,"jaguar":true,"java":true,"jcb":true,"jcp":true,"jeep":true,"jetzt":true,"jewelry":true,"jio":true,"jlc":true,"jll":true,"jmp":true,"jnj":true,"joburg":true,"jot":true,"joy":true,"jpmorgan":true,"jprs":true,"juegos":true,"juniper":true,"kaufen":true,"kddi":true,"kerryhotels":true,"kerrylogistics":true,"kerryproperties":true,"kfh":true,"kia":true,"kim":true,"kinder":true,"kindle":true,"kitchen":true,"kiwi":true,"koeln":true,"komatsu":true,"kosher":true,"kpmg":true,"kpn":true,"krd":true,"kred":true,"kuokgroup":true,"kyoto":true,"lacaixa":true,"ladbrokes":true,"lamborghini":true,"lamer":true,"lancaster":true,"lancia":true,"lancome":true,"land":true,"landrover":true,"lanxess":true,"lasalle":true,"lat":true,"latino":true,"latrobe":true,"law":true,"lawyer":true,"lds":true,"lease":true,"leclerc":true,"lefrak":true,"legal":true,"lego":true,"lexus":true,"lgbt":true,"liaison":true,"lidl":true,"life":true,"lifeinsurance":true,"lifestyle":true,"lighting":true,"like":true,"lilly":true,"limited":true,"limo":true,"lincoln":true,"linde":true,"link":true,"lipsy":true,"live":true,"living":true,"lixil":true,"loan":true,"loans":true,"locker":true,"locus":true,"loft":true,"lol":true,"london":true,"lotte":true,"lotto":true,"love":true,"lpl":true,"lplfinancial":true,"ltd":true,"ltda":true,"lundbeck":true,"lupin":true,"luxe":true,"luxury":true,"macys":true,"madrid":true,"maif":true,"maison":true,"makeup":true,"man":true,"management":true,"mango":true,"map":true,"market":true,"marketing":true,"markets":true,"marriott":true,"marshalls":true,"maserati":true,"mattel":true,"mba":true,"mckinsey":true,"med":true,"media":true,"meet":true,"melbourne":true,"meme":true,"memorial":true,"men":true,"menu":true,"meo":true,"merckmsd":true,"metlife":true,"miami":true,"microsoft":true,"mini":true,"mint":true,"mit":true,"mitsubishi":true,"mlb":true,"mls":true,"mma":true,"mobile":true,"mobily":true,"moda":true,"moe":true,"moi":true,"mom":true,"monash":true,"money":true,"monster":true,"mopar":true,"mormon":true,"mortgage":true,"moscow":true,"moto":true,"motorcycles":true,"mov":true,"movie":true,"movistar":true,"msd":true,"mtn":true,"mtpc":true,"mtr":true,"mutual":true,"nab":true,"nadex":true,"nagoya":true,"nationwide":true,"natura":true,"navy":true,"nba":true,"nec":true,"netbank":true,"netflix":true,"network":true,"neustar":true,"new":true,"newholland":true,"news":true,"next":true,"nextdirect":true,"nexus":true,"nfl":true,"ngo":true,"nhk":true,"nico":true,"nike":true,"nikon":true,"ninja":true,"nissan":true,"nissay":true,"nokia":true,"northwesternmutual":true,"norton":true,"now":true,"nowruz":true,"nowtv":true,"nra":true,"nrw":true,"ntt":true,"nyc":true,"obi":true,"observer":true,"off":true,"office":true,"okinawa":true,"olayan":true,"olayangroup":true,"oldnavy":true,"ollo":true,"omega":true,"one":true,"ong":true,"onl":true,"online":true,"onyourside":true,"ooo":true,"open":true,"oracle":true,"orange":true,"organic":true,"origins":true,"osaka":true,"otsuka":true,"ott":true,"ovh":true,"page":true,"panasonic":true,"panerai":true,"paris":true,"pars":true,"partners":true,"parts":true,"party":true,"passagens":true,"pay":true,"pccw":true,"pet":true,"pfizer":true,"pharmacy":true,"phd":true,"philips":true,"phone":true,"photo":true,"photography":true,"photos":true,"physio":true,"piaget":true,"pics":true,"pictet":true,"pictures":true,"pid":true,"pin":true,"ping":true,"pink":true,"pioneer":true,"pizza":true,"place":true,"play":true,"playstation":true,"plumbing":true,"plus":true,"pnc":true,"pohl":true,"poker":true,"politie":true,"porn":true,"pramerica":true,"praxi":true,"press":true,"prime":true,"prod":true,"productions":true,"prof":true,"progressive":true,"promo":true,"properties":true,"property":true,"protection":true,"pru":true,"prudential":true,"pub":true,"pwc":true,"qpon":true,"quebec":true,"quest":true,"qvc":true,"racing":true,"radio":true,"raid":true,"read":true,"realestate":true,"realtor":true,"realty":true,"recipes":true,"red":true,"redstone":true,"redumbrella":true,"rehab":true,"reise":true,"reisen":true,"reit":true,"reliance":true,"ren":true,"rent":true,"rentals":true,"repair":true,"report":true,"republican":true,"rest":true,"restaurant":true,"review":true,"reviews":true,"rexroth":true,"rich":true,"richardli":true,"ricoh":true,"rightathome":true,"ril":true,"rio":true,"rip":true,"rmit":true,"rocher":true,"rocks":true,"rodeo":true,"rogers":true,"room":true,"rsvp":true,"rugby":true,"ruhr":true,"run":true,"rwe":true,"ryukyu":true,"saarland":true,"safe":true,"safety":true,"sakura":true,"sale":true,"salon":true,"samsclub":true,"samsung":true,"sandvik":true,"sandvikcoromant":true,"sanofi":true,"sap":true,"sapo":true,"sarl":true,"sas":true,"save":true,"saxo":true,"sbi":true,"sbs":true,"sca":true,"scb":true,"schaeffler":true,"schmidt":true,"scholarships":true,"school":true,"schule":true,"schwarz":true,"science":true,"scjohnson":true,"scor":true,"scot":true,"search":true,"seat":true,"secure":true,"security":true,"seek":true,"select":true,"sener":true,"services":true,"ses":true,"seven":true,"sew":true,"sex":true,"sexy":true,"sfr":true,"shangrila":true,"sharp":true,"shaw":true,"shell":true,"shia":true,"shiksha":true,"shoes":true,"shop":true,"shopping":true,"shouji":true,"show":true,"showtime":true,"shriram":true,"silk":true,"sina":true,"singles":true,"site":true,"ski":true,"skin":true,"sky":true,"skype":true,"sling":true,"smart":true,"smile":true,"sncf":true,"soccer":true,"social":true,"softbank":true,"software":true,"sohu":true,"solar":true,"solutions":true,"song":true,"sony":true,"soy":true,"space":true,"spiegel":true,"spot":true,"spreadbetting":true,"srl":true,"srt":true,"stada":true,"staples":true,"star":true,"starhub":true,"statebank":true,"statefarm":true,"statoil":true,"stc":true,"stcgroup":true,"stockholm":true,"storage":true,"store":true,"stream":true,"studio":true,"study":true,"style":true,"sucks":true,"supplies":true,"supply":true,"support":true,"surf":true,"surgery":true,"suzuki":true,"swatch":true,"swiftcover":true,"swiss":true,"sydney":true,"symantec":true,"systems":true,"tab":true,"taipei":true,"talk":true,"taobao":true,"target":true,"tatamotors":true,"tatar":true,"tattoo":true,"tax":true,"taxi":true,"tci":true,"tdk":true,"team":true,"tech":true,"technology":true,"telecity":true,"telefonica":true,"temasek":true,"tennis":true,"teva":true,"thd":true,"theater":true,"theatre":true,"tiaa":true,"tickets":true,"tienda":true,"tiffany":true,"tips":true,"tires":true,"tirol":true,"tjmaxx":true,"tjx":true,"tkmaxx":true,"tmall":true,"today":true,"tokyo":true,"tools":true,"top":true,"toray":true,"toshiba":true,"total":true,"tours":true,"town":true,"toyota":true,"toys":true,"trade":true,"trading":true,"training":true,"travelchannel":true,"travelers":true,"travelersinsurance":true,"trust":true,"trv":true,"tube":true,"tui":true,"tunes":true,"tushu":true,"tvs":true,"ubank":true,"ubs":true,"uconnect":true,"unicom":true,"university":true,"uno":true,"uol":true,"ups":true,"vacations":true,"vana":true,"vanguard":true,"vegas":true,"ventures":true,"verisign":true,"versicherung":true,"vet":true,"viajes":true,"video":true,"vig":true,"viking":true,"villas":true,"vin":true,"vip":true,"virgin":true,"visa":true,"vision":true,"vista":true,"vistaprint":true,"viva":true,"vivo":true,"vlaanderen":true,"vodka":true,"volkswagen":true,"volvo":true,"vote":true,"voting":true,"voto":true,"voyage":true,"vuelos":true,"wales":true,"walmart":true,"walter":true,"wang":true,"wanggou":true,"warman":true,"watch":true,"watches":true,"weather":true,"weatherchannel":true,"webcam":true,"weber":true,"website":true,"wed":true,"wedding":true,"weibo":true,"weir":true,"whoswho":true,"wien":true,"wiki":true,"williamhill":true,"win":true,"windows":true,"wine":true,"winners":true,"wme":true,"wolterskluwer":true,"woodside":true,"work":true,"works":true,"world":true,"wow":true,"wtc":true,"wtf":true,"xbox":true,"xerox":true,"xfinity":true,"xihuan":true,"xin":true,"xn--11b4c3d":true,"xn--1ck2e1b":true,"xn--1qqw23a":true,"xn--30rr7y":true,"xn--3bst00m":true,"xn--3ds443g":true,"xn--3oq18vl8pn36a":true,"xn--3pxu8k":true,"xn--42c2d9a":true,"xn--45q11c":true,"xn--4gbrim":true,"xn--55qw42g":true,"xn--55qx5d":true,"xn--5su34j936bgsg":true,"xn--5tzm5g":true,"xn--6frz82g":true,"xn--6qq986b3xl":true,"xn--80adxhks":true,"xn--80aqecdr1a":true,"xn--80asehdb":true,"xn--80aswg":true,"xn--8y0a063a":true,"xn--9dbq2a":true,"xn--9et52u":true,"xn--9krt00a":true,"xn--b4w605ferd":true,"xn--bck1b9a5dre4c":true,"xn--c1avg":true,"xn--c2br7g":true,"xn--cck2b3b":true,"xn--cg4bki":true,"xn--czr694b":true,"xn--czrs0t":true,"xn--czru2d":true,"xn--d1acj3b":true,"xn--eckvdtc9d":true,"xn--efvy88h":true,"xn--estv75g":true,"xn--fct429k":true,"xn--fhbei":true,"xn--fiq228c5hs":true,"xn--fiq64b":true,"xn--fjq720a":true,"xn--flw351e":true,"xn--fzys8d69uvgm":true,"xn--g2xx48c":true,"xn--gckr3f0f":true,"xn--gk3at1e":true,"xn--hxt814e":true,"xn--i1b6b1a6a2e":true,"xn--imr513n":true,"xn--io0a7i":true,"xn--j1aef":true,"xn--jlq61u9w7b":true,"xn--jvr189m":true,"xn--kcrx77d1x4a":true,"xn--kpu716f":true,"xn--kput3i":true,"xn--mgba3a3ejt":true,"xn--mgba7c0bbn0a":true,"xn--mgbaakc7dvf":true,"xn--mgbab2bd":true,"xn--mgbb9fbpob":true,"xn--mgbca7dzdo":true,"xn--mgbi4ecexp":true,"xn--mgbt3dhd":true,"xn--mk1bu44c":true,"xn--mxtq1m":true,"xn--ngbc5azd":true,"xn--ngbe9e0a":true,"xn--ngbrx":true,"xn--nqv7f":true,"xn--nqv7fs00ema":true,"xn--nyqy26a":true,"xn--p1acf":true,"xn--pbt977c":true,"xn--pssy2u":true,"xn--q9jyb4c":true,"xn--qcka1pmc":true,"xn--rhqv96g":true,"xn--rovu88b":true,"xn--ses554g":true,"xn--t60b56a":true,"xn--tckwe":true,"xn--tiq49xqyj":true,"xn--unup4y":true,"xn--vermgensberater-ctb":true,"xn--vermgensberatung-pwb":true,"xn--vhquv":true,"xn--vuq861b":true,"xn--w4r85el8fhu5dnra":true,"xn--w4rs40l":true,"xn--xhq521b":true,"xn--zfr164b":true,"xperia":true,"xyz":true,"yachts":true,"yahoo":true,"yamaxun":true,"yandex":true,"yodobashi":true,"yoga":true,"yokohama":true,"you":true,"youtube":true,"yun":true,"zappos":true,"zara":true,"zero":true,"zip":true,"zippo":true,"zone":true,"zuerich":true,"cc.ua":true,"inf.ua":true,"ltd.ua":true,"1password.ca":true,"1password.com":true,"1password.eu":true,"beep.pl":true,"*.compute.estate":true,"*.alces.network":true,"alwaysdata.net":true,"cloudfront.net":true,"*.compute.amazonaws.com":true,"*.compute-1.amazonaws.com":true,"*.compute.amazonaws.com.cn":true,"us-east-1.amazonaws.com":true,"cn-north-1.eb.amazonaws.com.cn":true,"elasticbeanstalk.com":true,"ap-northeast-1.elasticbeanstalk.com":true,"ap-northeast-2.elasticbeanstalk.com":true,"ap-south-1.elasticbeanstalk.com":true,"ap-southeast-1.elasticbeanstalk.com":true,"ap-southeast-2.elasticbeanstalk.com":true,"ca-central-1.elasticbeanstalk.com":true,"eu-central-1.elasticbeanstalk.com":true,"eu-west-1.elasticbeanstalk.com":true,"eu-west-2.elasticbeanstalk.com":true,"eu-west-3.elasticbeanstalk.com":true,"sa-east-1.elasticbeanstalk.com":true,"us-east-1.elasticbeanstalk.com":true,"us-east-2.elasticbeanstalk.com":true,"us-gov-west-1.elasticbeanstalk.com":true,"us-west-1.elasticbeanstalk.com":true,"us-west-2.elasticbeanstalk.com":true,"*.elb.amazonaws.com":true,"*.elb.amazonaws.com.cn":true,"s3.amazonaws.com":true,"s3-ap-northeast-1.amazonaws.com":true,"s3-ap-northeast-2.amazonaws.com":true,"s3-ap-south-1.amazonaws.com":true,"s3-ap-southeast-1.amazonaws.com":true,"s3-ap-southeast-2.amazonaws.com":true,"s3-ca-central-1.amazonaws.com":true,"s3-eu-central-1.amazonaws.com":true,"s3-eu-west-1.amazonaws.com":true,"s3-eu-west-2.amazonaws.com":true,"s3-eu-west-3.amazonaws.com":true,"s3-external-1.amazonaws.com":true,"s3-fips-us-gov-west-1.amazonaws.com":true,"s3-sa-east-1.amazonaws.com":true,"s3-us-gov-west-1.amazonaws.com":true,"s3-us-east-2.amazonaws.com":true,"s3-us-west-1.amazonaws.com":true,"s3-us-west-2.amazonaws.com":true,"s3.ap-northeast-2.amazonaws.com":true,"s3.ap-south-1.amazonaws.com":true,"s3.cn-north-1.amazonaws.com.cn":true,"s3.ca-central-1.amazonaws.com":true,"s3.eu-central-1.amazonaws.com":true,"s3.eu-west-2.amazonaws.com":true,"s3.eu-west-3.amazonaws.com":true,"s3.us-east-2.amazonaws.com":true,"s3.dualstack.ap-northeast-1.amazonaws.com":true,"s3.dualstack.ap-northeast-2.amazonaws.com":true,"s3.dualstack.ap-south-1.amazonaws.com":true,"s3.dualstack.ap-southeast-1.amazonaws.com":true,"s3.dualstack.ap-southeast-2.amazonaws.com":true,"s3.dualstack.ca-central-1.amazonaws.com":true,"s3.dualstack.eu-central-1.amazonaws.com":true,"s3.dualstack.eu-west-1.amazonaws.com":true,"s3.dualstack.eu-west-2.amazonaws.com":true,"s3.dualstack.eu-west-3.amazonaws.com":true,"s3.dualstack.sa-east-1.amazonaws.com":true,"s3.dualstack.us-east-1.amazonaws.com":true,"s3.dualstack.us-east-2.amazonaws.com":true,"s3-website-us-east-1.amazonaws.com":true,"s3-website-us-west-1.amazonaws.com":true,"s3-website-us-west-2.amazonaws.com":true,"s3-website-ap-northeast-1.amazonaws.com":true,"s3-website-ap-southeast-1.amazonaws.com":true,"s3-website-ap-southeast-2.amazonaws.com":true,"s3-website-eu-west-1.amazonaws.com":true,"s3-website-sa-east-1.amazonaws.com":true,"s3-website.ap-northeast-2.amazonaws.com":true,"s3-website.ap-south-1.amazonaws.com":true,"s3-website.ca-central-1.amazonaws.com":true,"s3-website.eu-central-1.amazonaws.com":true,"s3-website.eu-west-2.amazonaws.com":true,"s3-website.eu-west-3.amazonaws.com":true,"s3-website.us-east-2.amazonaws.com":true,"t3l3p0rt.net":true,"tele.amune.org":true,"on-aptible.com":true,"user.party.eus":true,"pimienta.org":true,"poivron.org":true,"potager.org":true,"sweetpepper.org":true,"myasustor.com":true,"myfritz.net":true,"*.awdev.ca":true,"*.advisor.ws":true,"backplaneapp.io":true,"betainabox.com":true,"bnr.la":true,"boomla.net":true,"boxfuse.io":true,"square7.ch":true,"bplaced.com":true,"bplaced.de":true,"square7.de":true,"bplaced.net":true,"square7.net":true,"browsersafetymark.io":true,"mycd.eu":true,"ae.org":true,"ar.com":true,"br.com":true,"cn.com":true,"com.de":true,"com.se":true,"de.com":true,"eu.com":true,"gb.com":true,"gb.net":true,"hu.com":true,"hu.net":true,"jp.net":true,"jpn.com":true,"kr.com":true,"mex.com":true,"no.com":true,"qc.com":true,"ru.com":true,"sa.com":true,"se.com":true,"se.net":true,"uk.com":true,"uk.net":true,"us.com":true,"uy.com":true,"za.bz":true,"za.com":true,"africa.com":true,"gr.com":true,"in.net":true,"us.org":true,"co.com":true,"c.la":true,"certmgr.org":true,"xenapponazure.com":true,"virtueeldomein.nl":true,"c66.me":true,"cloud66.ws":true,"jdevcloud.com":true,"wpdevcloud.com":true,"cloudaccess.host":true,"freesite.host":true,"cloudaccess.net":true,"cloudcontrolled.com":true,"cloudcontrolapp.com":true,"co.ca":true,"co.cz":true,"c.cdn77.org":true,"cdn77-ssl.net":true,"r.cdn77.net":true,"rsc.cdn77.org":true,"ssl.origin.cdn77-secure.org":true,"cloudns.asia":true,"cloudns.biz":true,"cloudns.club":true,"cloudns.cc":true,"cloudns.eu":true,"cloudns.in":true,"cloudns.info":true,"cloudns.org":true,"cloudns.pro":true,"cloudns.pw":true,"cloudns.us":true,"co.nl":true,"co.no":true,"webhosting.be":true,"hosting-cluster.nl":true,"dyn.cosidns.de":true,"dynamisches-dns.de":true,"dnsupdater.de":true,"internet-dns.de":true,"l-o-g-i-n.de":true,"dynamic-dns.info":true,"feste-ip.net":true,"knx-server.net":true,"static-access.net":true,"realm.cz":true,"*.cryptonomic.net":true,"cupcake.is":true,"cyon.link":true,"cyon.site":true,"daplie.me":true,"localhost.daplie.me":true,"biz.dk":true,"co.dk":true,"firm.dk":true,"reg.dk":true,"store.dk":true,"debian.net":true,"dedyn.io":true,"dnshome.de":true,"drayddns.com":true,"dreamhosters.com":true,"mydrobo.com":true,"drud.io":true,"drud.us":true,"duckdns.org":true,"dy.fi":true,"tunk.org":true,"dyndns-at-home.com":true,"dyndns-at-work.com":true,"dyndns-blog.com":true,"dyndns-free.com":true,"dyndns-home.com":true,"dyndns-ip.com":true,"dyndns-mail.com":true,"dyndns-office.com":true,"dyndns-pics.com":true,"dyndns-remote.com":true,"dyndns-server.com":true,"dyndns-web.com":true,"dyndns-wiki.com":true,"dyndns-work.com":true,"dyndns.biz":true,"dyndns.info":true,"dyndns.org":true,"dyndns.tv":true,"at-band-camp.net":true,"ath.cx":true,"barrel-of-knowledge.info":true,"barrell-of-knowledge.info":true,"better-than.tv":true,"blogdns.com":true,"blogdns.net":true,"blogdns.org":true,"blogsite.org":true,"boldlygoingnowhere.org":true,"broke-it.net":true,"buyshouses.net":true,"cechire.com":true,"dnsalias.com":true,"dnsalias.net":true,"dnsalias.org":true,"dnsdojo.com":true,"dnsdojo.net":true,"dnsdojo.org":true,"does-it.net":true,"doesntexist.com":true,"doesntexist.org":true,"dontexist.com":true,"dontexist.net":true,"dontexist.org":true,"doomdns.com":true,"doomdns.org":true,"dvrdns.org":true,"dyn-o-saur.com":true,"dynalias.com":true,"dynalias.net":true,"dynalias.org":true,"dynathome.net":true,"dyndns.ws":true,"endofinternet.net":true,"endofinternet.org":true,"endoftheinternet.org":true,"est-a-la-maison.com":true,"est-a-la-masion.com":true,"est-le-patron.com":true,"est-mon-blogueur.com":true,"for-better.biz":true,"for-more.biz":true,"for-our.info":true,"for-some.biz":true,"for-the.biz":true,"forgot.her.name":true,"forgot.his.name":true,"from-ak.com":true,"from-al.com":true,"from-ar.com":true,"from-az.net":true,"from-ca.com":true,"from-co.net":true,"from-ct.com":true,"from-dc.com":true,"from-de.com":true,"from-fl.com":true,"from-ga.com":true,"from-hi.com":true,"from-ia.com":true,"from-id.com":true,"from-il.com":true,"from-in.com":true,"from-ks.com":true,"from-ky.com":true,"from-la.net":true,"from-ma.com":true,"from-md.com":true,"from-me.org":true,"from-mi.com":true,"from-mn.com":true,"from-mo.com":true,"from-ms.com":true,"from-mt.com":true,"from-nc.com":true,"from-nd.com":true,"from-ne.com":true,"from-nh.com":true,"from-nj.com":true,"from-nm.com":true,"from-nv.com":true,"from-ny.net":true,"from-oh.com":true,"from-ok.com":true,"from-or.com":true,"from-pa.com":true,"from-pr.com":true,"from-ri.com":true,"from-sc.com":true,"from-sd.com":true,"from-tn.com":true,"from-tx.com":true,"from-ut.com":true,"from-va.com":true,"from-vt.com":true,"from-wa.com":true,"from-wi.com":true,"from-wv.com":true,"from-wy.com":true,"ftpaccess.cc":true,"fuettertdasnetz.de":true,"game-host.org":true,"game-server.cc":true,"getmyip.com":true,"gets-it.net":true,"go.dyndns.org":true,"gotdns.com":true,"gotdns.org":true,"groks-the.info":true,"groks-this.info":true,"ham-radio-op.net":true,"here-for-more.info":true,"hobby-site.com":true,"hobby-site.org":true,"home.dyndns.org":true,"homedns.org":true,"homeftp.net":true,"homeftp.org":true,"homeip.net":true,"homelinux.com":true,"homelinux.net":true,"homelinux.org":true,"homeunix.com":true,"homeunix.net":true,"homeunix.org":true,"iamallama.com":true,"in-the-band.net":true,"is-a-anarchist.com":true,"is-a-blogger.com":true,"is-a-bookkeeper.com":true,"is-a-bruinsfan.org":true,"is-a-bulls-fan.com":true,"is-a-candidate.org":true,"is-a-caterer.com":true,"is-a-celticsfan.org":true,"is-a-chef.com":true,"is-a-chef.net":true,"is-a-chef.org":true,"is-a-conservative.com":true,"is-a-cpa.com":true,"is-a-cubicle-slave.com":true,"is-a-democrat.com":true,"is-a-designer.com":true,"is-a-doctor.com":true,"is-a-financialadvisor.com":true,"is-a-geek.com":true,"is-a-geek.net":true,"is-a-geek.org":true,"is-a-green.com":true,"is-a-guru.com":true,"is-a-hard-worker.com":true,"is-a-hunter.com":true,"is-a-knight.org":true,"is-a-landscaper.com":true,"is-a-lawyer.com":true,"is-a-liberal.com":true,"is-a-libertarian.com":true,"is-a-linux-user.org":true,"is-a-llama.com":true,"is-a-musician.com":true,"is-a-nascarfan.com":true,"is-a-nurse.com":true,"is-a-painter.com":true,"is-a-patsfan.org":true,"is-a-personaltrainer.com":true,"is-a-photographer.com":true,"is-a-player.com":true,"is-a-republican.com":true,"is-a-rockstar.com":true,"is-a-socialist.com":true,"is-a-soxfan.org":true,"is-a-student.com":true,"is-a-teacher.com":true,"is-a-techie.com":true,"is-a-therapist.com":true,"is-an-accountant.com":true,"is-an-actor.com":true,"is-an-actress.com":true,"is-an-anarchist.com":true,"is-an-artist.com":true,"is-an-engineer.com":true,"is-an-entertainer.com":true,"is-by.us":true,"is-certified.com":true,"is-found.org":true,"is-gone.com":true,"is-into-anime.com":true,"is-into-cars.com":true,"is-into-cartoons.com":true,"is-into-games.com":true,"is-leet.com":true,"is-lost.org":true,"is-not-certified.com":true,"is-saved.org":true,"is-slick.com":true,"is-uberleet.com":true,"is-very-bad.org":true,"is-very-evil.org":true,"is-very-good.org":true,"is-very-nice.org":true,"is-very-sweet.org":true,"is-with-theband.com":true,"isa-geek.com":true,"isa-geek.net":true,"isa-geek.org":true,"isa-hockeynut.com":true,"issmarterthanyou.com":true,"isteingeek.de":true,"istmein.de":true,"kicks-ass.net":true,"kicks-ass.org":true,"knowsitall.info":true,"land-4-sale.us":true,"lebtimnetz.de":true,"leitungsen.de":true,"likes-pie.com":true,"likescandy.com":true,"merseine.nu":true,"mine.nu":true,"misconfused.org":true,"mypets.ws":true,"myphotos.cc":true,"neat-url.com":true,"office-on-the.net":true,"on-the-web.tv":true,"podzone.net":true,"podzone.org":true,"readmyblog.org":true,"saves-the-whales.com":true,"scrapper-site.net":true,"scrapping.cc":true,"selfip.biz":true,"selfip.com":true,"selfip.info":true,"selfip.net":true,"selfip.org":true,"sells-for-less.com":true,"sells-for-u.com":true,"sells-it.net":true,"sellsyourhome.org":true,"servebbs.com":true,"servebbs.net":true,"servebbs.org":true,"serveftp.net":true,"serveftp.org":true,"servegame.org":true,"shacknet.nu":true,"simple-url.com":true,"space-to-rent.com":true,"stuff-4-sale.org":true,"stuff-4-sale.us":true,"teaches-yoga.com":true,"thruhere.net":true,"traeumtgerade.de":true,"webhop.biz":true,"webhop.info":true,"webhop.net":true,"webhop.org":true,"worse-than.tv":true,"writesthisblog.com":true,"ddnss.de":true,"dyn.ddnss.de":true,"dyndns.ddnss.de":true,"dyndns1.de":true,"dyn-ip24.de":true,"home-webserver.de":true,"dyn.home-webserver.de":true,"myhome-server.de":true,"ddnss.org":true,"definima.net":true,"definima.io":true,"ddnsfree.com":true,"ddnsgeek.com":true,"giize.com":true,"gleeze.com":true,"kozow.com":true,"loseyourip.com":true,"ooguy.com":true,"theworkpc.com":true,"casacam.net":true,"dynu.net":true,"accesscam.org":true,"camdvr.org":true,"freeddns.org":true,"mywire.org":true,"webredirect.org":true,"myddns.rocks":true,"blogsite.xyz":true,"dynv6.net":true,"e4.cz":true,"mytuleap.com":true,"enonic.io":true,"customer.enonic.io":true,"eu.org":true,"al.eu.org":true,"asso.eu.org":true,"at.eu.org":true,"au.eu.org":true,"be.eu.org":true,"bg.eu.org":true,"ca.eu.org":true,"cd.eu.org":true,"ch.eu.org":true,"cn.eu.org":true,"cy.eu.org":true,"cz.eu.org":true,"de.eu.org":true,"dk.eu.org":true,"edu.eu.org":true,"ee.eu.org":true,"es.eu.org":true,"fi.eu.org":true,"fr.eu.org":true,"gr.eu.org":true,"hr.eu.org":true,"hu.eu.org":true,"ie.eu.org":true,"il.eu.org":true,"in.eu.org":true,"int.eu.org":true,"is.eu.org":true,"it.eu.org":true,"jp.eu.org":true,"kr.eu.org":true,"lt.eu.org":true,"lu.eu.org":true,"lv.eu.org":true,"mc.eu.org":true,"me.eu.org":true,"mk.eu.org":true,"mt.eu.org":true,"my.eu.org":true,"net.eu.org":true,"ng.eu.org":true,"nl.eu.org":true,"no.eu.org":true,"nz.eu.org":true,"paris.eu.org":true,"pl.eu.org":true,"pt.eu.org":true,"q-a.eu.org":true,"ro.eu.org":true,"ru.eu.org":true,"se.eu.org":true,"si.eu.org":true,"sk.eu.org":true,"tr.eu.org":true,"uk.eu.org":true,"us.eu.org":true,"eu-1.evennode.com":true,"eu-2.evennode.com":true,"eu-3.evennode.com":true,"eu-4.evennode.com":true,"us-1.evennode.com":true,"us-2.evennode.com":true,"us-3.evennode.com":true,"us-4.evennode.com":true,"twmail.cc":true,"twmail.net":true,"twmail.org":true,"mymailer.com.tw":true,"url.tw":true,"apps.fbsbx.com":true,"ru.net":true,"adygeya.ru":true,"bashkiria.ru":true,"bir.ru":true,"cbg.ru":true,"com.ru":true,"dagestan.ru":true,"grozny.ru":true,"kalmykia.ru":true,"kustanai.ru":true,"marine.ru":true,"mordovia.ru":true,"msk.ru":true,"mytis.ru":true,"nalchik.ru":true,"nov.ru":true,"pyatigorsk.ru":true,"spb.ru":true,"vladikavkaz.ru":true,"vladimir.ru":true,"abkhazia.su":true,"adygeya.su":true,"aktyubinsk.su":true,"arkhangelsk.su":true,"armenia.su":true,"ashgabad.su":true,"azerbaijan.su":true,"balashov.su":true,"bashkiria.su":true,"bryansk.su":true,"bukhara.su":true,"chimkent.su":true,"dagestan.su":true,"east-kazakhstan.su":true,"exnet.su":true,"georgia.su":true,"grozny.su":true,"ivanovo.su":true,"jambyl.su":true,"kalmykia.su":true,"kaluga.su":true,"karacol.su":true,"karaganda.su":true,"karelia.su":true,"khakassia.su":true,"krasnodar.su":true,"kurgan.su":true,"kustanai.su":true,"lenug.su":true,"mangyshlak.su":true,"mordovia.su":true,"msk.su":true,"murmansk.su":true,"nalchik.su":true,"navoi.su":true,"north-kazakhstan.su":true,"nov.su":true,"obninsk.su":true,"penza.su":true,"pokrovsk.su":true,"sochi.su":true,"spb.su":true,"tashkent.su":true,"termez.su":true,"togliatti.su":true,"troitsk.su":true,"tselinograd.su":true,"tula.su":true,"tuva.su":true,"vladikavkaz.su":true,"vladimir.su":true,"vologda.su":true,"channelsdvr.net":true,"fastlylb.net":true,"map.fastlylb.net":true,"freetls.fastly.net":true,"map.fastly.net":true,"a.prod.fastly.net":true,"global.prod.fastly.net":true,"a.ssl.fastly.net":true,"b.ssl.fastly.net":true,"global.ssl.fastly.net":true,"fhapp.xyz":true,"fedorainfracloud.org":true,"fedorapeople.org":true,"cloud.fedoraproject.org":true,"app.os.fedoraproject.org":true,"app.os.stg.fedoraproject.org":true,"filegear.me":true,"firebaseapp.com":true,"flynnhub.com":true,"flynnhosting.net":true,"freebox-os.com":true,"freeboxos.com":true,"fbx-os.fr":true,"fbxos.fr":true,"freebox-os.fr":true,"freeboxos.fr":true,"*.futurecms.at":true,"futurehosting.at":true,"futuremailing.at":true,"*.ex.ortsinfo.at":true,"*.kunden.ortsinfo.at":true,"*.statics.cloud":true,"service.gov.uk":true,"github.io":true,"githubusercontent.com":true,"gitlab.io":true,"homeoffice.gov.uk":true,"ro.im":true,"shop.ro":true,"goip.de":true,"*.0emm.com":true,"appspot.com":true,"blogspot.ae":true,"blogspot.al":true,"blogspot.am":true,"blogspot.ba":true,"blogspot.be":true,"blogspot.bg":true,"blogspot.bj":true,"blogspot.ca":true,"blogspot.cf":true,"blogspot.ch":true,"blogspot.cl":true,"blogspot.co.at":true,"blogspot.co.id":true,"blogspot.co.il":true,"blogspot.co.ke":true,"blogspot.co.nz":true,"blogspot.co.uk":true,"blogspot.co.za":true,"blogspot.com":true,"blogspot.com.ar":true,"blogspot.com.au":true,"blogspot.com.br":true,"blogspot.com.by":true,"blogspot.com.co":true,"blogspot.com.cy":true,"blogspot.com.ee":true,"blogspot.com.eg":true,"blogspot.com.es":true,"blogspot.com.mt":true,"blogspot.com.ng":true,"blogspot.com.tr":true,"blogspot.com.uy":true,"blogspot.cv":true,"blogspot.cz":true,"blogspot.de":true,"blogspot.dk":true,"blogspot.fi":true,"blogspot.fr":true,"blogspot.gr":true,"blogspot.hk":true,"blogspot.hr":true,"blogspot.hu":true,"blogspot.ie":true,"blogspot.in":true,"blogspot.is":true,"blogspot.it":true,"blogspot.jp":true,"blogspot.kr":true,"blogspot.li":true,"blogspot.lt":true,"blogspot.lu":true,"blogspot.md":true,"blogspot.mk":true,"blogspot.mr":true,"blogspot.mx":true,"blogspot.my":true,"blogspot.nl":true,"blogspot.no":true,"blogspot.pe":true,"blogspot.pt":true,"blogspot.qa":true,"blogspot.re":true,"blogspot.ro":true,"blogspot.rs":true,"blogspot.ru":true,"blogspot.se":true,"blogspot.sg":true,"blogspot.si":true,"blogspot.sk":true,"blogspot.sn":true,"blogspot.td":true,"blogspot.tw":true,"blogspot.ug":true,"blogspot.vn":true,"cloudfunctions.net":true,"cloud.goog":true,"codespot.com":true,"googleapis.com":true,"googlecode.com":true,"pagespeedmobilizer.com":true,"publishproxy.com":true,"withgoogle.com":true,"withyoutube.com":true,"hashbang.sh":true,"hasura-app.io":true,"hepforge.org":true,"herokuapp.com":true,"herokussl.com":true,"moonscale.net":true,"iki.fi":true,"biz.at":true,"info.at":true,"info.cx":true,"ac.leg.br":true,"al.leg.br":true,"am.leg.br":true,"ap.leg.br":true,"ba.leg.br":true,"ce.leg.br":true,"df.leg.br":true,"es.leg.br":true,"go.leg.br":true,"ma.leg.br":true,"mg.leg.br":true,"ms.leg.br":true,"mt.leg.br":true,"pa.leg.br":true,"pb.leg.br":true,"pe.leg.br":true,"pi.leg.br":true,"pr.leg.br":true,"rj.leg.br":true,"rn.leg.br":true,"ro.leg.br":true,"rr.leg.br":true,"rs.leg.br":true,"sc.leg.br":true,"se.leg.br":true,"sp.leg.br":true,"to.leg.br":true,"pixolino.com":true,"ipifony.net":true,"*.triton.zone":true,"*.cns.joyent.com":true,"js.org":true,"keymachine.de":true,"knightpoint.systems":true,"co.krd":true,"edu.krd":true,"git-repos.de":true,"lcube-server.de":true,"svn-repos.de":true,"linkyard.cloud":true,"linkyard-cloud.ch":true,"we.bs":true,"barsy.bg":true,"barsyonline.com":true,"barsy.de":true,"barsy.eu":true,"barsy.in":true,"barsy.net":true,"barsy.online":true,"barsy.support":true,"*.magentosite.cloud":true,"hb.cldmail.ru":true,"cloud.metacentrum.cz":true,"custom.metacentrum.cz":true,"meteorapp.com":true,"eu.meteorapp.com":true,"co.pl":true,"azurewebsites.net":true,"azure-mobile.net":true,"cloudapp.net":true,"mozilla-iot.org":true,"bmoattachments.org":true,"net.ru":true,"org.ru":true,"pp.ru":true,"bitballoon.com":true,"netlify.com":true,"4u.com":true,"ngrok.io":true,"nh-serv.co.uk":true,"nfshost.com":true,"nsupdate.info":true,"nerdpol.ovh":true,"blogsyte.com":true,"brasilia.me":true,"cable-modem.org":true,"ciscofreak.com":true,"collegefan.org":true,"couchpotatofries.org":true,"damnserver.com":true,"ddns.me":true,"ditchyourip.com":true,"dnsfor.me":true,"dnsiskinky.com":true,"dvrcam.info":true,"dynns.com":true,"eating-organic.net":true,"fantasyleague.cc":true,"geekgalaxy.com":true,"golffan.us":true,"health-carereform.com":true,"homesecuritymac.com":true,"homesecuritypc.com":true,"hopto.me":true,"ilovecollege.info":true,"loginto.me":true,"mlbfan.org":true,"mmafan.biz":true,"myactivedirectory.com":true,"mydissent.net":true,"myeffect.net":true,"mymediapc.net":true,"mypsx.net":true,"mysecuritycamera.com":true,"mysecuritycamera.net":true,"mysecuritycamera.org":true,"net-freaks.com":true,"nflfan.org":true,"nhlfan.net":true,"no-ip.ca":true,"no-ip.co.uk":true,"no-ip.net":true,"noip.us":true,"onthewifi.com":true,"pgafan.net":true,"point2this.com":true,"pointto.us":true,"privatizehealthinsurance.net":true,"quicksytes.com":true,"read-books.org":true,"securitytactics.com":true,"serveexchange.com":true,"servehumour.com":true,"servep2p.com":true,"servesarcasm.com":true,"stufftoread.com":true,"ufcfan.org":true,"unusualperson.com":true,"workisboring.com":true,"3utilities.com":true,"bounceme.net":true,"ddns.net":true,"ddnsking.com":true,"gotdns.ch":true,"hopto.org":true,"myftp.biz":true,"myftp.org":true,"myvnc.com":true,"no-ip.biz":true,"no-ip.info":true,"no-ip.org":true,"noip.me":true,"redirectme.net":true,"servebeer.com":true,"serveblog.net":true,"servecounterstrike.com":true,"serveftp.com":true,"servegame.com":true,"servehalflife.com":true,"servehttp.com":true,"serveirc.com":true,"serveminecraft.net":true,"servemp3.com":true,"servepics.com":true,"servequake.com":true,"sytes.net":true,"webhop.me":true,"zapto.org":true,"stage.nodeart.io":true,"nodum.co":true,"nodum.io":true,"nyc.mn":true,"nom.ae":true,"nom.ai":true,"nom.al":true,"nym.by":true,"nym.bz":true,"nom.cl":true,"nom.gd":true,"nom.gl":true,"nym.gr":true,"nom.gt":true,"nom.hn":true,"nom.im":true,"nym.kz":true,"nym.la":true,"nom.li":true,"nym.li":true,"nym.lt":true,"nym.lu":true,"nym.me":true,"nom.mk":true,"nym.mx":true,"nom.nu":true,"nym.nz":true,"nym.pe":true,"nym.pt":true,"nom.pw":true,"nom.qa":true,"nom.rs":true,"nom.si":true,"nym.sk":true,"nym.su":true,"nym.sx":true,"nym.tw":true,"nom.ug":true,"nom.uy":true,"nom.vc":true,"nom.vg":true,"cya.gg":true,"nid.io":true,"opencraft.hosting":true,"operaunite.com":true,"outsystemscloud.com":true,"ownprovider.com":true,"oy.lc":true,"pgfog.com":true,"pagefrontapp.com":true,"art.pl":true,"gliwice.pl":true,"krakow.pl":true,"poznan.pl":true,"wroc.pl":true,"zakopane.pl":true,"pantheonsite.io":true,"gotpantheon.com":true,"mypep.link":true,"on-web.fr":true,"*.platform.sh":true,"*.platformsh.site":true,"xen.prgmr.com":true,"priv.at":true,"protonet.io":true,"chirurgiens-dentistes-en-france.fr":true,"byen.site":true,"qa2.com":true,"dev-myqnapcloud.com":true,"alpha-myqnapcloud.com":true,"myqnapcloud.com":true,"*.quipelements.com":true,"vapor.cloud":true,"vaporcloud.io":true,"rackmaze.com":true,"rackmaze.net":true,"rhcloud.com":true,"resindevice.io":true,"devices.resinstaging.io":true,"hzc.io":true,"wellbeingzone.eu":true,"ptplus.fit":true,"wellbeingzone.co.uk":true,"sandcats.io":true,"logoip.de":true,"logoip.com":true,"schokokeks.net":true,"scrysec.com":true,"firewall-gateway.com":true,"firewall-gateway.de":true,"my-gateway.de":true,"my-router.de":true,"spdns.de":true,"spdns.eu":true,"firewall-gateway.net":true,"my-firewall.org":true,"myfirewall.org":true,"spdns.org":true,"*.s5y.io":true,"*.sensiosite.cloud":true,"biz.ua":true,"co.ua":true,"pp.ua":true,"shiftedit.io":true,"myshopblocks.com":true,"1kapp.com":true,"appchizi.com":true,"applinzi.com":true,"sinaapp.com":true,"vipsinaapp.com":true,"bounty-full.com":true,"alpha.bounty-full.com":true,"beta.bounty-full.com":true,"static.land":true,"dev.static.land":true,"sites.static.land":true,"apps.lair.io":true,"*.stolos.io":true,"spacekit.io":true,"stackspace.space":true,"storj.farm":true,"temp-dns.com":true,"diskstation.me":true,"dscloud.biz":true,"dscloud.me":true,"dscloud.mobi":true,"dsmynas.com":true,"dsmynas.net":true,"dsmynas.org":true,"familyds.com":true,"familyds.net":true,"familyds.org":true,"i234.me":true,"myds.me":true,"synology.me":true,"vpnplus.to":true,"taifun-dns.de":true,"gda.pl":true,"gdansk.pl":true,"gdynia.pl":true,"med.pl":true,"sopot.pl":true,"cust.dev.thingdust.io":true,"cust.disrec.thingdust.io":true,"cust.prod.thingdust.io":true,"cust.testing.thingdust.io":true,"bloxcms.com":true,"townnews-staging.com":true,"12hp.at":true,"2ix.at":true,"4lima.at":true,"lima-city.at":true,"12hp.ch":true,"2ix.ch":true,"4lima.ch":true,"lima-city.ch":true,"trafficplex.cloud":true,"de.cool":true,"12hp.de":true,"2ix.de":true,"4lima.de":true,"lima-city.de":true,"1337.pictures":true,"clan.rip":true,"lima-city.rocks":true,"webspace.rocks":true,"lima.zone":true,"*.transurl.be":true,"*.transurl.eu":true,"*.transurl.nl":true,"tuxfamily.org":true,"dd-dns.de":true,"diskstation.eu":true,"diskstation.org":true,"dray-dns.de":true,"draydns.de":true,"dyn-vpn.de":true,"dynvpn.de":true,"mein-vigor.de":true,"my-vigor.de":true,"my-wan.de":true,"syno-ds.de":true,"synology-diskstation.de":true,"synology-ds.de":true,"uber.space":true,"hk.com":true,"hk.org":true,"ltd.hk":true,"inc.hk":true,"lib.de.us":true,"2038.io":true,"router.management":true,"v-info.info":true,"wedeploy.io":true,"wedeploy.me":true,"wedeploy.sh":true,"remotewd.com":true,"wmflabs.org":true,"cistron.nl":true,"demon.nl":true,"xs4all.space":true,"official.academy":true,"yolasite.com":true,"ybo.faith":true,"yombo.me":true,"homelink.one":true,"ybo.party":true,"ybo.review":true,"ybo.science":true,"ybo.trade":true,"za.net":true,"za.org":true,"now.sh":true});
 
 // END of automatically generated file
 
-},{"punycode":undefined}],278:[function(require,module,exports){
+},{"punycode":undefined}],280:[function(require,module,exports){
 /*!
  * Copyright (c) 2015, Salesforce.com, Inc.
  * All rights reserved.
@@ -64950,54 +66771,31 @@ Store.prototype.getAllCookies = function(cb) {
   throw new Error('getAllCookies is not implemented (therefore jar cannot be serialized)');
 };
 
-},{}],279:[function(require,module,exports){
+},{}],281:[function(require,module,exports){
 module.exports={
-  "_args": [
-    [
-      {
-        "raw": "tough-cookie@~2.3.0",
-        "scope": null,
-        "escapedName": "tough-cookie",
-        "name": "tough-cookie",
-        "rawSpec": "~2.3.0",
-        "spec": ">=2.3.0 <2.4.0",
-        "type": "range"
-      },
-      "/Users/ddascal/Projects/openwhisk/openwhisk-slack/node_modules/request"
-    ]
-  ],
-  "_from": "tough-cookie@>=2.3.0 <2.4.0",
-  "_id": "tough-cookie@2.3.2",
-  "_inCache": true,
+  "_from": "tough-cookie@~2.3.0",
+  "_id": "tough-cookie@2.3.4",
+  "_inBundle": false,
+  "_integrity": "sha1-7GDO44rGdQY//JelwYlwV47oNlU=",
   "_location": "/tough-cookie",
-  "_nodeVersion": "7.0.0",
-  "_npmOperationalInternal": {
-    "host": "packages-12-west.internal.npmjs.com",
-    "tmp": "tmp/tough-cookie-2.3.2.tgz_1477415232912_0.6133609430398792"
-  },
-  "_npmUser": {
-    "name": "jstash",
-    "email": "jstash@gmail.com"
-  },
-  "_npmVersion": "3.10.8",
   "_phantomChildren": {},
   "_requested": {
+    "type": "range",
+    "registry": true,
     "raw": "tough-cookie@~2.3.0",
-    "scope": null,
-    "escapedName": "tough-cookie",
     "name": "tough-cookie",
+    "escapedName": "tough-cookie",
     "rawSpec": "~2.3.0",
-    "spec": ">=2.3.0 <2.4.0",
-    "type": "range"
+    "saveSpec": null,
+    "fetchSpec": "~2.3.0"
   },
   "_requiredBy": [
     "/request"
   ],
-  "_resolved": "https://registry.npmjs.org/tough-cookie/-/tough-cookie-2.3.2.tgz",
-  "_shasum": "f081f76e4c85720e6c37a5faced737150d84072a",
-  "_shrinkwrap": null,
+  "_resolved": "https://artifactory.corp.adobe.com:443/artifactory/api/npm/npm-runner-release/tough-cookie/-/tough-cookie-2.3.4.tgz",
+  "_shasum": "ec60cee38ac675063ffc97a5c18970578ee83655",
   "_spec": "tough-cookie@~2.3.0",
-  "_where": "/Users/ddascal/Projects/openwhisk/openwhisk-slack/node_modules/request",
+  "_where": "/Users/ddascal/Projects/adobe-apiplatform/openwhisk-slack/node_modules/request",
   "author": {
     "name": "Jeremy Stashewsky",
     "email": "jstashewsky@salesforce.com"
@@ -65005,6 +66803,7 @@ module.exports={
   "bugs": {
     "url": "https://github.com/salesforce/tough-cookie/issues"
   },
+  "bundleDependencies": false,
   "contributors": [
     {
       "name": "Alexander Savin"
@@ -65028,16 +66827,12 @@ module.exports={
   "dependencies": {
     "punycode": "^1.4.1"
   },
+  "deprecated": false,
   "description": "RFC6265 Cookies and Cookie Jar for node.js",
   "devDependencies": {
     "async": "^1.4.2",
     "string.prototype.repeat": "^0.2.0",
     "vows": "^0.8.1"
-  },
-  "directories": {},
-  "dist": {
-    "shasum": "f081f76e4c85720e6c37a5faced737150d84072a",
-    "tarball": "https://registry.npmjs.org/tough-cookie/-/tough-cookie-2.3.2.tgz"
   },
   "engines": {
     "node": ">=0.8"
@@ -65045,7 +66840,6 @@ module.exports={
   "files": [
     "lib"
   ],
-  "gitHead": "2610df5dc8ef7373a483d509006e5887572a4076",
   "homepage": "https://github.com/salesforce/tough-cookie",
   "keywords": [
     "HTTP",
@@ -65059,23 +66853,7 @@ module.exports={
   ],
   "license": "BSD-3-Clause",
   "main": "./lib/cookie",
-  "maintainers": [
-    {
-      "name": "awaterma",
-      "email": "awaterma@awaterma.net"
-    },
-    {
-      "name": "jstash",
-      "email": "jstash@gmail.com"
-    },
-    {
-      "name": "nexxy",
-      "email": "emily@contactvibe.com"
-    }
-  ],
   "name": "tough-cookie",
-  "optionalDependencies": {},
-  "readme": "ERROR: No README data found!",
   "repository": {
     "type": "git",
     "url": "git://github.com/salesforce/tough-cookie.git"
@@ -65084,10 +66862,10 @@ module.exports={
     "suffixup": "curl -o public_suffix_list.dat https://publicsuffix.org/list/public_suffix_list.dat && ./generate-pubsuffix.js",
     "test": "vows test/*_test.js"
   },
-  "version": "2.3.2"
+  "version": "2.3.4"
 }
 
-},{}],280:[function(require,module,exports){
+},{}],282:[function(require,module,exports){
 'use strict'
 
 var net = require('net')
@@ -65332,7 +67110,7 @@ if (process.env.NODE_DEBUG && /\btunnel\b/.test(process.env.NODE_DEBUG)) {
 }
 exports.debug = debug // for test
 
-},{"assert":undefined,"events":undefined,"http":undefined,"https":undefined,"net":undefined,"tls":undefined,"util":undefined}],281:[function(require,module,exports){
+},{"assert":undefined,"events":undefined,"http":undefined,"https":undefined,"net":undefined,"tls":undefined,"util":undefined}],283:[function(require,module,exports){
 (function(nacl) {
 'use strict';
 
@@ -67722,7 +69500,7 @@ nacl.setPRNG = function(fn) {
 
 })(typeof module !== 'undefined' && module.exports ? module.exports : (self.nacl = self.nacl || {}));
 
-},{"crypto":undefined}],282:[function(require,module,exports){
+},{"crypto":undefined}],284:[function(require,module,exports){
 'use strict';
 
 var has = Object.prototype.hasOwnProperty;
@@ -67853,7 +69631,7 @@ Ultron.prototype.destroy = function destroy() {
 //
 module.exports = Ultron;
 
-},{}],283:[function(require,module,exports){
+},{}],285:[function(require,module,exports){
 function normalize (str) {
   return str
           .replace(/[\/]+/g, '/')
@@ -67866,7 +69644,7 @@ module.exports = function () {
   var joined = [].slice.call(arguments, 0).join('/');
   return normalize(joined);
 };
-},{}],284:[function(require,module,exports){
+},{}],286:[function(require,module,exports){
 /*!
  * UTF-8 validate: UTF-8 validation for WebSockets.
  * Copyright(c) 2015 Einar Otto Stangvik <einaros@gmail.com>
@@ -67940,7 +69718,7 @@ const isValidUTF8 = (buf) => {
 
 module.exports = isValidUTF8;
 
-},{}],285:[function(require,module,exports){
+},{}],287:[function(require,module,exports){
 'use strict';
 
 try {
@@ -67949,246 +69727,392 @@ try {
   module.exports = require('./fallback');
 }
 
-},{"./fallback":284,"bindings":95}],286:[function(require,module,exports){
-var v1 = require('./v1');
-var v4 = require('./v4');
+},{"./fallback":286,"bindings":288}],288:[function(require,module,exports){
+(function (__filename){
 
-var uuid = v4;
-uuid.v1 = v1;
-uuid.v4 = v4;
-
-module.exports = uuid;
-
-},{"./v1":289,"./v4":290}],287:[function(require,module,exports){
 /**
- * Convert array of 16 byte values to UUID string format of the form:
- * XXXXXXXX-XXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX
+ * Module dependencies.
  */
-var byteToHex = [];
-for (var i = 0; i < 256; ++i) {
-  byteToHex[i] = (i + 0x100).toString(16).substr(1);
-}
 
-function bytesToUuid(buf, offset) {
-  var i = offset || 0;
-  var bth = byteToHex;
-  return  bth[buf[i++]] + bth[buf[i++]] +
-          bth[buf[i++]] + bth[buf[i++]] + '-' +
-          bth[buf[i++]] + bth[buf[i++]] + '-' +
-          bth[buf[i++]] + bth[buf[i++]] + '-' +
-          bth[buf[i++]] + bth[buf[i++]] + '-' +
-          bth[buf[i++]] + bth[buf[i++]] +
-          bth[buf[i++]] + bth[buf[i++]] +
-          bth[buf[i++]] + bth[buf[i++]];
-}
+var fs = require('fs')
+  , path = require('path')
+  , join = path.join
+  , dirname = path.dirname
+  , exists = ((fs.accessSync && function (path) { try { fs.accessSync(path); } catch (e) { return false; } return true; })
+      || fs.existsSync || path.existsSync)
+  , defaults = {
+        arrow: process.env.NODE_BINDINGS_ARROW || ' → '
+      , compiled: process.env.NODE_BINDINGS_COMPILED_DIR || 'compiled'
+      , platform: process.platform
+      , arch: process.arch
+      , version: process.versions.node
+      , bindings: 'bindings.node'
+      , try: [
+          // node-gyp's linked version in the "build" dir
+          [ 'module_root', 'build', 'bindings' ]
+          // node-waf and gyp_addon (a.k.a node-gyp)
+        , [ 'module_root', 'build', 'Debug', 'bindings' ]
+        , [ 'module_root', 'build', 'Release', 'bindings' ]
+          // Debug files, for development (legacy behavior, remove for node v0.9)
+        , [ 'module_root', 'out', 'Debug', 'bindings' ]
+        , [ 'module_root', 'Debug', 'bindings' ]
+          // Release files, but manually compiled (legacy behavior, remove for node v0.9)
+        , [ 'module_root', 'out', 'Release', 'bindings' ]
+        , [ 'module_root', 'Release', 'bindings' ]
+          // Legacy from node-waf, node <= 0.4.x
+        , [ 'module_root', 'build', 'default', 'bindings' ]
+          // Production "Release" buildtype binary (meh...)
+        , [ 'module_root', 'compiled', 'version', 'platform', 'arch', 'bindings' ]
+        ]
+    }
 
-module.exports = bytesToUuid;
+/**
+ * The main `bindings()` function loads the compiled bindings for a given module.
+ * It uses V8's Error API to determine the parent filename that this function is
+ * being invoked from, which is then used to find the root directory.
+ */
 
-},{}],288:[function(require,module,exports){
-// Unique ID creation requires a high quality random # generator.  In node.js
-// this is prett straight-forward - we use the crypto API.
+function bindings (opts) {
 
-var rb = require('crypto').randomBytes;
-
-function rng() {
-  return rb(16);
-};
-
-module.exports = rng;
-
-},{"crypto":undefined}],289:[function(require,module,exports){
-// Unique ID creation requires a high quality random # generator.  We feature
-// detect to determine the best RNG source, normalizing to a function that
-// returns 128-bits of randomness, since that's what's usually required
-var rng = require('./lib/rng');
-var bytesToUuid = require('./lib/bytesToUuid');
-
-// **`v1()` - Generate time-based UUID**
-//
-// Inspired by https://github.com/LiosK/UUID.js
-// and http://docs.python.org/library/uuid.html
-
-// random #'s we need to init node and clockseq
-var _seedBytes = rng();
-
-// Per 4.5, create and 48-bit node id, (47 random bits + multicast bit = 1)
-var _nodeId = [
-  _seedBytes[0] | 0x01,
-  _seedBytes[1], _seedBytes[2], _seedBytes[3], _seedBytes[4], _seedBytes[5]
-];
-
-// Per 4.2.2, randomize (14 bit) clockseq
-var _clockseq = (_seedBytes[6] << 8 | _seedBytes[7]) & 0x3fff;
-
-// Previous uuid creation time
-var _lastMSecs = 0, _lastNSecs = 0;
-
-// See https://github.com/broofa/node-uuid for API details
-function v1(options, buf, offset) {
-  var i = buf && offset || 0;
-  var b = buf || [];
-
-  options = options || {};
-
-  var clockseq = options.clockseq !== undefined ? options.clockseq : _clockseq;
-
-  // UUID timestamps are 100 nano-second units since the Gregorian epoch,
-  // (1582-10-15 00:00).  JSNumbers aren't precise enough for this, so
-  // time is handled internally as 'msecs' (integer milliseconds) and 'nsecs'
-  // (100-nanoseconds offset from msecs) since unix epoch, 1970-01-01 00:00.
-  var msecs = options.msecs !== undefined ? options.msecs : new Date().getTime();
-
-  // Per 4.2.1.2, use count of uuid's generated during the current clock
-  // cycle to simulate higher resolution clock
-  var nsecs = options.nsecs !== undefined ? options.nsecs : _lastNSecs + 1;
-
-  // Time since last uuid creation (in msecs)
-  var dt = (msecs - _lastMSecs) + (nsecs - _lastNSecs)/10000;
-
-  // Per 4.2.1.2, Bump clockseq on clock regression
-  if (dt < 0 && options.clockseq === undefined) {
-    clockseq = clockseq + 1 & 0x3fff;
+  // Argument surgery
+  if (typeof opts == 'string') {
+    opts = { bindings: opts }
+  } else if (!opts) {
+    opts = {}
   }
 
-  // Reset nsecs if clock regresses (new clockseq) or we've moved onto a new
-  // time interval
-  if ((dt < 0 || msecs > _lastMSecs) && options.nsecs === undefined) {
-    nsecs = 0;
+  // maps `defaults` onto `opts` object
+  Object.keys(defaults).map(function(i) {
+    if (!(i in opts)) opts[i] = defaults[i];
+  });
+
+  // Get the module root
+  if (!opts.module_root) {
+    opts.module_root = exports.getRoot(exports.getFileName())
   }
 
-  // Per 4.2.1.2 Throw error if too many uuids are requested
-  if (nsecs >= 10000) {
-    throw new Error('uuid.v1(): Can\'t create more than 10M uuids/sec');
+  // Ensure the given bindings name ends with .node
+  if (path.extname(opts.bindings) != '.node') {
+    opts.bindings += '.node'
   }
 
-  _lastMSecs = msecs;
-  _lastNSecs = nsecs;
-  _clockseq = clockseq;
+  var tries = []
+    , i = 0
+    , l = opts.try.length
+    , n
+    , b
+    , err
 
-  // Per 4.1.4 - Convert from unix epoch to Gregorian epoch
-  msecs += 12219292800000;
-
-  // `time_low`
-  var tl = ((msecs & 0xfffffff) * 10000 + nsecs) % 0x100000000;
-  b[i++] = tl >>> 24 & 0xff;
-  b[i++] = tl >>> 16 & 0xff;
-  b[i++] = tl >>> 8 & 0xff;
-  b[i++] = tl & 0xff;
-
-  // `time_mid`
-  var tmh = (msecs / 0x100000000 * 10000) & 0xfffffff;
-  b[i++] = tmh >>> 8 & 0xff;
-  b[i++] = tmh & 0xff;
-
-  // `time_high_and_version`
-  b[i++] = tmh >>> 24 & 0xf | 0x10; // include version
-  b[i++] = tmh >>> 16 & 0xff;
-
-  // `clock_seq_hi_and_reserved` (Per 4.2.2 - include variant)
-  b[i++] = clockseq >>> 8 | 0x80;
-
-  // `clock_seq_low`
-  b[i++] = clockseq & 0xff;
-
-  // `node`
-  var node = options.node || _nodeId;
-  for (var n = 0; n < 6; ++n) {
-    b[i + n] = node[n];
-  }
-
-  return buf ? buf : bytesToUuid(b);
-}
-
-module.exports = v1;
-
-},{"./lib/bytesToUuid":287,"./lib/rng":288}],290:[function(require,module,exports){
-var rng = require('./lib/rng');
-var bytesToUuid = require('./lib/bytesToUuid');
-
-function v4(options, buf, offset) {
-  var i = buf && offset || 0;
-
-  if (typeof(options) == 'string') {
-    buf = options == 'binary' ? new Array(16) : null;
-    options = null;
-  }
-  options = options || {};
-
-  var rnds = options.random || (options.rng || rng)();
-
-  // Per 4.4, set bits for version and `clock_seq_hi_and_reserved`
-  rnds[6] = (rnds[6] & 0x0f) | 0x40;
-  rnds[8] = (rnds[8] & 0x3f) | 0x80;
-
-  // Copy bytes to buffer, if provided
-  if (buf) {
-    for (var ii = 0; ii < 16; ++ii) {
-      buf[i + ii] = rnds[ii];
+  for (; i<l; i++) {
+    n = join.apply(null, opts.try[i].map(function (p) {
+      return opts[p] || p
+    }))
+    tries.push(n)
+    try {
+      b = opts.path ? require.resolve(n) : require(n)
+      if (!opts.path) {
+        b.path = n
+      }
+      return b
+    } catch (e) {
+      if (!/not find/i.test(e.message)) {
+        throw e
+      }
     }
   }
 
-  return buf || bytesToUuid(rnds);
+  err = new Error('Could not locate the bindings file. Tried:\n'
+    + tries.map(function (a) { return opts.arrow + a }).join('\n'))
+  err.tries = tries
+  throw err
+}
+module.exports = exports = bindings
+
+
+/**
+ * Gets the filename of the JavaScript file that invokes this function.
+ * Used to help find the root directory of a module.
+ * Optionally accepts an filename argument to skip when searching for the invoking filename
+ */
+
+exports.getFileName = function getFileName (calling_file) {
+  var origPST = Error.prepareStackTrace
+    , origSTL = Error.stackTraceLimit
+    , dummy = {}
+    , fileName
+
+  Error.stackTraceLimit = 10
+
+  Error.prepareStackTrace = function (e, st) {
+    for (var i=0, l=st.length; i<l; i++) {
+      fileName = st[i].getFileName()
+      if (fileName !== __filename) {
+        if (calling_file) {
+            if (fileName !== calling_file) {
+              return
+            }
+        } else {
+          return
+        }
+      }
+    }
+  }
+
+  // run the 'prepareStackTrace' function above
+  Error.captureStackTrace(dummy)
+  dummy.stack
+
+  // cleanup
+  Error.prepareStackTrace = origPST
+  Error.stackTraceLimit = origSTL
+
+  return fileName
 }
 
-module.exports = v4;
+/**
+ * Gets the root directory of a module, given an arbitrary filename
+ * somewhere in the module tree. The "root directory" is the directory
+ * containing the `package.json` file.
+ *
+ *   In:  /home/nate/node-native-module/lib/index.js
+ *   Out: /home/nate/node-native-module
+ */
 
-},{"./lib/bytesToUuid":287,"./lib/rng":288}],291:[function(require,module,exports){
+exports.getRoot = function getRoot (file) {
+  var dir = dirname(file)
+    , prev
+  while (true) {
+    if (dir === '.') {
+      // Avoids an infinite loop in rare cases, like the REPL
+      dir = process.cwd()
+    }
+    if (exists(join(dir, 'package.json')) || exists(join(dir, 'node_modules'))) {
+      // Found the 'package.json' file or 'node_modules' dir; we're done
+      return dir
+    }
+    if (prev === dir) {
+      // Got to the top
+      throw new Error('Could not find module root given file: "' + file
+                    + '". Do you have a `package.json` file? ')
+    }
+    // Try the parent dir next
+    prev = dir
+    dir = join(dir, '..')
+  }
+}
+
+}).call(this,"/Users/ddascal/Projects/adobe-apiplatform/openwhisk-slack/node_modules/utf-8-validate/node_modules/bindings/bindings.js")
+},{"fs":undefined,"path":undefined}],289:[function(require,module,exports){
 /*
  * verror.js: richer JavaScript errors
  */
 
-var mod_assert = require('assert');
+var mod_assertplus = require('assert-plus');
 var mod_util = require('util');
 
 var mod_extsprintf = require('extsprintf');
+var mod_isError = require('core-util-is').isError;
+var sprintf = mod_extsprintf.sprintf;
 
 /*
  * Public interface
  */
-exports.VError = VError;
-exports.WError = WError;
-exports.MultiError = MultiError;
+
+/* So you can 'var VError = require('verror')' */
+module.exports = VError;
+/* For compatibility */
+VError.VError = VError;
+/* Other exported classes */
+VError.SError = SError;
+VError.WError = WError;
+VError.MultiError = MultiError;
 
 /*
- * Like JavaScript's built-in Error class, but supports a "cause" argument and a
- * printf-style message.  The cause argument can be null.
+ * Common function used to parse constructor arguments for VError, WError, and
+ * SError.  Named arguments to this function:
+ *
+ *     strict		force strict interpretation of sprintf arguments, even
+ *     			if the options in "argv" don't say so
+ *
+ *     argv		error's constructor arguments, which are to be
+ *     			interpreted as described in README.md.  For quick
+ *     			reference, "argv" has one of the following forms:
+ *
+ *          [ sprintf_args... ]           (argv[0] is a string)
+ *          [ cause, sprintf_args... ]    (argv[0] is an Error)
+ *          [ options, sprintf_args... ]  (argv[0] is an object)
+ *
+ * This function normalizes these forms, producing an object with the following
+ * properties:
+ *
+ *    options           equivalent to "options" in third form.  This will never
+ *    			be a direct reference to what the caller passed in
+ *    			(i.e., it may be a shallow copy), so it can be freely
+ *    			modified.
+ *
+ *    shortmessage      result of sprintf(sprintf_args), taking options.strict
+ *    			into account as described in README.md.
  */
-function VError(options)
+function parseConstructorArguments(args)
 {
-	var args, causedBy, ctor, tailmsg;
+	var argv, options, sprintf_args, shortmessage, k;
 
-	if (options instanceof Error || typeof (options) === 'object') {
-		args = Array.prototype.slice.call(arguments, 1);
+	mod_assertplus.object(args, 'args');
+	mod_assertplus.bool(args.strict, 'args.strict');
+	mod_assertplus.array(args.argv, 'args.argv');
+	argv = args.argv;
+
+	/*
+	 * First, figure out which form of invocation we've been given.
+	 */
+	if (argv.length === 0) {
+		options = {};
+		sprintf_args = [];
+	} else if (mod_isError(argv[0])) {
+		options = { 'cause': argv[0] };
+		sprintf_args = argv.slice(1);
+	} else if (typeof (argv[0]) === 'object') {
+		options = {};
+		for (k in argv[0]) {
+			options[k] = argv[0][k];
+		}
+		sprintf_args = argv.slice(1);
 	} else {
-		args = Array.prototype.slice.call(arguments, 0);
-		options = undefined;
+		mod_assertplus.string(argv[0],
+		    'first argument to VError, SError, or WError ' +
+		    'constructor must be a string, object, or Error');
+		options = {};
+		sprintf_args = argv;
 	}
 
-	tailmsg = args.length > 0 ?
-	    mod_extsprintf.sprintf.apply(null, args) : '';
-	this.jse_shortmsg = tailmsg;
-	this.jse_summary = tailmsg;
+	/*
+	 * Now construct the error's message.
+	 *
+	 * extsprintf (which we invoke here with our caller's arguments in order
+	 * to construct this Error's message) is strict in its interpretation of
+	 * values to be processed by the "%s" specifier.  The value passed to
+	 * extsprintf must actually be a string or something convertible to a
+	 * String using .toString().  Passing other values (notably "null" and
+	 * "undefined") is considered a programmer error.  The assumption is
+	 * that if you actually want to print the string "null" or "undefined",
+	 * then that's easy to do that when you're calling extsprintf; on the
+	 * other hand, if you did NOT want that (i.e., there's actually a bug
+	 * where the program assumes some variable is non-null and tries to
+	 * print it, which might happen when constructing a packet or file in
+	 * some specific format), then it's better to stop immediately than
+	 * produce bogus output.
+	 *
+	 * However, sometimes the bug is only in the code calling VError, and a
+	 * programmer might prefer to have the error message contain "null" or
+	 * "undefined" rather than have the bug in the error path crash the
+	 * program (making the first bug harder to identify).  For that reason,
+	 * by default VError converts "null" or "undefined" arguments to their
+	 * string representations and passes those to extsprintf.  Programmers
+	 * desiring the strict behavior can use the SError class or pass the
+	 * "strict" option to the VError constructor.
+	 */
+	mod_assertplus.object(options);
+	if (!options.strict && !args.strict) {
+		sprintf_args = sprintf_args.map(function (a) {
+			return (a === null ? 'null' :
+			    a === undefined ? 'undefined' : a);
+		});
+	}
 
-	if (options) {
-		causedBy = options.cause;
+	if (sprintf_args.length === 0) {
+		shortmessage = '';
+	} else {
+		shortmessage = sprintf.apply(null, sprintf_args);
+	}
 
-		if (!causedBy || !(options.cause instanceof Error))
-			causedBy = options;
+	return ({
+	    'options': options,
+	    'shortmessage': shortmessage
+	});
+}
 
-		if (causedBy && (causedBy instanceof Error)) {
-			this.jse_cause = causedBy;
-			this.jse_summary += ': ' + causedBy.message;
+/*
+ * See README.md for reference documentation.
+ */
+function VError()
+{
+	var args, obj, parsed, cause, ctor, message, k;
+
+	args = Array.prototype.slice.call(arguments, 0);
+
+	/*
+	 * This is a regrettable pattern, but JavaScript's built-in Error class
+	 * is defined to work this way, so we allow the constructor to be called
+	 * without "new".
+	 */
+	if (!(this instanceof VError)) {
+		obj = Object.create(VError.prototype);
+		VError.apply(obj, arguments);
+		return (obj);
+	}
+
+	/*
+	 * For convenience and backwards compatibility, we support several
+	 * different calling forms.  Normalize them here.
+	 */
+	parsed = parseConstructorArguments({
+	    'argv': args,
+	    'strict': false
+	});
+
+	/*
+	 * If we've been given a name, apply it now.
+	 */
+	if (parsed.options.name) {
+		mod_assertplus.string(parsed.options.name,
+		    'error\'s "name" must be a string');
+		this.name = parsed.options.name;
+	}
+
+	/*
+	 * For debugging, we keep track of the original short message (attached
+	 * this Error particularly) separately from the complete message (which
+	 * includes the messages of our cause chain).
+	 */
+	this.jse_shortmsg = parsed.shortmessage;
+	message = parsed.shortmessage;
+
+	/*
+	 * If we've been given a cause, record a reference to it and update our
+	 * message appropriately.
+	 */
+	cause = parsed.options.cause;
+	if (cause) {
+		mod_assertplus.ok(mod_isError(cause), 'cause is not an Error');
+		this.jse_cause = cause;
+
+		if (!parsed.options.skipCauseMessage) {
+			message += ': ' + cause.message;
 		}
 	}
 
-	this.message = this.jse_summary;
-	Error.call(this, this.jse_summary);
+	/*
+	 * If we've been given an object with properties, shallow-copy that
+	 * here.  We don't want to use a deep copy in case there are non-plain
+	 * objects here, but we don't want to use the original object in case
+	 * the caller modifies it later.
+	 */
+	this.jse_info = {};
+	if (parsed.options.info) {
+		for (k in parsed.options.info) {
+			this.jse_info[k] = parsed.options.info[k];
+		}
+	}
+
+	this.message = message;
+	Error.call(this, message);
 
 	if (Error.captureStackTrace) {
-		ctor = options ? options.constructorOpt : undefined;
-		ctor = ctor || arguments.callee;
+		ctor = parsed.options.constructorOpt || this.constructor;
 		Error.captureStackTrace(this, ctor);
 	}
+
+	return (this);
 }
 
 mod_util.inherits(VError, Error);
@@ -68204,10 +70128,152 @@ VError.prototype.toString = function ve_toString()
 	return (str);
 };
 
+/*
+ * This method is provided for compatibility.  New callers should use
+ * VError.cause() instead.  That method also uses the saner `null` return value
+ * when there is no cause.
+ */
 VError.prototype.cause = function ve_cause()
 {
-	return (this.jse_cause);
+	var cause = VError.cause(this);
+	return (cause === null ? undefined : cause);
 };
+
+/*
+ * Static methods
+ *
+ * These class-level methods are provided so that callers can use them on
+ * instances of Errors that are not VErrors.  New interfaces should be provided
+ * only using static methods to eliminate the class of programming mistake where
+ * people fail to check whether the Error object has the corresponding methods.
+ */
+
+VError.cause = function (err)
+{
+	mod_assertplus.ok(mod_isError(err), 'err must be an Error');
+	return (mod_isError(err.jse_cause) ? err.jse_cause : null);
+};
+
+VError.info = function (err)
+{
+	var rv, cause, k;
+
+	mod_assertplus.ok(mod_isError(err), 'err must be an Error');
+	cause = VError.cause(err);
+	if (cause !== null) {
+		rv = VError.info(cause);
+	} else {
+		rv = {};
+	}
+
+	if (typeof (err.jse_info) == 'object' && err.jse_info !== null) {
+		for (k in err.jse_info) {
+			rv[k] = err.jse_info[k];
+		}
+	}
+
+	return (rv);
+};
+
+VError.findCauseByName = function (err, name)
+{
+	var cause;
+
+	mod_assertplus.ok(mod_isError(err), 'err must be an Error');
+	mod_assertplus.string(name, 'name');
+	mod_assertplus.ok(name.length > 0, 'name cannot be empty');
+
+	for (cause = err; cause !== null; cause = VError.cause(cause)) {
+		mod_assertplus.ok(mod_isError(cause));
+		if (cause.name == name) {
+			return (cause);
+		}
+	}
+
+	return (null);
+};
+
+VError.hasCauseWithName = function (err, name)
+{
+	return (VError.findCauseByName(err, name) !== null);
+};
+
+VError.fullStack = function (err)
+{
+	mod_assertplus.ok(mod_isError(err), 'err must be an Error');
+
+	var cause = VError.cause(err);
+
+	if (cause) {
+		return (err.stack + '\ncaused by: ' + VError.fullStack(cause));
+	}
+
+	return (err.stack);
+};
+
+VError.errorFromList = function (errors)
+{
+	mod_assertplus.arrayOfObject(errors, 'errors');
+
+	if (errors.length === 0) {
+		return (null);
+	}
+
+	errors.forEach(function (e) {
+		mod_assertplus.ok(mod_isError(e));
+	});
+
+	if (errors.length == 1) {
+		return (errors[0]);
+	}
+
+	return (new MultiError(errors));
+};
+
+VError.errorForEach = function (err, func)
+{
+	mod_assertplus.ok(mod_isError(err), 'err must be an Error');
+	mod_assertplus.func(func, 'func');
+
+	if (err instanceof MultiError) {
+		err.errors().forEach(function iterError(e) { func(e); });
+	} else {
+		func(err);
+	}
+};
+
+
+/*
+ * SError is like VError, but stricter about types.  You cannot pass "null" or
+ * "undefined" as string arguments to the formatter.
+ */
+function SError()
+{
+	var args, obj, parsed, options;
+
+	args = Array.prototype.slice.call(arguments, 0);
+	if (!(this instanceof SError)) {
+		obj = Object.create(SError.prototype);
+		SError.apply(obj, arguments);
+		return (obj);
+	}
+
+	parsed = parseConstructorArguments({
+	    'argv': args,
+	    'strict': true
+	});
+
+	options = parsed.options;
+	VError.call(this, options, '%s', parsed.shortmessage);
+
+	return (this);
+}
+
+/*
+ * We don't bother setting SError.prototype.name because once constructed,
+ * SErrors are just like VErrors.
+ */
+mod_util.inherits(SError, VError);
 
 
 /*
@@ -68218,58 +70284,52 @@ VError.prototype.cause = function ve_cause()
  */
 function MultiError(errors)
 {
-	mod_assert.ok(errors.length > 0);
+	mod_assertplus.array(errors, 'list of errors');
+	mod_assertplus.ok(errors.length > 0, 'must be at least one error');
 	this.ase_errors = errors;
 
-	VError.call(this, errors[0], 'first of %d error%s',
-	    errors.length, errors.length == 1 ? '' : 's');
+	VError.call(this, {
+	    'cause': errors[0]
+	}, 'first of %d error%s', errors.length, errors.length == 1 ? '' : 's');
 }
 
 mod_util.inherits(MultiError, VError);
+MultiError.prototype.name = 'MultiError';
 
+MultiError.prototype.errors = function me_errors()
+{
+	return (this.ase_errors.slice(0));
+};
 
 
 /*
- * Like JavaScript's built-in Error class, but supports a "cause" argument which
- * is wrapped, not "folded in" as with VError.	Accepts a printf-style message.
- * The cause argument can be null.
+ * See README.md for reference details.
  */
-function WError(options)
+function WError()
 {
-	Error.call(this);
+	var args, obj, parsed, options;
 
-	var args, cause, ctor;
-	if (typeof (options) === 'object') {
-		args = Array.prototype.slice.call(arguments, 1);
-	} else {
-		args = Array.prototype.slice.call(arguments, 0);
-		options = undefined;
+	args = Array.prototype.slice.call(arguments, 0);
+	if (!(this instanceof WError)) {
+		obj = Object.create(WError.prototype);
+		WError.apply(obj, args);
+		return (obj);
 	}
 
-	if (args.length > 0) {
-		this.message = mod_extsprintf.sprintf.apply(null, args);
-	} else {
-		this.message = '';
-	}
+	parsed = parseConstructorArguments({
+	    'argv': args,
+	    'strict': false
+	});
 
-	if (options) {
-		if (options instanceof Error) {
-			cause = options;
-		} else {
-			cause = options.cause;
-			ctor = options.constructorOpt;
-		}
-	}
+	options = parsed.options;
+	options['skipCauseMessage'] = true;
+	VError.call(this, options, '%s', parsed.shortmessage);
 
-	Error.captureStackTrace(this, ctor || this.constructor);
-	if (cause)
-		this.cause(cause);
-
+	return (this);
 }
 
-mod_util.inherits(WError, Error);
+mod_util.inherits(WError, VError);
 WError.prototype.name = 'WError';
-
 
 WError.prototype.toString = function we_toString()
 {
@@ -68277,21 +70337,27 @@ WError.prototype.toString = function we_toString()
 		this.constructor.name || this.constructor.prototype.name);
 	if (this.message)
 		str += ': ' + this.message;
-	if (this.we_cause && this.we_cause.message)
-		str += '; caused by ' + this.we_cause.toString();
+	if (this.jse_cause && this.jse_cause.message)
+		str += '; caused by ' + this.jse_cause.toString();
 
 	return (str);
 };
 
+/*
+ * For purely historical reasons, WError's cause() function allows you to set
+ * the cause.
+ */
 WError.prototype.cause = function we_cause(c)
 {
-	if (c instanceof Error)
-		this.we_cause = c;
+	if (mod_isError(c))
+		this.jse_cause = c;
 
-	return (this.we_cause);
+	return (this.jse_cause);
 };
 
-},{"assert":undefined,"extsprintf":159,"util":undefined}],292:[function(require,module,exports){
+},{"assert-plus":290,"core-util-is":150,"extsprintf":163,"util":undefined}],290:[function(require,module,exports){
+arguments[4][215][0].apply(exports,arguments)
+},{"assert":undefined,"dup":215,"stream":undefined,"util":undefined}],291:[function(require,module,exports){
 /*
  * winston.js: Top-level include defining Winston.
  *
@@ -68457,7 +70523,7 @@ Object.defineProperty(winston, 'default', {
   }
 });
 
-},{"../package.json":308,"./winston/common":293,"./winston/config":294,"./winston/container":298,"./winston/exception":299,"./winston/logger":300,"./winston/transports":301,"./winston/transports/transport":306}],293:[function(require,module,exports){
+},{"../package.json":307,"./winston/common":292,"./winston/config":293,"./winston/container":297,"./winston/exception":298,"./winston/logger":299,"./winston/transports":300,"./winston/transports/transport":305}],292:[function(require,module,exports){
 /*
  * common.js: Internal helper and utility functions for winston
  *
@@ -68537,15 +70603,10 @@ exports.longestElement = function (xs) {
 // i.e. JSON objects that are either literals or objects (no Arrays, etc)
 //
 exports.clone = function (obj) {
-  //
-  // We only need to clone reference types (Object)
-  //
-  var copy = {};
-
   if (obj instanceof Error) {
     // With potential custom Error objects, this might not be exactly correct,
     // but probably close-enough for purposes of this lib.
-    copy = { message: obj.message };
+    var copy = { message: obj.message };
     Object.getOwnPropertyNames(obj).forEach(function (key) {
       copy[key] = obj[key];
     });
@@ -68558,6 +70619,15 @@ exports.clone = function (obj) {
   else if (obj instanceof Date) {
     return new Date(obj.getTime());
   }
+
+  return clone(cycle.decycle(obj));
+};
+
+function clone(obj) {
+  //
+  // We only need to clone reference types (Object)
+  //
+  var copy = Array.isArray(obj) ? [] : {};
 
   for (var i in obj) {
     if (Array.isArray(obj[i])) {
@@ -68575,7 +70645,7 @@ exports.clone = function (obj) {
   }
 
   return copy;
-};
+}
 
 //
 // ### function log (options)
@@ -68600,7 +70670,7 @@ exports.log = function (options) {
       timestamp   = options.timestamp ? timestampFn() : null,
       showLevel   = options.showLevel === undefined ? true : options.showLevel,
       meta        = options.meta !== null && options.meta !== undefined && !(options.meta instanceof Error)
-        ? exports.clone(cycle.decycle(options.meta))
+        ? exports.clone(options.meta)
         : options.meta || null,
       output;
 
@@ -68674,7 +70744,7 @@ exports.log = function (options) {
   // Remark: this should really be a call to `util.format`.
   //
   if (typeof options.formatter == 'function') {
-    options.meta = meta;
+    options.meta = meta || options.meta;
     return String(options.formatter(exports.clone(options)));
   }
 
@@ -68707,7 +70777,7 @@ exports.log = function (options) {
         output += ' ' + '\n' + util.inspect(meta, false, options.depth || null, options.colorize);
       } else if (
         options.humanReadableUnhandledException
-          && Object.keys(meta).length === 5
+          && Object.keys(meta).length >= 5
           && meta.hasOwnProperty('date')
           && meta.hasOwnProperty('process')
           && meta.hasOwnProperty('os')
@@ -68868,7 +70938,7 @@ exports.tailFile = function(options, callback) {
 
     (function read() {
       if (stream.destroyed) {
-        fs.close(fd);
+        fs.close(fd, nop);
         return;
       }
 
@@ -68954,7 +71024,9 @@ exports.stringArrayToSet = function (strArray, errMsg) {
   }, Object.create(null));
 };
 
-},{"./config":294,"crypto":undefined,"cycle":148,"fs":undefined,"stream":undefined,"string_decoder":undefined,"util":undefined}],294:[function(require,module,exports){
+function nop () {}
+
+},{"./config":293,"crypto":undefined,"cycle":152,"fs":undefined,"stream":undefined,"string_decoder":undefined,"util":undefined}],293:[function(require,module,exports){
 /*
  * config.js: Default settings for all levels that winston knows about
  *
@@ -69024,7 +71096,7 @@ function mixin (target) {
   return target;
 };
 
-},{"./config/cli-config":295,"./config/npm-config":296,"./config/syslog-config":297,"colors/safe":145}],295:[function(require,module,exports){
+},{"./config/cli-config":294,"./config/npm-config":295,"./config/syslog-config":296,"colors/safe":147}],294:[function(require,module,exports){
 /*
  * cli-config.js: Config that conform to commonly used CLI logging levels.
  *
@@ -69061,7 +71133,7 @@ cliConfig.colors = {
   silly: 'magenta'
 };
 
-},{}],296:[function(require,module,exports){
+},{}],295:[function(require,module,exports){
 /*
  * npm-config.js: Config that conform to npm logging levels.
  *
@@ -69090,7 +71162,7 @@ npmConfig.colors = {
   silly: 'magenta'
 };
 
-},{}],297:[function(require,module,exports){
+},{}],296:[function(require,module,exports){
 /*
  * syslog-config.js: Config that conform to syslog logging levels.
  *
@@ -69123,7 +71195,7 @@ syslogConfig.colors = {
   debug: 'blue'
 };
 
-},{}],298:[function(require,module,exports){
+},{}],297:[function(require,module,exports){
 /*
  * container.js: Inversion of control container for winston logger instances
  *
@@ -69184,7 +71256,7 @@ Container.prototype.get = Container.prototype.add = function (id, options) {
     }
 
     Object.keys(options).forEach(function (key) {
-      if (key === 'transports') {
+      if (key === 'transports' || key === 'filters' || key === 'rewriters') {
         return;
       }
 
@@ -69253,7 +71325,7 @@ Container.prototype._delete = function (id) {
 }
 
 
-},{"../winston":292,"./common":293,"util":undefined}],299:[function(require,module,exports){
+},{"../winston":291,"./common":292,"util":undefined}],298:[function(require,module,exports){
 /*
  * exception.js: Utility methods for gathing information about uncaughtExceptions.
  *
@@ -69311,7 +71383,7 @@ exception.getTrace = function (err) {
   });
 };
 
-},{"os":undefined,"stack-trace":271}],300:[function(require,module,exports){
+},{"os":undefined,"stack-trace":273}],299:[function(require,module,exports){
 /*
  * logger.js: Core logger object used by winston.
  *
@@ -70042,7 +72114,7 @@ ProfileHandler.prototype.done = function (msg) {
   return this.logger.info(msg, meta, callback);
 };
 
-},{"./common":293,"./config":294,"./exception":299,"async":307,"events":undefined,"stream":undefined,"util":undefined}],301:[function(require,module,exports){
+},{"./common":292,"./config":293,"./exception":298,"async":306,"events":undefined,"stream":undefined,"util":undefined}],300:[function(require,module,exports){
 /*
  * transports.js: Set of all transports Winston knows about
  *
@@ -70080,7 +72152,7 @@ Object.defineProperty(exports, 'Memory', {
   }
 });
 
-},{"./transports/console":302,"./transports/file":303,"./transports/http":304,"./transports/memory":305}],302:[function(require,module,exports){
+},{"./transports/console":301,"./transports/file":302,"./transports/http":303,"./transports/memory":304}],301:[function(require,module,exports){
 /*
  * console.js: Transport for outputting to the console
  *
@@ -70212,7 +72284,7 @@ Console.prototype.log = function (level, msg, meta, callback) {
   callback(null, true);
 };
 
-},{"../common":293,"./transport":306,"events":undefined,"os":undefined,"util":undefined}],303:[function(require,module,exports){
+},{"../common":292,"./transport":305,"events":undefined,"os":undefined,"util":undefined}],302:[function(require,module,exports){
 /*
  * file.js: Transport for outputting to a local log file
  *
@@ -70533,7 +72605,8 @@ File.prototype.query = function (options, callback) {
 
     var time = new Date(log.timestamp);
     if ((options.from && time < options.from)
-        || (options.until && time > options.until)) {
+        || (options.until && time > options.until)
+        || (options.level && options.level !== log.level)) {
       return;
     }
 
@@ -70745,7 +72818,7 @@ File.prototype._createStream = function () {
 
         inp.pipe(gzip).pipe(out);
 
-        fs.unlink(String(self._archive));
+        fs.unlink(String(self._archive), function () {});
         self._archive = '';
       }
     }
@@ -70892,13 +72965,13 @@ File.prototype._lazyDrain = function () {
     this._draining = true;
 
     this._stream.once('drain', function () {
-      this._draining = false;
+      self._draining = false;
       self.emit('logged');
     });
   }
 };
 
-},{"../common":293,"./transport":306,"async":307,"events":undefined,"fs":undefined,"isstream":204,"os":undefined,"path":undefined,"stream":undefined,"util":undefined,"zlib":undefined}],304:[function(require,module,exports){
+},{"../common":292,"./transport":305,"async":306,"events":undefined,"fs":undefined,"isstream":209,"os":undefined,"path":undefined,"stream":undefined,"util":undefined,"zlib":undefined}],303:[function(require,module,exports){
 var util = require('util'),
     winston = require('../../winston'),
     http = require('http'),
@@ -71140,7 +73213,7 @@ Http.prototype.stream = function (options) {
   return stream;
 };
 
-},{"../../winston":292,"./transport":306,"http":undefined,"https":undefined,"stream":undefined,"util":undefined}],305:[function(require,module,exports){
+},{"../../winston":291,"./transport":305,"http":undefined,"https":undefined,"stream":undefined,"util":undefined}],304:[function(require,module,exports){
 var events = require('events'),
     util = require('util'),
     common = require('../common'),
@@ -71231,7 +73304,7 @@ Memory.prototype.clearLogs = function () {
   this.writeOutput = [];
 };
 
-},{"../common":293,"./transport":306,"events":undefined,"util":undefined}],306:[function(require,module,exports){
+},{"../common":292,"./transport":305,"events":undefined,"util":undefined}],305:[function(require,module,exports){
 /*
  * transport.js: Base Transport object for all Winston transports.
  *
@@ -71368,7 +73441,7 @@ Transport.prototype.logException = function (msg, meta, callback) {
   this.log(self.exceptionsLevel, msg, meta, function () { });
 };
 
-},{"events":undefined,"util":undefined}],307:[function(require,module,exports){
+},{"events":undefined,"util":undefined}],306:[function(require,module,exports){
 /*!
  * async
  * https://github.com/caolan/async
@@ -72653,54 +74726,31 @@ Transport.prototype.logException = function (msg, meta, callback) {
 
 }());
 
-},{}],308:[function(require,module,exports){
+},{}],307:[function(require,module,exports){
 module.exports={
-  "_args": [
-    [
-      {
-        "raw": "winston@^2.1.1",
-        "scope": null,
-        "escapedName": "winston",
-        "name": "winston",
-        "rawSpec": "^2.1.1",
-        "spec": ">=2.1.1 <3.0.0",
-        "type": "range"
-      },
-      "/Users/ddascal/Projects/openwhisk/openwhisk-slack/node_modules/@slack/client"
-    ]
-  ],
-  "_from": "winston@>=2.1.1 <3.0.0",
-  "_id": "winston@2.3.1",
-  "_inCache": true,
+  "_from": "winston@^2.1.1",
+  "_id": "winston@2.4.1",
+  "_inBundle": false,
+  "_integrity": "sha1-o6kmUQVWQmPGeFtFg7jIrKJv3tY=",
   "_location": "/winston",
-  "_nodeVersion": "4.7.2",
-  "_npmOperationalInternal": {
-    "host": "packages-18-east.internal.npmjs.com",
-    "tmp": "tmp/winston-2.3.1.tgz_1484937497945_0.36467634653672576"
-  },
-  "_npmUser": {
-    "name": "indexzero",
-    "email": "charlie.robbins@gmail.com"
-  },
-  "_npmVersion": "3.10.5",
   "_phantomChildren": {},
   "_requested": {
+    "type": "range",
+    "registry": true,
     "raw": "winston@^2.1.1",
-    "scope": null,
-    "escapedName": "winston",
     "name": "winston",
+    "escapedName": "winston",
     "rawSpec": "^2.1.1",
-    "spec": ">=2.1.1 <3.0.0",
-    "type": "range"
+    "saveSpec": null,
+    "fetchSpec": "^2.1.1"
   },
   "_requiredBy": [
     "/@slack/client"
   ],
-  "_resolved": "https://registry.npmjs.org/winston/-/winston-2.3.1.tgz",
-  "_shasum": "0b48420d978c01804cf0230b648861598225a119",
-  "_shrinkwrap": null,
+  "_resolved": "https://artifactory.corp.adobe.com:443/artifactory/api/npm/npm-runner-release/winston/-/winston-2.4.1.tgz",
+  "_shasum": "a3a9265105564263c6785b4583b8c8aca26fded6",
   "_spec": "winston@^2.1.1",
-  "_where": "/Users/ddascal/Projects/openwhisk/openwhisk-slack/node_modules/@slack/client",
+  "_where": "/Users/ddascal/Projects/adobe-apiplatform/openwhisk-slack/node_modules/@slack/client",
   "author": {
     "name": "Charlie Robbins",
     "email": "charlie.robbins@gmail.com"
@@ -72708,6 +74758,7 @@ module.exports={
   "bugs": {
     "url": "https://github.com/winstonjs/winston/issues"
   },
+  "bundleDependencies": false,
   "dependencies": {
     "async": "~1.0.0",
     "colors": "1.0.x",
@@ -72716,6 +74767,7 @@ module.exports={
     "isstream": "0.1.x",
     "stack-trace": "0.0.x"
   },
+  "deprecated": false,
   "description": "A multi-transport async logging library for Node.js",
   "devDependencies": {
     "cross-spawn-async": "^2.0.0",
@@ -72723,15 +74775,9 @@ module.exports={
     "std-mocks": "~1.0.0",
     "vows": "0.7.x"
   },
-  "directories": {},
-  "dist": {
-    "shasum": "0b48420d978c01804cf0230b648861598225a119",
-    "tarball": "https://registry.npmjs.org/winston/-/winston-2.3.1.tgz"
-  },
   "engines": {
     "node": ">= 0.10.0"
   },
-  "gitHead": "fba37b44f7875ba7c460df81fad27d6a941ed213",
   "homepage": "https://github.com/winstonjs/winston#readme",
   "keywords": [
     "winston",
@@ -72743,33 +74789,15 @@ module.exports={
   "main": "./lib/winston",
   "maintainers": [
     {
-      "name": "indexzero",
-      "email": "charlie.robbins@gmail.com"
-    },
-    {
-      "name": "chjj",
-      "email": "chjjeffrey@gmail.com"
-    },
-    {
-      "name": "jcrugzz",
+      "name": "Jarrett Cruger",
       "email": "jcrugzz@gmail.com"
     },
     {
-      "name": "pose",
+      "name": "Alberto Pose",
       "email": "albertopose@gmail.com"
-    },
-    {
-      "name": "v1",
-      "email": "info@3rd-Eden.com"
-    },
-    {
-      "name": "3rdeden",
-      "email": "npm@3rd-Eden.com"
     }
   ],
   "name": "winston",
-  "optionalDependencies": {},
-  "readme": "ERROR: No README data found!",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/winstonjs/winston.git"
@@ -72777,10 +74805,10 @@ module.exports={
   "scripts": {
     "test": "vows --spec --isolate"
   },
-  "version": "2.3.1"
+  "version": "2.4.1"
 }
 
-},{}],309:[function(require,module,exports){
+},{}],308:[function(require,module,exports){
 'use strict';
 
 /*!
@@ -72831,7 +74859,7 @@ WS.connect = WS.createConnection = function connect(address, fn) {
   return client;
 };
 
-},{"./lib/Receiver":317,"./lib/Sender":319,"./lib/WebSocket":322,"./lib/WebSocketServer":323}],310:[function(require,module,exports){
+},{"./lib/Receiver":316,"./lib/Sender":318,"./lib/WebSocket":321,"./lib/WebSocketServer":322}],309:[function(require,module,exports){
 /*!
  * ws: a node.js websocket client
  * Copyright(c) 2011 Einar Otto Stangvik <einaros@gmail.com>
@@ -72896,7 +74924,7 @@ BufferPool.prototype.reset = function(forceNewBuffer) {
 
 module.exports = BufferPool;
 
-},{"util":undefined}],311:[function(require,module,exports){
+},{"util":undefined}],310:[function(require,module,exports){
 /*!
  * ws: a node.js websocket client
  * Copyright(c) 2011 Einar Otto Stangvik <einaros@gmail.com>
@@ -72945,7 +74973,7 @@ exports.BufferUtil = {
   }
 }
 
-},{}],312:[function(require,module,exports){
+},{}],311:[function(require,module,exports){
 'use strict';
 
 /*!
@@ -72954,13 +74982,17 @@ exports.BufferUtil = {
  * MIT Licensed
  */
 
+var bufferUtil;
+
 try {
-  module.exports = require('bufferutil');
+  bufferUtil = require('bufferutil');
 } catch (e) {
-  module.exports = require('./BufferUtil.fallback');
+  bufferUtil = require('./BufferUtil.fallback');
 }
 
-},{"./BufferUtil.fallback":311,"bufferutil":134}],313:[function(require,module,exports){
+module.exports = bufferUtil.BufferUtil || bufferUtil;
+
+},{"./BufferUtil.fallback":310,"bufferutil":136}],312:[function(require,module,exports){
 /*!
  * ws: a node.js websocket client
  * Copyright(c) 2011 Einar Otto Stangvik <einaros@gmail.com>
@@ -72985,7 +75017,7 @@ module.exports = {
   1010: 'extension handshake missing',
   1011: 'an unexpected condition prevented the request from being fulfilled',
 };
-},{}],314:[function(require,module,exports){
+},{}],313:[function(require,module,exports){
 
 var util = require('util');
 
@@ -73008,7 +75040,13 @@ function parse(value) {
   value.split(',').forEach(function(v) {
     var params = v.split(';');
     var token = params.shift().trim();
-    var paramsList = extensions[token] = extensions[token] || [];
+
+    if (extensions[token] === undefined) {
+      extensions[token] = [];
+    } else if (!extensions.hasOwnProperty(token)) {
+      return;
+    }
+
     var parsedParams = {};
 
     params.forEach(function(param) {
@@ -73026,10 +75064,15 @@ function parse(value) {
           value = value.slice(0, value.length - 1);
         }
       }
-      (parsedParams[key] = parsedParams[key] || []).push(value);
+
+      if (parsedParams[key] === undefined) {
+        parsedParams[key] = [value];
+      } else if (parsedParams.hasOwnProperty(key)) {
+        parsedParams[key].push(value);
+      }
     });
 
-    paramsList.push(parsedParams);
+    extensions[token].push(parsedParams);
   });
 
   return extensions;
@@ -73057,7 +75100,7 @@ function format(value) {
   }).join(', ');
 }
 
-},{"util":undefined}],315:[function(require,module,exports){
+},{"util":undefined}],314:[function(require,module,exports){
 
 var zlib = require('zlib');
 
@@ -73396,7 +75439,7 @@ PerMessageDeflate.prototype.compress = function (data, fin, callback) {
 
 module.exports = PerMessageDeflate;
 
-},{"zlib":undefined}],316:[function(require,module,exports){
+},{"zlib":undefined}],315:[function(require,module,exports){
 /*!
  * ws: a node.js websocket client
  * Copyright(c) 2011 Einar Otto Stangvik <einaros@gmail.com>
@@ -73592,7 +75635,7 @@ function bufferIndex(buffer, byte) {
   return -1;
 }
 
-},{"util":undefined}],317:[function(require,module,exports){
+},{"util":undefined}],316:[function(require,module,exports){
 /*!
  * ws: a node.js websocket client
  * Copyright(c) 2011 Einar Otto Stangvik <einaros@gmail.com>
@@ -73600,10 +75643,10 @@ function bufferIndex(buffer, byte) {
  */
 
 var util = require('util')
-  , Validation = require('./Validation').Validation
+  , isValidUTF8 = require('./Validation')
   , ErrorCodes = require('./ErrorCodes')
   , BufferPool = require('./BufferPool')
-  , bufferUtil = require('./BufferUtil').BufferUtil
+  , bufferUtil = require('./BufferUtil')
   , PerMessageDeflate = require('./PerMessageDeflate');
 
 /**
@@ -74124,7 +76167,7 @@ var opcodes = {
             var messageBuffer = Buffer.concat(self.currentMessage);
             self.currentMessage = [];
             self.currentMessageLength = 0;
-            if (!Validation.isValidUTF8(messageBuffer)) {
+            if (!isValidUTF8(messageBuffer)) {
               self.error('invalid utf8 sequence', 1007);
               return;
             }
@@ -74281,7 +76324,7 @@ var opcodes = {
         var message = '';
         if (data && data.length > 2) {
           var messageBuffer = data.slice(2);
-          if (!Validation.isValidUTF8(messageBuffer)) {
+          if (!isValidUTF8(messageBuffer)) {
             self.error('invalid utf8 sequence', 1007);
             return;
           }
@@ -74387,7 +76430,7 @@ var opcodes = {
   }
 }
 
-},{"./BufferPool":310,"./BufferUtil":312,"./ErrorCodes":313,"./PerMessageDeflate":315,"./Validation":321,"util":undefined}],318:[function(require,module,exports){
+},{"./BufferPool":309,"./BufferUtil":311,"./ErrorCodes":312,"./PerMessageDeflate":314,"./Validation":320,"util":undefined}],317:[function(require,module,exports){
 /*!
  * ws: a node.js websocket client
  * Copyright(c) 2011 Einar Otto Stangvik <einaros@gmail.com>
@@ -74513,7 +76556,7 @@ Sender.prototype.error = function (reason) {
   return this;
 };
 
-},{"events":undefined,"util":undefined}],319:[function(require,module,exports){
+},{"events":undefined,"util":undefined}],318:[function(require,module,exports){
 /*!
  * ws: a node.js websocket client
  * Copyright(c) 2011 Einar Otto Stangvik <einaros@gmail.com>
@@ -74522,9 +76565,10 @@ Sender.prototype.error = function (reason) {
 
 var events = require('events')
   , util = require('util')
+  , crypto = require('crypto')
   , EventEmitter = events.EventEmitter
   , ErrorCodes = require('./ErrorCodes')
-  , bufferUtil = require('./BufferUtil').BufferUtil
+  , bufferUtil = require('./BufferUtil')
   , PerMessageDeflate = require('./PerMessageDeflate');
 
 /**
@@ -74569,9 +76613,8 @@ Sender.prototype.close = function(code, data, mask, cb) {
   if (dataBuffer.length > 2) dataBuffer.write(data, 2);
 
   var self = this;
-  this.messageHandlers.push(function(callback) {
+  this.messageHandlers.push(function() {
     self.frameAndSend(0x8, dataBuffer, true, mask);
-    callback();
     if (typeof cb == 'function') cb();
   });
   this.flush();
@@ -74586,9 +76629,8 @@ Sender.prototype.close = function(code, data, mask, cb) {
 Sender.prototype.ping = function(data, options) {
   var mask = options && options.mask;
   var self = this;
-  this.messageHandlers.push(function(callback) {
+  this.messageHandlers.push(function() {
     self.frameAndSend(0x9, data || '', true, mask);
-    callback();
   });
   this.flush();
 };
@@ -74602,9 +76644,8 @@ Sender.prototype.ping = function(data, options) {
 Sender.prototype.pong = function(data, options) {
   var mask = options && options.mask;
   var self = this;
-  this.messageHandlers.push(function(callback) {
+  this.messageHandlers.push(function() {
     self.frameAndSend(0xa, data || '', true, mask);
-    callback();
   });
   this.flush();
 };
@@ -74632,7 +76673,13 @@ Sender.prototype.send = function(data, options, cb) {
   var compressFragment = this.compress;
 
   var self = this;
-  this.messageHandlers.push(function(callback) {
+  this.messageHandlers.push(function() {
+    if (!data || !compressFragment) {
+      self.frameAndSend(opcode, data, finalFragment, mask, compress, cb);
+      return;
+    }
+
+    self.processing = true;
     self.applyExtensions(data, finalFragment, compressFragment, function(err, data) {
       if (err) {
         if (typeof cb == 'function') cb(err);
@@ -74640,7 +76687,8 @@ Sender.prototype.send = function(data, options, cb) {
         return;
       }
       self.frameAndSend(opcode, data, finalFragment, mask, compress, cb);
-      callback();
+      self.processing = false;
+      self.flush();
     });
   });
   this.flush();
@@ -74772,19 +76820,9 @@ Sender.prototype.frameAndSend = function(opcode, data, finalFragment, maskData, 
  */
 
 Sender.prototype.flush = function() {
-  if (this.processing) return;
-
-  var handler = this.messageHandlers.shift();
-  if (!handler) return;
-
-  this.processing = true;
-
-  var self = this;
-
-  handler(function() {
-    self.processing = false;
-    self.flush();
-  });
+  while (!this.processing && this.messageHandlers.length) {
+    this.messageHandlers.shift()();
+  }
 };
 
 /**
@@ -74794,14 +76832,10 @@ Sender.prototype.flush = function() {
  */
 
 Sender.prototype.applyExtensions = function(data, fin, compress, callback) {
-  if (compress && data) {
-    if ((data.buffer || data) instanceof ArrayBuffer) {
-      data = getArrayBuffer(data);
-    }
-    this.extensions[PerMessageDeflate.extensionName].compress(data, fin, callback);
-  } else {
-    callback(null, data);
+  if ((data.buffer || data) instanceof ArrayBuffer) {
+    data = getArrayBuffer(data);
   }
+  this.extensions[PerMessageDeflate.extensionName].compress(data, fin, callback);
 };
 
 module.exports = Sender;
@@ -74831,15 +76865,10 @@ function getArrayBuffer(data) {
 }
 
 function getRandomMask() {
-  return new Buffer([
-    ~~(Math.random() * 255),
-    ~~(Math.random() * 255),
-    ~~(Math.random() * 255),
-    ~~(Math.random() * 255)
-  ]);
+  return crypto.randomBytes(4);
 }
 
-},{"./BufferUtil":312,"./ErrorCodes":313,"./PerMessageDeflate":315,"events":undefined,"util":undefined}],320:[function(require,module,exports){
+},{"./BufferUtil":311,"./ErrorCodes":312,"./PerMessageDeflate":314,"crypto":undefined,"events":undefined,"util":undefined}],319:[function(require,module,exports){
 /*!
  * ws: a node.js websocket client
  * Copyright(c) 2011 Einar Otto Stangvik <einaros@gmail.com>
@@ -74852,7 +76881,7 @@ exports.Validation = {
   }
 };
 
-},{}],321:[function(require,module,exports){
+},{}],320:[function(require,module,exports){
 'use strict';
 
 /*!
@@ -74861,13 +76890,19 @@ exports.Validation = {
  * MIT Licensed
  */
 
+var isValidUTF8;
+
 try {
-  module.exports = require('utf-8-validate');
+  isValidUTF8 = require('utf-8-validate');
 } catch (e) {
-  module.exports = require('./Validation.fallback');
+  isValidUTF8 = require('./Validation.fallback');
 }
 
-},{"./Validation.fallback":320,"utf-8-validate":285}],322:[function(require,module,exports){
+module.exports = typeof isValidUTF8 === 'object'
+  ? isValidUTF8.Validation.isValidUTF8
+  : isValidUTF8;
+
+},{"./Validation.fallback":319,"utf-8-validate":287}],321:[function(require,module,exports){
 'use strict';
 
 /*!
@@ -75856,7 +77891,7 @@ function cleanupWebsocketResources(error) {
   delete this._queue;
 }
 
-},{"./Extensions":314,"./PerMessageDeflate":315,"./Receiver":317,"./Receiver.hixie":316,"./Sender":319,"./Sender.hixie":318,"crypto":undefined,"events":undefined,"http":undefined,"https":undefined,"options":222,"stream":undefined,"ultron":282,"url":undefined,"util":undefined}],323:[function(require,module,exports){
+},{"./Extensions":313,"./PerMessageDeflate":314,"./Receiver":316,"./Receiver.hixie":315,"./Sender":318,"./Sender.hixie":317,"crypto":undefined,"events":undefined,"http":undefined,"https":undefined,"options":223,"stream":undefined,"ultron":284,"url":undefined,"util":undefined}],322:[function(require,module,exports){
 /*!
  * ws: a node.js websocket client
  * Copyright(c) 2011 Einar Otto Stangvik <einaros@gmail.com>
@@ -76412,7 +78447,7 @@ function abortConnection(socket, code, name) {
   }
 }
 
-},{"./Extensions":314,"./PerMessageDeflate":315,"./WebSocket":322,"crypto":undefined,"events":undefined,"http":undefined,"options":222,"tls":undefined,"url":undefined,"util":undefined}],324:[function(require,module,exports){
+},{"./Extensions":313,"./PerMessageDeflate":314,"./WebSocket":321,"crypto":undefined,"events":undefined,"http":undefined,"options":223,"tls":undefined,"url":undefined,"util":undefined}],323:[function(require,module,exports){
 module.exports = extend
 
 var hasOwnProperty = Object.prototype.hasOwnProperty;
@@ -76442,4 +78477,4 @@ function extend() {
 try{var d=require("@slack/client").IncomingWebhook}catch(g){console.log(g),c({message:"Could not load @slack/client",error:g.toString()})}var e=a.slack_webhook_url,f=new d(e);f.send("Hello there from JS",function(g,h){g?(console.log("Error:",g),c(a)):(console.log("Message sent: ",h),b(a))})})}exports.default=main;
 
 },{"@slack/client":1}]},{},[]);
-var main = require('main-action').default;
+var main = require('main-action').default; exports.main=main;
